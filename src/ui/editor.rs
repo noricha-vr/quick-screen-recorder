@@ -15,7 +15,9 @@ use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSSt
 use crate::config::Preferences;
 use crate::export::avfoundation::{extract_rgba_frame, probe_video_metadata};
 use crate::export::{ExportFormat, ExportRequest};
-use crate::fs_safety::{format_tilde_path, next_recording_output_path, unique_private_file_path};
+use crate::fs_safety::{
+    format_tilde_path, is_usable_export_dir, next_recording_output_path, unique_private_file_path,
+};
 use crate::ui::clipboard::rgba_to_nsimage;
 use crate::ui::editor_worker::{
     EditorState, ExportProgressView, FPS_PRESETS, ProgressVisualState, SIZE_PRESETS,
@@ -397,11 +399,11 @@ impl EditorWindow {
                         if st.busy {
                             return;
                         }
-                        if let Err(e) = std::fs::create_dir_all(&st.export_dir) {
+                        if !is_usable_export_dir(&st.export_dir) {
                             status_save.setTextColor(Some(&NSColor::systemRedColor()));
-                            status_save.setStringValue(&NSString::from_str(&format!(
-                                "Cannot access export folder: {e}"
-                            )));
+                            status_save.setStringValue(&NSString::from_str(
+                                "Export folder is unavailable or unsafe; choose another via Folder...",
+                            ));
                             return;
                         }
                         let out_path =

@@ -29,7 +29,7 @@ struct TrimTrackState {
     playhead_sec: f64,
     video_w: u32,
     video_h: u32,
-    active_drag: Option<TrimDragTarget>,
+    active_drag: Option<(TrimDragTarget, f64)>,
 }
 
 pub type TrimChangeCallback = Rc<dyn Fn(f64, f64, f64)>;
@@ -186,27 +186,39 @@ define_class!(
         fn mouse_down(&self, event: &NSEvent) {
             let loc = self.convertPoint_fromView(event.locationInWindow(), None);
             let track_w = (self.bounds().size.width - TRACK_INSET_X * 2.0).max(40.0);
-            let target = {
-                let st = *self.ivars().state.borrow();
-                hit_test_trim_timeline(
+            let (target, start, end, preview) = {
+                let mut st = self.ivars().state.borrow_mut();
+                let (t, grab_dx, ns, ne, np) = begin_trim_drag(
                     loc.x,
                     TRACK_INSET_X,
                     track_w,
                     st.start_sec,
                     st.end_sec,
                     st.duration_sec,
-                )
+                );
+                st.active_drag = Some((t, grab_dx));
+                st.start_sec = ns;
+                st.end_sec = ne;
+                st.playhead_sec = np;
+                (t, ns, ne, np)
             };
-            self.ivars().state.borrow_mut().active_drag = Some(target);
-            self.apply_pointer_x(loc.x, target);
+            if matches!(
+                target,
+                TrimDragTarget::StartBracket | TrimDragTarget::EndBracket
+            ) {
+                set_horizontal_resize_cursor();
+            }
+            self.refresh_labels();
+            self.setNeedsDisplay(true);
+            (self.ivars().on_change)(start, end, preview);
         }
 
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, event: &NSEvent) {
             let loc = self.convertPoint_fromView(event.locationInWindow(), None);
-            let target = self.ivars().state.borrow().active_drag;
-            if let Some(t) = target {
-                self.apply_pointer_x(loc.x, t);
+            let active = self.ivars().state.borrow().active_drag;
+            if let Some((target, grab_dx)) = active {
+                self.apply_pointer_x(loc.x - grab_dx, target);
             }
         }
 
@@ -396,6 +408,43 @@ pub fn hit_test_trim_timeline(
     }
 }
 
+pub fn begin_trim_drag(
+    pointer_x: f64,
+    track_x0: f64,
+    track_w: f64,
+    start_sec: f64,
+    end_sec: f64,
+    duration_sec: f64,
+) -> (TrimDragTarget, f64, f64, f64, f64) {
+    let start_x = time_to_x(start_sec, duration_sec, track_x0, track_w);
+    let end_x = time_to_x(end_sec, duration_sec, track_x0, track_w);
+    let in_left_zone = pointer_x >= start_x - HANDLE_WIDTH - 6.0 && pointer_x <= start_x + 6.0;
+    let in_right_zone = pointer_x >= end_x - 6.0 && pointer_x <= end_x + HANDLE_WIDTH + 6.0;
+    let target = hit_test_trim_timeline(
+        pointer_x,
+        track_x0,
+        track_w,
+        start_sec,
+        end_sec,
+        duration_sec,
+    );
+
+    // Grabbing directly on a bracket handle records the pointer-to-boundary offset so clicking never shifts IN/OUT
+    match target {
+        TrimDragTarget::StartBracket if in_left_zone => {
+            (target, pointer_x - start_x, start_sec, end_sec, start_sec)
+        }
+        TrimDragTarget::EndBracket if in_right_zone => {
+            (target, pointer_x - end_x, start_sec, end_sec, end_sec)
+        }
+        _ => {
+            let t = x_to_time(pointer_x, duration_sec, track_x0, track_w);
+            let (ns, ne, np) = compute_dragged_trim(t, target, start_sec, end_sec, duration_sec);
+            (target, 0.0, ns, ne, np)
+        }
+    }
+}
+
 pub fn compute_dragged_trim(
     pointer_time: f64,
     target: TrimDragTarget,
@@ -461,5 +510,16 @@ mod tests {
         assert_eq!(s2, 2.0);
         assert!((e2 - 2.05).abs() < 1e-6);
         assert_eq!(p2, e2);
+
+        // Pressing center of left bracket on a 600s video keeps IN exact (0.000s jump) and tracks delta
+        let (tgt, grab_dx, s0, e0, p0) =
+            begin_trim_drag(109.0, track_x0, track_w, 100.0, 500.0, 600.0);
+        assert_eq!(tgt, TrimDragTarget::StartBracket);
+        assert_eq!(s0, 100.0);
+        assert_eq!(e0, 500.0);
+        assert_eq!(p0, 100.0);
+        let moved_t = x_to_time(119.0 - grab_dx, 600.0, track_x0, track_w);
+        let (s_drag, _, _) = compute_dragged_trim(moved_t, tgt, s0, e0, 600.0);
+        assert!((s_drag - 110.0).abs() < 1e-6);
     }
 }

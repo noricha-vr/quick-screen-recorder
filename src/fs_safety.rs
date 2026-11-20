@@ -1,7 +1,9 @@
+use std::ffi::CString;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
@@ -45,7 +47,8 @@ pub fn valid_home_dir() -> Option<PathBuf> {
     if p.is_absolute() { Some(p) } else { None }
 }
 
-/// Returns `~/Desktop` when available as a real directory owned by the current user, falling back to `HOME` or temp dir.
+/// Returns `~/Desktop` when available as a verified directory owned by the current user,
+/// falling back to `HOME` or the private `0700` cache directory.
 pub fn default_desktop_export_dir() -> PathBuf {
     if let Some(home) = valid_home_dir() {
         let desktop = home.join("Desktop");
@@ -56,17 +59,58 @@ pub fn default_desktop_export_dir() -> PathBuf {
             return home;
         }
     }
-    std::env::temp_dir()
+    private_cache_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
 }
 
+/// Verifies `dir` is an absolute, dot-free, non-symlink directory whose ancestor chain has no
+/// user-controlled symlinks or non-sticky world-writable directories.
 pub fn is_usable_export_dir(dir: &Path) -> bool {
-    if !dir.is_absolute() {
+    if !dir.is_absolute()
+        || dir
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
         return false;
     }
-    match fs::symlink_metadata(dir) {
-        Ok(meta) => !meta.file_type().is_symlink() && meta.is_dir(),
-        Err(_) => false,
+    let euid = unsafe { libc::geteuid() };
+    let Ok(meta) = fs::symlink_metadata(dir) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() || (meta.uid() != euid && meta.uid() != 0) {
+        return false;
     }
+    let mode = meta.permissions().mode();
+    if (mode & 0o002 != 0) && (mode & 0o1000 == 0) {
+        return false;
+    }
+    verify_safe_dir_ancestors(dir.parent(), euid)
+}
+
+fn verify_safe_dir_ancestors(mut cur: Option<&Path>, euid: u32) -> bool {
+    while let Some(anc) = cur {
+        if anc.as_os_str().is_empty() {
+            break;
+        }
+        let Ok(lmeta) = fs::symlink_metadata(anc) else {
+            return false;
+        };
+        // Only root-owned macOS system symlinks (e.g. /var -> private/var, /tmp -> private/tmp) are permitted
+        if lmeta.file_type().is_symlink() && lmeta.uid() != 0 {
+            return false;
+        }
+        let Ok(dmeta) = fs::metadata(anc) else {
+            return false;
+        };
+        if !dmeta.is_dir() || (dmeta.uid() != euid && dmeta.uid() != 0) {
+            return false;
+        }
+        let dmode = dmeta.permissions().mode();
+        if (dmode & 0o002 != 0) && (dmode & 0o1000 == 0) {
+            return false;
+        }
+        cur = anc.parent();
+    }
+    true
 }
 
 /// Formats a directory path with `~` substitution for UI display so personal home usernames never appear on screen.
@@ -162,13 +206,26 @@ impl ExclusiveStagingDir {
             _ => std::env::current_dir()
                 .map_err(|e| format!("Cannot resolve working directory: {e}"))?,
         };
+        let euid = unsafe { libc::geteuid() };
+        if let Ok(psym) = fs::symlink_metadata(&parent) {
+            if psym.file_type().is_symlink() && psym.uid() != 0 {
+                return Err("Refusing to use symlinked output directory".to_string());
+            }
+        }
         fs::create_dir_all(&parent)
             .map_err(|e| format!("Failed creating output directory: {e}"))?;
+        if let Ok(psym) = fs::symlink_metadata(&parent) {
+            if psym.file_type().is_symlink() && psym.uid() != 0 {
+                return Err("Refusing to use symlinked output directory".to_string());
+            }
+        }
         let canon_parent = fs::canonicalize(&parent)
             .map_err(|e| format!("Failed resolving canonical output directory: {e}"))?;
+        if !is_usable_export_dir(&canon_parent) {
+            return Err("Output directory failed ownership or symlink safety check".to_string());
+        }
         let canon_dest = canon_parent.join(file_name);
 
-        let euid = unsafe { libc::geteuid() };
         if let Ok(existing) = fs::symlink_metadata(&canon_dest) {
             if existing.file_type().is_symlink() || !existing.is_file() || existing.uid() != euid {
                 return Err(
@@ -204,6 +261,10 @@ impl ExclusiveStagingDir {
     }
 
     pub fn commit(&self) -> Result<u64, String> {
+        self.commit_with_policy(false).map(|(_, len)| len)
+    }
+
+    pub fn commit_with_policy(&self, prevent_overwrite: bool) -> Result<(PathBuf, u64), String> {
         let euid = unsafe { libc::geteuid() };
         let staged_meta = fs::symlink_metadata(&self.staged_file)
             .map_err(|e| format!("Staged output file missing: {e}"))?;
@@ -214,8 +275,21 @@ impl ExclusiveStagingDir {
         {
             return Err("Staged output file is empty or invalid".to_string());
         }
+        let Some(canon_parent) = self.canon_dest.parent() else {
+            return Err("Destination parent missing".to_string());
+        };
+        if !is_usable_export_dir(canon_parent) {
+            return Err("Destination directory changed during export".to_string());
+        }
 
-        // Only inherit permissions from a regular file owned by the current user; otherwise enforce 0600.
+        if prevent_overwrite {
+            fs::set_permissions(&self.staged_file, fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("Failed setting output file permissions: {e}"))?;
+            let final_dest = rename_exclusive_with_retry(&self.staged_file, &self.canon_dest)?;
+            return Ok((final_dest, staged_meta.len()));
+        }
+
+        // Explicit CLI overwrite mode: only overwrite a regular file owned by current user
         let desired_mode = match fs::symlink_metadata(&self.canon_dest) {
             Ok(existing) => {
                 if existing.file_type().is_symlink()
@@ -235,10 +309,69 @@ impl ExclusiveStagingDir {
 
         fs::set_permissions(&self.staged_file, fs::Permissions::from_mode(desired_mode))
             .map_err(|e| format!("Failed setting output file permissions: {e}"))?;
-
         fs::rename(&self.staged_file, &self.canon_dest)
             .map_err(|e| format!("Failed moving staged file to destination: {e}"))?;
-        Ok(staged_meta.len())
+        Ok((self.canon_dest.clone(), staged_meta.len()))
+    }
+}
+
+fn rename_exclusive_with_retry(staged: &Path, initial_dest: &Path) -> Result<PathBuf, String> {
+    if try_rename_excl(staged, initial_dest)? {
+        return Ok(initial_dest.to_path_buf());
+    }
+    let parent = initial_dest.parent().ok_or("Missing parent directory")?;
+    let ext = initial_dest
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("mp4");
+    let raw_stem = initial_dest
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Recording");
+    let base_stem = strip_numeric_collision_suffix(raw_stem);
+
+    for suffix in 2..=9999_u32 {
+        let candidate = parent.join(format!("{base_stem}-{suffix}.{ext}"));
+        if try_rename_excl(staged, &candidate)? {
+            return Ok(candidate);
+        }
+    }
+    let fallback = parent.join(format!("{base_stem}-{}.{ext}", random_hex_token()));
+    if try_rename_excl(staged, &fallback)? {
+        Ok(fallback)
+    } else {
+        Err("Failed finding non-colliding output filename".to_string())
+    }
+}
+
+fn strip_numeric_collision_suffix(stem: &str) -> &str {
+    // Preserve YYYY-MM-DD-HHMMSS (6 digits at end), only strip short -2..-9999 collision suffixes
+    if let Some((prefix, tail)) = stem.rsplit_once('-') {
+        if (1..=4).contains(&tail.len()) && tail.chars().all(|c| c.is_ascii_digit()) {
+            // Avoid stripping -DD from YYYY-MM-DD if prefix ends with YYYY-MM (4-2 pattern)
+            let looks_like_date =
+                prefix.len() >= 7 && prefix.as_bytes()[prefix.len() - 3] == b'-' && tail.len() == 2;
+            if !looks_like_date {
+                return prefix;
+            }
+        }
+    }
+    stem
+}
+
+fn try_rename_excl(from: &Path, to: &Path) -> Result<bool, String> {
+    let from_c =
+        CString::new(from.as_os_str().as_bytes()).map_err(|_| "Invalid staged path bytes")?;
+    let to_c = CString::new(to.as_os_str().as_bytes()).map_err(|_| "Invalid target path bytes")?;
+    let rc = unsafe { libc::renamex_np(from_c.as_ptr(), to_c.as_ptr(), libc::RENAME_EXCL) };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let err = io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EEXIST) {
+        Ok(false)
+    } else {
+        Err(format!("Atomic exclusive rename failed: {err}"))
     }
 }
 
@@ -475,5 +608,34 @@ mod tests {
         if let Some(home) = valid_home_dir() {
             assert_eq!(format_tilde_path(&home.join("Desktop")), "~/Desktop");
         }
+    }
+
+    #[test]
+    fn concurrent_prevent_overwrite_commits_preserve_both_recordings_and_reject_symlinks() {
+        let dir = std::env::temp_dir().join(format!("qsr-atomic-excl-{}", random_hex_token()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let same_target = dir.join("Recording-2026-11-21-150000.mp4");
+
+        // Two concurrent editors pick the exact same target name before either commits
+        let s1 = ExclusiveStagingDir::create_for_target(&same_target, "mp4").expect("stage1");
+        let s2 = ExclusiveStagingDir::create_for_target(&same_target, "mp4").expect("stage2");
+        fs::write(s1.staged_file(), b"first-video").expect("write s1");
+        fs::write(s2.staged_file(), b"second-video").expect("write s2");
+
+        let (p1, _) = s1.commit_with_policy(true).expect("commit s1");
+        let (p2, _) = s2.commit_with_policy(true).expect("commit s2");
+        assert_ne!(p1, p2);
+        assert_eq!(fs::read(&p1).unwrap(), b"first-video");
+        assert_eq!(fs::read(&p2).unwrap(), b"second-video");
+        assert!(p2.file_name().unwrap().to_string_lossy().contains("-2.mp4"));
+
+        // User-created symlinked export directory must be rejected by is_usable_export_dir
+        let sym_dir = dir.join("sym-export");
+        std::os::unix::fs::symlink(&dir, &sym_dir).expect("symlink dir");
+        assert!(!is_usable_export_dir(&sym_dir));
+        assert!(!is_usable_export_dir(&sym_dir.join("sub")));
+        assert!(!is_usable_export_dir(&dir.join("..").join("tmp")));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

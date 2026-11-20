@@ -6,6 +6,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,7 @@ const ALLOWLISTED_FFMPEG_PATHS: [&str; 3] = [
 ];
 
 const FFMPEG_TIMEOUT: Duration = Duration::from_secs(180);
+const DARWIN_POSIX_SPAWN_CLOEXEC_DEFAULT: libc::c_short = 0x4000;
 
 unsafe extern "C" {
     fn responsibility_spawnattrs_setdisclaim(
@@ -259,6 +261,8 @@ fn spawn_disclaimed_with_timeout(
         return Err("Failed creating stdout progress pipe for ffmpeg".to_string());
     }
     let (out_read_fd, out_write_fd) = (out_fds[0], out_fds[1]);
+    set_fd_cloexec(out_read_fd);
+    set_fd_cloexec(out_write_fd);
 
     let mut pipe_fds = [0_i32; 2];
     if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
@@ -269,6 +273,8 @@ fn spawn_disclaimed_with_timeout(
         return Err("Failed creating stderr pipe for ffmpeg".to_string());
     }
     let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
+    set_fd_cloexec(read_fd);
+    set_fd_cloexec(write_fd);
 
     let mut file_actions: libc::posix_spawn_file_actions_t = ptr::null_mut();
     let mut attrs: libc::posix_spawnattr_t = ptr::null_mut();
@@ -291,12 +297,12 @@ fn spawn_disclaimed_with_timeout(
             libc::STDOUT_FILENO,
         );
         libc::posix_spawn_file_actions_adddup2(&mut file_actions, write_fd, libc::STDERR_FILENO);
-        libc::posix_spawn_file_actions_addclose(&mut file_actions, out_read_fd);
-        libc::posix_spawn_file_actions_addclose(&mut file_actions, out_write_fd);
-        libc::posix_spawn_file_actions_addclose(&mut file_actions, read_fd);
-        libc::posix_spawn_file_actions_addclose(&mut file_actions, write_fd);
 
         libc::posix_spawnattr_init(&mut attrs);
+        let flags =
+            (libc::POSIX_SPAWN_SETPGROUP as libc::c_short) | DARWIN_POSIX_SPAWN_CLOEXEC_DEFAULT;
+        libc::posix_spawnattr_setflags(&mut attrs, flags);
+        libc::posix_spawnattr_setpgroup(&mut attrs, 0);
         let _ = responsibility_spawnattrs_setdisclaim(&mut attrs, 1);
     }
 
@@ -328,7 +334,8 @@ fn spawn_disclaimed_with_timeout(
     }
 
     let dur = clip_duration_sec.max(0.05);
-    let stdout_handle = thread::spawn(move || {
+    let (out_tx, out_rx) = mpsc::sync_channel::<()>(1);
+    thread::spawn(move || {
         let file = unsafe { fs::File::from_raw_fd(out_read_fd) };
         let mut reader = BufReader::new(file.take(1_048_576));
         let mut line = String::new();
@@ -343,13 +350,15 @@ fn spawn_disclaimed_with_timeout(
             }
             line.clear();
         }
+        let _ = out_tx.send(());
     });
 
-    let stderr_handle = thread::spawn(move || {
+    let (err_tx, err_rx) = mpsc::sync_channel::<Vec<u8>>(1);
+    thread::spawn(move || {
         let mut reader = unsafe { fs::File::from_raw_fd(read_fd) };
         let mut buf = Vec::new();
         let _ = (&mut reader).take(8192).read_to_end(&mut buf);
-        buf
+        let _ = err_tx.send(buf);
     });
 
     let start = Instant::now();
@@ -364,18 +373,23 @@ fn spawn_disclaimed_with_timeout(
         }
         if start.elapsed() > timeout {
             unsafe {
+                if child_pid > 1 {
+                    libc::kill(-child_pid, libc::SIGKILL);
+                }
                 libc::kill(child_pid, libc::SIGKILL);
                 libc::waitpid(child_pid, &mut status, 0);
             }
-            let _ = stdout_handle.join();
-            let _ = stderr_handle.join();
+            let _ = out_rx.recv_timeout(Duration::from_millis(500));
+            let _ = err_rx.recv_timeout(Duration::from_millis(500));
             return Err("Timed out running ffmpeg export".to_string());
         }
         thread::sleep(Duration::from_millis(15));
     }
 
-    let _ = stdout_handle.join();
-    let stderr_bytes = stderr_handle.join().unwrap_or_default();
+    let _ = out_rx.recv_timeout(Duration::from_millis(500));
+    let stderr_bytes = err_rx
+        .recv_timeout(Duration::from_millis(500))
+        .unwrap_or_default();
     if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
         Ok(())
     } else {
@@ -469,6 +483,15 @@ fn verify_ancestor_chain(mut cur: Option<&Path>, euid: u32) -> Option<()> {
 
 const fn is_trusted_admin_group(gid: u32) -> bool {
     gid == 0 || gid == 80
+}
+
+fn set_fd_cloexec(fd: libc::c_int) {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags >= 0 {
+            let _ = libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        }
+    }
 }
 
 #[cfg(test)]

@@ -122,12 +122,20 @@ pub struct ExportResult {
 }
 
 pub fn run_export(req: &ExportRequest) -> Result<ExportResult, String> {
-    run_export_with_progress(req, None)
+    run_export_with_options(req, None, false)
 }
 
 pub fn run_export_with_progress(
     req: &ExportRequest,
     progress: Option<&SharedExportProgress>,
+) -> Result<ExportResult, String> {
+    run_export_with_options(req, progress, false)
+}
+
+pub fn run_export_with_options(
+    req: &ExportRequest,
+    progress: Option<&SharedExportProgress>,
+    prevent_overwrite: bool,
 ) -> Result<ExportResult, String> {
     if let Some(p) = progress {
         p.store(0, Ordering::Relaxed);
@@ -184,8 +192,8 @@ pub fn run_export_with_progress(
 
     match res {
         Ok(()) => {
-            let bytes = match stage.commit() {
-                Ok(len) => len,
+            let (committed_path, bytes) = match stage.commit_with_policy(prevent_overwrite) {
+                Ok(pair) => pair,
                 Err(err) => {
                     record_perf_event(&PerfEvent {
                         ts_unix: now_unix_secs(),
@@ -212,7 +220,11 @@ pub fn run_export_with_progress(
                 ok: true,
             });
             Ok(ExportResult {
-                output_path: req.output.clone(),
+                output_path: if prevent_overwrite {
+                    committed_path
+                } else {
+                    req.output.clone()
+                },
                 elapsed_ms,
                 output_bytes: bytes,
             })

@@ -17,7 +17,7 @@ use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTi
 
 use crate::config::Preferences;
 use crate::export::avfoundation::{VideoMetadata, extract_rgba_frame};
-use crate::export::{ExportFormat, ExportRequest, ExportResult, run_export_with_progress};
+use crate::export::{ExportFormat, ExportRequest, ExportResult, run_export_with_options};
 use crate::fs_safety::{format_tilde_path, is_usable_export_dir, sanitize_terminal_text};
 use crate::ui::clipboard::{copy_file_to_clipboard, rgba_to_nsimage};
 
@@ -287,7 +287,7 @@ pub fn spawn_async_export(
     let progress_bg = Arc::clone(&progress);
     let (tx, rx) = mpsc::channel::<Result<ExportResult, String>>();
     thread::spawn(move || {
-        let _ = tx.send(run_export_with_progress(&req, Some(&progress_bg)));
+        let _ = tx.send(run_export_with_options(&req, Some(&progress_bg), true));
     });
 
     let poll_block = RcBlock::new(move |timer: std::ptr::NonNull<NSTimer>| {
@@ -404,6 +404,11 @@ pub fn choose_export_directory(
         .URL()
         .and_then(|u| u.path())
         .map(|p| PathBuf::from(p.to_string()))?;
+    if !is_usable_export_dir(&picked_raw) {
+        return Some(Err(
+            "Selected destination must be a real folder owned by your user (not a symlink)",
+        ));
+    }
     let picked = std::fs::canonicalize(&picked_raw).unwrap_or(picked_raw);
     if is_usable_export_dir(&picked) {
         Some(Ok(picked))
