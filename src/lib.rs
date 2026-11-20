@@ -6,4 +6,5 @@ pub mod fs_safety;
 pub mod geometry;
 pub mod observe;
 pub mod permissions;
+pub mod staging;
 pub mod ui;

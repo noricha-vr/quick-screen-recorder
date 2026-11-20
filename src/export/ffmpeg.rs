@@ -1,12 +1,10 @@
 use std::ffi::CString;
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
-use std::os::fd::FromRawFd;
+use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -261,8 +259,8 @@ fn spawn_disclaimed_with_timeout(
         return Err("Failed creating stdout progress pipe for ffmpeg".to_string());
     }
     let (out_read_fd, out_write_fd) = (out_fds[0], out_fds[1]);
-    set_fd_cloexec(out_read_fd);
-    set_fd_cloexec(out_write_fd);
+    set_fd_cloexec_and_nonblock(out_read_fd, true);
+    set_fd_cloexec_and_nonblock(out_write_fd, false);
 
     let mut pipe_fds = [0_i32; 2];
     if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
@@ -273,8 +271,8 @@ fn spawn_disclaimed_with_timeout(
         return Err("Failed creating stderr pipe for ffmpeg".to_string());
     }
     let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
-    set_fd_cloexec(read_fd);
-    set_fd_cloexec(write_fd);
+    set_fd_cloexec_and_nonblock(read_fd, true);
+    set_fd_cloexec_and_nonblock(write_fd, false);
 
     let mut file_actions: libc::posix_spawn_file_actions_t = ptr::null_mut();
     let mut attrs: libc::posix_spawnattr_t = ptr::null_mut();
@@ -334,62 +332,54 @@ fn spawn_disclaimed_with_timeout(
     }
 
     let dur = clip_duration_sec.max(0.05);
-    let (out_tx, out_rx) = mpsc::sync_channel::<()>(1);
-    thread::spawn(move || {
-        let file = unsafe { fs::File::from_raw_fd(out_read_fd) };
-        let mut reader = BufReader::new(file.take(1_048_576));
-        let mut line = String::new();
-        while reader.read_line(&mut line).unwrap_or(0) > 0 {
-            if let Some(us_raw) = line.trim().strip_prefix("out_time_us=") {
-                if let Ok(us) = us_raw.parse::<i64>() {
-                    if us >= 0 {
-                        let frac = ((us as f64 / 1_000_000.0) / dur).clamp(0.0, 1.0);
-                        set_progress_permille(progress.as_ref(), 50 + (frac * 910.0) as u32);
-                    }
-                }
-            }
-            line.clear();
-        }
-        let _ = out_tx.send(());
-    });
-
-    let (err_tx, err_rx) = mpsc::sync_channel::<Vec<u8>>(1);
-    thread::spawn(move || {
-        let mut reader = unsafe { fs::File::from_raw_fd(read_fd) };
-        let mut buf = Vec::new();
-        let _ = (&mut reader).take(8192).read_to_end(&mut buf);
-        let _ = err_tx.send(buf);
-    });
+    let mut out_buf = Vec::with_capacity(4096);
+    let mut stderr_bytes = Vec::with_capacity(1024);
 
     let start = Instant::now();
     let mut status: libc::c_int = 0;
-    loop {
+    let wait_err = loop {
+        drain_nonblocking_fd(out_read_fd, &mut out_buf, 65_536);
+        parse_ffmpeg_progress_lines(&mut out_buf, dur, progress.as_ref());
+        drain_nonblocking_fd(read_fd, &mut stderr_bytes, 8_192);
+
         let w = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
         if w == child_pid {
-            break;
+            break None;
         }
         if w < 0 {
-            return Err("waitpid error waiting for ffmpeg".to_string());
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break Some("waitpid error waiting for ffmpeg".to_string());
         }
         if start.elapsed() > timeout {
-            unsafe {
-                if child_pid > 1 {
-                    libc::kill(-child_pid, libc::SIGKILL);
-                }
-                libc::kill(child_pid, libc::SIGKILL);
-                libc::waitpid(child_pid, &mut status, 0);
-            }
-            let _ = out_rx.recv_timeout(Duration::from_millis(500));
-            let _ = err_rx.recv_timeout(Duration::from_millis(500));
-            return Err("Timed out running ffmpeg export".to_string());
+            break Some("Timed out running ffmpeg export".to_string());
         }
         thread::sleep(Duration::from_millis(15));
+    };
+
+    // Always terminate the entire spawned process group and close read FDs deterministically
+    unsafe {
+        if child_pid > 1 {
+            libc::kill(-child_pid, libc::SIGKILL);
+        }
+        if wait_err.is_some() {
+            libc::kill(child_pid, libc::SIGKILL);
+            let _ = libc::waitpid(child_pid, &mut status, 0);
+        }
+    }
+    drain_nonblocking_fd(out_read_fd, &mut out_buf, 65_536);
+    parse_ffmpeg_progress_lines(&mut out_buf, dur, progress.as_ref());
+    drain_nonblocking_fd(read_fd, &mut stderr_bytes, 8_192);
+    unsafe {
+        libc::close(out_read_fd);
+        libc::close(read_fd);
     }
 
-    let _ = out_rx.recv_timeout(Duration::from_millis(500));
-    let stderr_bytes = err_rx
-        .recv_timeout(Duration::from_millis(500))
-        .unwrap_or_default();
+    if let Some(err_msg) = wait_err {
+        return Err(err_msg);
+    }
     if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
         Ok(())
     } else {
@@ -485,12 +475,56 @@ const fn is_trusted_admin_group(gid: u32) -> bool {
     gid == 0 || gid == 80
 }
 
-fn set_fd_cloexec(fd: libc::c_int) {
+fn set_fd_cloexec_and_nonblock(fd: libc::c_int, nonblock: bool) {
     unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFD);
-        if flags >= 0 {
-            let _ = libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+        let fd_flags = libc::fcntl(fd, libc::F_GETFD);
+        if fd_flags >= 0 {
+            let _ = libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC);
         }
+        if nonblock {
+            let fl = libc::fcntl(fd, libc::F_GETFL);
+            if fl >= 0 {
+                let _ = libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+            }
+        }
+    }
+}
+
+fn drain_nonblocking_fd(fd: libc::c_int, dst: &mut Vec<u8>, max_keep: usize) {
+    let mut chunk = [0_u8; 2048];
+    loop {
+        let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if n <= 0 {
+            break;
+        }
+        let slice = &chunk[..(n as usize)];
+        let room = max_keep.saturating_sub(dst.len());
+        if room > 0 {
+            dst.extend_from_slice(&slice[..slice.len().min(room)]);
+        }
+    }
+}
+
+fn parse_ffmpeg_progress_lines(
+    buf: &mut Vec<u8>,
+    dur: f64,
+    progress: Option<&SharedExportProgress>,
+) {
+    while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+        let line_bytes: Vec<u8> = buf.drain(..=nl).collect();
+        if let Ok(line) = std::str::from_utf8(&line_bytes) {
+            if let Some(us_raw) = line.trim().strip_prefix("out_time_us=") {
+                if let Ok(us) = us_raw.parse::<i64>() {
+                    if us >= 0 {
+                        let frac = ((us as f64 / 1_000_000.0) / dur).clamp(0.0, 1.0);
+                        set_progress_permille(progress, 50 + (frac * 910.0) as u32);
+                    }
+                }
+            }
+        }
+    }
+    if buf.len() > 32_768 {
+        buf.clear();
     }
 }
 

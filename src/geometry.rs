@@ -360,12 +360,12 @@ pub fn hit_test_window_frames(
 }
 
 /// Projects a ScreenCaptureKit global top-left window frame onto the active display's AppKit overlay bounds,
-/// clipping any off-screen overhang so the highlight border aligns with the visible window edges.
+/// clipping any off-screen overhang. Returns `None` if the window does not intersect this display.
 pub fn window_frame_to_overlay_rect(
     win_frame: Rect,
     display_origin: (f64, f64),
     overlay_bounds: Rect,
-) -> Rect {
+) -> Option<Rect> {
     let lx0 = win_frame.x - display_origin.0;
     let ly0 = win_frame.y - display_origin.1;
     let lx1 = lx0 + win_frame.width;
@@ -376,17 +376,14 @@ pub fn window_frame_to_overlay_rect(
     let cx1 = lx1.clamp(0.0, overlay_bounds.width);
     let cy1 = ly1.clamp(0.0, overlay_bounds.height);
 
-    let vis_w = (cx1 - cx0).max(MIN_CAPTURE_DIMENSION);
-    let vis_h = (cy1 - cy0).max(MIN_CAPTURE_DIMENSION);
+    let vis_w = cx1 - cx0;
+    let vis_h = cy1 - cy0;
+    if vis_w < 1.0 || vis_h < 1.0 {
+        return None;
+    }
     let appkit_y =
         (overlay_bounds.height - cy1).clamp(0.0, (overlay_bounds.height - vis_h).max(0.0));
-
-    Rect::new(
-        cx0.clamp(0.0, (overlay_bounds.width - vis_w).max(0.0)),
-        appkit_y,
-        vis_w,
-        vis_h,
-    )
+    Some(Rect::new(cx0, appkit_y, vis_w, vis_h))
 }
 
 fn round_down_even(v: f64) -> f64 {
@@ -510,6 +507,15 @@ mod tests {
             (0.0, 0.0),
             bounds,
         );
-        assert_eq!(proj, Rect::new(0.0, 0.0, 500.0, 300.0));
+        assert_eq!(proj, Some(Rect::new(0.0, 0.0, 500.0, 300.0)));
+        // Window on a secondary display (x = 1920..2720) has empty intersection -> None
+        assert_eq!(
+            window_frame_to_overlay_rect(
+                Rect::new(1920.0, 100.0, 800.0, 600.0),
+                (0.0, 0.0),
+                bounds
+            ),
+            None
+        );
     }
 }

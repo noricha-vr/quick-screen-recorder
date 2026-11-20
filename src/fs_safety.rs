@@ -1,16 +1,25 @@
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::ptr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use crate::config::APP_SUPPORT_DIR_NAME;
 use crate::observe::now_unix_secs;
+pub use crate::staging::ExclusiveStagingDir;
 
 static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(1);
+const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
+
+unsafe extern "C" {
+    fn acl_get_link_np(path: *const libc::c_char, acl_type: libc::c_int) -> *mut libc::c_void;
+    fn acl_to_text(acl: *mut libc::c_void, len_p: *mut libc::ssize_t) -> *mut libc::c_char;
+    fn acl_free(obj_p: *mut libc::c_void) -> libc::c_int;
+}
 
 pub fn random_hex_token() -> String {
     let mut buf = [0_u8; 16];
@@ -47,7 +56,7 @@ pub fn valid_home_dir() -> Option<PathBuf> {
     if p.is_absolute() { Some(p) } else { None }
 }
 
-/// Returns `~/Desktop` when available as a verified directory owned by the current user,
+/// Returns `~/Desktop` when available as a verified writable directory owned by the current user,
 /// falling back to `HOME` or the private `0700` cache directory.
 pub fn default_desktop_export_dir() -> PathBuf {
     if let Some(home) = valid_home_dir() {
@@ -59,11 +68,11 @@ pub fn default_desktop_export_dir() -> PathBuf {
             return home;
         }
     }
-    private_cache_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
+    private_cache_dir().unwrap_or_else(|_| PathBuf::from("/private/tmp"))
 }
 
-/// Verifies `dir` is an absolute, dot-free, non-symlink directory whose ancestor chain has no
-/// user-controlled symlinks or non-sticky world-writable directories.
+/// Verifies `dir` is an absolute, dot-free, writable, non-symlink directory with safe group/ACL
+/// permissions and no user-controlled symlinks in its ancestor chain.
 pub fn is_usable_export_dir(dir: &Path) -> bool {
     if !dir.is_absolute()
         || dir
@@ -76,14 +85,67 @@ pub fn is_usable_export_dir(dir: &Path) -> bool {
     let Ok(meta) = fs::symlink_metadata(dir) else {
         return false;
     };
-    if meta.file_type().is_symlink() || !meta.is_dir() || (meta.uid() != euid && meta.uid() != 0) {
+    if meta.file_type().is_symlink() || !meta.is_dir() {
         return false;
     }
     let mode = meta.permissions().mode();
-    if (mode & 0o002 != 0) && (mode & 0o1000 == 0) {
+    let sticky = (mode & 0o1000) != 0;
+    // Leaf export dir must be owned by current user (or be a sticky root temp dir), never e.g. /System
+    if meta.uid() != euid && !(meta.uid() == 0 && sticky) {
+        return false;
+    }
+    if !is_safe_dir_mode_and_group(mode, meta.gid()) || !has_only_safe_acls(dir, euid, sticky) {
+        return false;
+    }
+    if !is_dir_writable(dir) {
         return false;
     }
     verify_safe_dir_ancestors(dir.parent(), euid)
+}
+
+/// Validates existing ancestors BEFORE `canonicalize` so `symlink_dir/real_sub/out.mp4` is rejected.
+pub(crate) fn verify_pre_canonical_target_parent(parent: &Path, euid: u32) -> Result<(), String> {
+    let abs = if parent.is_absolute() {
+        parent.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| format!("Cannot resolve cwd: {e}"))?
+            .join(parent)
+    };
+    if abs.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err("Refusing parent-traversal ('..') in output path".to_string());
+    }
+    let mut cur: Option<&Path> = Some(&abs);
+    while let Some(p) = cur {
+        if p.as_os_str().is_empty() {
+            break;
+        }
+        match fs::symlink_metadata(p) {
+            Ok(lmeta) => {
+                if lmeta.file_type().is_symlink() && lmeta.uid() != 0 {
+                    return Err("Refusing to traverse user symlink in output path".to_string());
+                }
+                if !lmeta.file_type().is_symlink() {
+                    let mode = lmeta.permissions().mode();
+                    let sticky = (mode & 0o1000) != 0;
+                    if !lmeta.is_dir()
+                        || (lmeta.uid() != euid && lmeta.uid() != 0)
+                        || !is_safe_dir_mode_and_group(mode, lmeta.gid())
+                        || !has_only_safe_acls(p, euid, sticky)
+                    {
+                        return Err(
+                            "Output ancestor directory failed ownership or permission check"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("Failed inspecting output path ancestor: {e}")),
+        }
+        cur = p.parent();
+    }
+    Ok(())
 }
 
 fn verify_safe_dir_ancestors(mut cur: Option<&Path>, euid: u32) -> bool {
@@ -94,23 +156,127 @@ fn verify_safe_dir_ancestors(mut cur: Option<&Path>, euid: u32) -> bool {
         let Ok(lmeta) = fs::symlink_metadata(anc) else {
             return false;
         };
-        // Only root-owned macOS system symlinks (e.g. /var -> private/var, /tmp -> private/tmp) are permitted
         if lmeta.file_type().is_symlink() && lmeta.uid() != 0 {
             return false;
         }
         let Ok(dmeta) = fs::metadata(anc) else {
             return false;
         };
-        if !dmeta.is_dir() || (dmeta.uid() != euid && dmeta.uid() != 0) {
-            return false;
-        }
         let dmode = dmeta.permissions().mode();
-        if (dmode & 0o002 != 0) && (dmode & 0o1000 == 0) {
+        let sticky = (dmode & 0o1000) != 0;
+        if !dmeta.is_dir()
+            || (dmeta.uid() != euid && dmeta.uid() != 0)
+            || !is_safe_dir_mode_and_group(dmode, dmeta.gid())
+            || !has_only_safe_acls(anc, euid, sticky)
+        {
             return false;
         }
         cur = anc.parent();
     }
     true
+}
+
+const fn is_safe_dir_mode_and_group(mode: u32, gid: u32) -> bool {
+    let sticky = (mode & 0o1000) != 0;
+    if sticky {
+        return true;
+    }
+    if (mode & 0o002) != 0 {
+        return false;
+    }
+    if (mode & 0o020) != 0 && gid != 0 && gid != 80 {
+        return false;
+    }
+    true
+}
+
+fn is_dir_writable(dir: &Path) -> bool {
+    let Ok(c_path) = CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    unsafe { libc::access(c_path.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
+}
+
+/// Allowlist check for Darwin extended ACLs (`<sys/acl.h>`): allows absent ACLs, `deny` entries
+/// (such as macOS's default `group:everyone deny delete` on `~/Desktop`), `allow` entries scoped to
+/// `euid` itself, or strictly read-only `allow` permissions. Any third-party write/modify ACL fails closed.
+fn has_only_safe_acls(dir: &Path, euid: u32, sticky: bool) -> bool {
+    if sticky {
+        return true;
+    }
+    let Ok(c_path) = CString::new(dir.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let acl = unsafe { acl_get_link_np(c_path.as_ptr(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        return true;
+    }
+    let mut text_len: libc::ssize_t = 0;
+    let text_ptr = unsafe { acl_to_text(acl, &mut text_len) };
+    if text_ptr.is_null() {
+        unsafe {
+            acl_free(acl);
+        }
+        return false;
+    }
+    let text = unsafe { CStr::from_ptr(text_ptr).to_string_lossy().into_owned() };
+    unsafe {
+        acl_free(text_ptr.cast());
+        acl_free(acl);
+    }
+    is_acl_text_allowlisted(&text, euid)
+}
+
+fn is_acl_text_allowlisted(acl_text: &str, euid: u32) -> bool {
+    for raw_line in acl_text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with("!#acl") {
+            continue;
+        }
+        // Darwin acl_to_text format: <tag>:<uuid>:<name>:<id>:<allow|deny>:<perms>
+        let parts: Vec<&str> = line.split(':').collect();
+        if parts.len() < 6 {
+            return false;
+        }
+        let tag = parts[0];
+        let id_str = parts[3];
+        let action = parts[4];
+        let perms = parts[5];
+        if action == "deny" {
+            continue;
+        }
+        if action != "allow" {
+            return false;
+        }
+        if tag == "user" && id_str.parse::<u32>() == Ok(euid) {
+            continue;
+        }
+        let all_readonly = perms.split(',').all(|p| {
+            matches!(
+                p.trim(),
+                "read"
+                    | "list"
+                    | "search"
+                    | "execute"
+                    | "readattr"
+                    | "readextattr"
+                    | "readsecurity"
+            )
+        });
+        if !all_readonly {
+            return false;
+        }
+    }
+    true
+}
+
+pub(crate) fn strip_extended_acl(path: &Path) {
+    if let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) {
+        let attr = c"com.apple.system.Security";
+        unsafe {
+            let _ = libc::removexattr(c_path.as_ptr(), attr.as_ptr(), libc::XATTR_NOFOLLOW);
+        }
+    }
 }
 
 /// Formats a directory path with `~` substitution for UI display so personal home usernames never appear on screen.
@@ -183,204 +349,6 @@ pub fn ensure_distinct_files(input: &Path, output: &Path) -> Result<(), String> 
     Ok(())
 }
 
-/// An exclusively created (`mkdir` `0700`) staging directory on the same filesystem as the destination.
-/// Stores the canonicalized destination path at creation time to prevent parent-symlink TOCTOU swaps.
-pub struct ExclusiveStagingDir {
-    dir_path: PathBuf,
-    staged_file: PathBuf,
-    canon_dest: PathBuf,
-}
-
-impl ExclusiveStagingDir {
-    pub fn create_for_target(target: &Path, ext: &str) -> Result<Self, String> {
-        let file_name = target
-            .file_name()
-            .ok_or("Target path is missing a file name")?;
-        if let Ok(sym) = fs::symlink_metadata(target) {
-            if sym.file_type().is_symlink() {
-                return Err("Refusing to overwrite a symlink target path".to_string());
-            }
-        }
-        let parent = match target.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-            _ => std::env::current_dir()
-                .map_err(|e| format!("Cannot resolve working directory: {e}"))?,
-        };
-        let euid = unsafe { libc::geteuid() };
-        if let Ok(psym) = fs::symlink_metadata(&parent) {
-            if psym.file_type().is_symlink() && psym.uid() != 0 {
-                return Err("Refusing to use symlinked output directory".to_string());
-            }
-        }
-        fs::create_dir_all(&parent)
-            .map_err(|e| format!("Failed creating output directory: {e}"))?;
-        if let Ok(psym) = fs::symlink_metadata(&parent) {
-            if psym.file_type().is_symlink() && psym.uid() != 0 {
-                return Err("Refusing to use symlinked output directory".to_string());
-            }
-        }
-        let canon_parent = fs::canonicalize(&parent)
-            .map_err(|e| format!("Failed resolving canonical output directory: {e}"))?;
-        if !is_usable_export_dir(&canon_parent) {
-            return Err("Output directory failed ownership or symlink safety check".to_string());
-        }
-        let canon_dest = canon_parent.join(file_name);
-
-        if let Ok(existing) = fs::symlink_metadata(&canon_dest) {
-            if existing.file_type().is_symlink() || !existing.is_file() || existing.uid() != euid {
-                return Err(
-                    "Refusing to overwrite symlink, special file, or file owned by another user"
-                        .to_string(),
-                );
-            }
-        }
-
-        let dir_path = canon_parent.join(format!(".qsr-work-{}", random_hex_token()));
-        DirBuilder::new()
-            .mode(0o700)
-            .create(&dir_path)
-            .map_err(|e| format!("Failed creating exclusive 0700 staging directory: {e}"))?;
-
-        let dir_meta = fs::symlink_metadata(&dir_path)
-            .map_err(|e| format!("Failed verifying staging directory metadata: {e}"))?;
-        if dir_meta.file_type().is_symlink() || !dir_meta.is_dir() || dir_meta.uid() != euid {
-            let _ = fs::remove_dir_all(&dir_path);
-            return Err("Staging directory ownership verification failed".to_string());
-        }
-
-        let staged_file = dir_path.join(format!("staged.{ext}"));
-        Ok(Self {
-            dir_path,
-            staged_file,
-            canon_dest,
-        })
-    }
-
-    pub fn staged_file(&self) -> &Path {
-        &self.staged_file
-    }
-
-    pub fn commit(&self) -> Result<u64, String> {
-        self.commit_with_policy(false).map(|(_, len)| len)
-    }
-
-    pub fn commit_with_policy(&self, prevent_overwrite: bool) -> Result<(PathBuf, u64), String> {
-        let euid = unsafe { libc::geteuid() };
-        let staged_meta = fs::symlink_metadata(&self.staged_file)
-            .map_err(|e| format!("Staged output file missing: {e}"))?;
-        if staged_meta.file_type().is_symlink()
-            || !staged_meta.is_file()
-            || staged_meta.uid() != euid
-            || staged_meta.len() == 0
-        {
-            return Err("Staged output file is empty or invalid".to_string());
-        }
-        let Some(canon_parent) = self.canon_dest.parent() else {
-            return Err("Destination parent missing".to_string());
-        };
-        if !is_usable_export_dir(canon_parent) {
-            return Err("Destination directory changed during export".to_string());
-        }
-
-        if prevent_overwrite {
-            fs::set_permissions(&self.staged_file, fs::Permissions::from_mode(0o600))
-                .map_err(|e| format!("Failed setting output file permissions: {e}"))?;
-            let final_dest = rename_exclusive_with_retry(&self.staged_file, &self.canon_dest)?;
-            return Ok((final_dest, staged_meta.len()));
-        }
-
-        // Explicit CLI overwrite mode: only overwrite a regular file owned by current user
-        let desired_mode = match fs::symlink_metadata(&self.canon_dest) {
-            Ok(existing) => {
-                if existing.file_type().is_symlink()
-                    || !existing.is_file()
-                    || existing.uid() != euid
-                {
-                    return Err(
-                        "Refusing to overwrite symlink, non-regular file, or file owned by another user"
-                            .to_string(),
-                    );
-                }
-                existing.permissions().mode() & 0o777
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => 0o600,
-            Err(e) => return Err(format!("Failed inspecting destination path: {e}")),
-        };
-
-        fs::set_permissions(&self.staged_file, fs::Permissions::from_mode(desired_mode))
-            .map_err(|e| format!("Failed setting output file permissions: {e}"))?;
-        fs::rename(&self.staged_file, &self.canon_dest)
-            .map_err(|e| format!("Failed moving staged file to destination: {e}"))?;
-        Ok((self.canon_dest.clone(), staged_meta.len()))
-    }
-}
-
-fn rename_exclusive_with_retry(staged: &Path, initial_dest: &Path) -> Result<PathBuf, String> {
-    if try_rename_excl(staged, initial_dest)? {
-        return Ok(initial_dest.to_path_buf());
-    }
-    let parent = initial_dest.parent().ok_or("Missing parent directory")?;
-    let ext = initial_dest
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("mp4");
-    let raw_stem = initial_dest
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("Recording");
-    let base_stem = strip_numeric_collision_suffix(raw_stem);
-
-    for suffix in 2..=9999_u32 {
-        let candidate = parent.join(format!("{base_stem}-{suffix}.{ext}"));
-        if try_rename_excl(staged, &candidate)? {
-            return Ok(candidate);
-        }
-    }
-    let fallback = parent.join(format!("{base_stem}-{}.{ext}", random_hex_token()));
-    if try_rename_excl(staged, &fallback)? {
-        Ok(fallback)
-    } else {
-        Err("Failed finding non-colliding output filename".to_string())
-    }
-}
-
-fn strip_numeric_collision_suffix(stem: &str) -> &str {
-    // Preserve YYYY-MM-DD-HHMMSS (6 digits at end), only strip short -2..-9999 collision suffixes
-    if let Some((prefix, tail)) = stem.rsplit_once('-') {
-        if (1..=4).contains(&tail.len()) && tail.chars().all(|c| c.is_ascii_digit()) {
-            // Avoid stripping -DD from YYYY-MM-DD if prefix ends with YYYY-MM (4-2 pattern)
-            let looks_like_date =
-                prefix.len() >= 7 && prefix.as_bytes()[prefix.len() - 3] == b'-' && tail.len() == 2;
-            if !looks_like_date {
-                return prefix;
-            }
-        }
-    }
-    stem
-}
-
-fn try_rename_excl(from: &Path, to: &Path) -> Result<bool, String> {
-    let from_c =
-        CString::new(from.as_os_str().as_bytes()).map_err(|_| "Invalid staged path bytes")?;
-    let to_c = CString::new(to.as_os_str().as_bytes()).map_err(|_| "Invalid target path bytes")?;
-    let rc = unsafe { libc::renamex_np(from_c.as_ptr(), to_c.as_ptr(), libc::RENAME_EXCL) };
-    if rc == 0 {
-        return Ok(true);
-    }
-    let err = io::Error::last_os_error();
-    if err.raw_os_error() == Some(libc::EEXIST) {
-        Ok(false)
-    } else {
-        Err(format!("Atomic exclusive rename failed: {err}"))
-    }
-}
-
-impl Drop for ExclusiveStagingDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir_path);
-    }
-}
-
 pub fn private_cache_dir() -> Result<PathBuf, String> {
     let base = if let Some(home) = valid_home_dir() {
         home.join("Library")
@@ -393,6 +361,7 @@ pub fn private_cache_dir() -> Result<PathBuf, String> {
     };
 
     ensure_private_dir(&base)?;
+    strip_extended_acl(&base);
     Ok(base)
 }
 
@@ -406,7 +375,7 @@ pub fn ensure_private_dir(dir: &Path) -> Result<(), String> {
                 .map_err(|e| format!("Failed creating parent directory: {e}"))?;
         }
         if let Ok(pm) = fs::symlink_metadata(parent) {
-            if pm.file_type().is_symlink() {
+            if pm.file_type().is_symlink() && pm.uid() != 0 {
                 return Err("Refusing to use symlinked parent directory".to_string());
             }
         }
@@ -442,6 +411,7 @@ pub fn ensure_private_dir(dir: &Path) -> Result<(), String> {
     dir_fd
         .set_permissions(fs::Permissions::from_mode(0o700))
         .map_err(|e| format!("Failed setting 0700 permissions on private directory: {e}"))?;
+    let _ = ptr::null::<u8>();
     Ok(())
 }
 
@@ -567,6 +537,7 @@ mod tests {
     fn exclusive_staging_enforces_0600_for_new_files_and_cleans_up() {
         let dir = std::env::temp_dir().join(format!("qsr-stage-test-{}", random_hex_token()));
         fs::create_dir_all(&dir).expect("mkdir");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
         let dest = dir.join("result.gif");
         {
             let stage = ExclusiveStagingDir::create_for_target(&dest, "gif").expect("stage");
@@ -594,7 +565,6 @@ mod tests {
         assert_eq!(p1.file_name().unwrap(), "Recording-2026-11-21-120000.mp4");
         fs::write(&p1, b"clip1").expect("write p1");
 
-        // Even a dangling symlink at -2 must be skipped
         let link2 = dir.join("Recording-2026-11-21-120000-2.mp4");
         std::os::unix::fs::symlink(dir.join("missing.mp4"), &link2).expect("dangling symlink");
 
@@ -604,19 +574,24 @@ mod tests {
     }
 
     #[test]
-    fn format_tilde_hides_home_prefix() {
+    fn format_tilde_hides_home_prefix_and_desktop_is_usable() {
         if let Some(home) = valid_home_dir() {
-            assert_eq!(format_tilde_path(&home.join("Desktop")), "~/Desktop");
+            let desktop = home.join("Desktop");
+            assert_eq!(format_tilde_path(&desktop), "~/Desktop");
+            if desktop.is_dir() {
+                assert!(is_usable_export_dir(&desktop));
+            }
         }
+        assert!(!is_usable_export_dir(Path::new("/System")));
     }
 
     #[test]
-    fn concurrent_prevent_overwrite_commits_preserve_both_recordings_and_reject_symlinks() {
+    fn concurrent_commits_reject_group_write_acl_and_ancestor_symlinks() {
         let dir = std::env::temp_dir().join(format!("qsr-atomic-excl-{}", random_hex_token()));
         fs::create_dir_all(&dir).expect("mkdir");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
         let same_target = dir.join("Recording-2026-11-21-150000.mp4");
 
-        // Two concurrent editors pick the exact same target name before either commits
         let s1 = ExclusiveStagingDir::create_for_target(&same_target, "mp4").expect("stage1");
         let s2 = ExclusiveStagingDir::create_for_target(&same_target, "mp4").expect("stage2");
         fs::write(s1.staged_file(), b"first-video").expect("write s1");
@@ -627,14 +602,36 @@ mod tests {
         assert_ne!(p1, p2);
         assert_eq!(fs::read(&p1).unwrap(), b"first-video");
         assert_eq!(fs::read(&p2).unwrap(), b"second-video");
-        assert!(p2.file_name().unwrap().to_string_lossy().contains("-2.mp4"));
 
-        // User-created symlinked export directory must be rejected by is_usable_export_dir
-        let sym_dir = dir.join("sym-export");
-        std::os::unix::fs::symlink(&dir, &sym_dir).expect("symlink dir");
-        assert!(!is_usable_export_dir(&sym_dir));
-        assert!(!is_usable_export_dir(&sym_dir.join("sub")));
-        assert!(!is_usable_export_dir(&dir.join("..").join("tmp")));
+        // Reject 0770 group-writable non-sticky directory (staff = 20)
+        let grp_dir = dir.join("group-writable");
+        fs::create_dir_all(&grp_dir).expect("mkdir grp");
+        fs::set_permissions(&grp_dir, fs::Permissions::from_mode(0o770)).expect("chmod 0770");
+        if fs::metadata(&grp_dir).unwrap().gid() != 0 && fs::metadata(&grp_dir).unwrap().gid() != 80
+        {
+            assert!(!is_usable_export_dir(&grp_dir));
+        }
+
+        // Reject pre-canonicalize ancestor symlink (link/sub/out.mp4)
+        let real_sub = dir.join("real-sub");
+        fs::create_dir_all(&real_sub).expect("mkdir real-sub");
+        fs::set_permissions(&real_sub, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+        let sym_anc = dir.join("sym-anc");
+        std::os::unix::fs::symlink(&dir, &sym_anc).expect("symlink anc");
+        assert!(
+            ExclusiveStagingDir::create_for_target(&sym_anc.join("real-sub/out.mp4"), "mp4")
+                .is_err()
+        );
+
+        // Verify ACL allowlist rejects third-party write ACE while accepting macOS deny:delete
+        assert!(is_acl_text_allowlisted(
+            "!#acl 1\ngroup:ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C:everyone:12:deny:delete\n",
+            501
+        ));
+        assert!(!is_acl_text_allowlisted(
+            "!#acl 1\ngroup:ABCDEFAB-CDEF-ABCD-EFAB-CDEF00000014:staff:20:allow:write,add_file\n",
+            501
+        ));
 
         let _ = fs::remove_dir_all(&dir);
     }

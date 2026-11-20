@@ -90,33 +90,72 @@ pub fn capture_window_view_to_png(window: &NSWindow, output_path: &Path) -> Resu
         unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &empty_props) }
             .ok_or("Failed to encode window bitmap as PNG")?;
 
-    let bytes = strip_ancillary_png_chunks(&png_data.to_vec());
+    let bytes = strip_ancillary_png_chunks(&png_data.to_vec())?;
     crate::fs_safety::atomic_write_private(output_path, &bytes)
         .map_err(|e| format!("Failed writing PNG screenshot: {e}"))
 }
 
 /// Retains only `IHDR`, `IDAT`, and `IEND` PNG chunks so display ICC color profile names never leak.
-fn strip_ancillary_png_chunks(png: &[u8]) -> Vec<u8> {
+/// Fails closed with `Err` if the PNG signature, chunk bounds, or `IEND` trailer is malformed.
+pub fn strip_ancillary_png_chunks(png: &[u8]) -> Result<Vec<u8>, String> {
     const SIG: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
     if png.len() < 8 || &png[..8] != SIG {
-        return png.to_vec();
+        return Err("Invalid PNG signature".to_string());
     }
     let mut out = Vec::with_capacity(png.len());
     out.extend_from_slice(SIG);
     let mut pos = 8_usize;
-    while pos + 12 <= png.len() {
+    let mut saw_ihdr = false;
+    let mut saw_idat = false;
+    let mut saw_iend = false;
+    while pos < png.len() {
+        if pos + 12 > png.len() {
+            return Err("Truncated PNG chunk header".to_string());
+        }
         let len = u32::from_be_bytes([png[pos], png[pos + 1], png[pos + 2], png[pos + 3]]) as usize;
-        let Some(chunk_end) = pos.checked_add(12).and_then(|n| n.checked_add(len)) else {
-            return png.to_vec();
-        };
+        let chunk_end = pos
+            .checked_add(12)
+            .and_then(|n| n.checked_add(len))
+            .ok_or("PNG chunk length overflow")?;
         if chunk_end > png.len() {
-            return png.to_vec();
+            return Err("Truncated PNG chunk payload".to_string());
         }
         let tag = &png[pos + 4..pos + 8];
-        if matches!(tag, b"IHDR" | b"IDAT" | b"IEND") {
-            out.extend_from_slice(&png[pos..chunk_end]);
+        match tag {
+            b"IHDR" => {
+                saw_ihdr = true;
+                out.extend_from_slice(&png[pos..chunk_end]);
+            }
+            b"IDAT" => {
+                saw_idat = true;
+                out.extend_from_slice(&png[pos..chunk_end]);
+            }
+            b"IEND" => {
+                saw_iend = true;
+                out.extend_from_slice(&png[pos..chunk_end]);
+                break;
+            }
+            _ => {}
         }
         pos = chunk_end;
     }
-    out
+    if !saw_ihdr || !saw_idat || !saw_iend {
+        return Err("PNG missing required IHDR/IDAT/IEND chunks".to_string());
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn png_chunk_stripper_fails_closed_on_corrupt_input() {
+        assert!(strip_ancillary_png_chunks(b"not-a-png").is_err());
+        let mut corrupt = b"\x89PNG\r\n\x1a\n".to_vec();
+        corrupt.extend_from_slice(&[0x7F, 0xFF, 0xFF, 0xFF]);
+        corrupt.extend_from_slice(b"iCCP");
+        corrupt.extend_from_slice(b"leak");
+        assert!(strip_ancillary_png_chunks(&corrupt).is_err());
+    }
 }

@@ -70,11 +70,26 @@ impl OverlayState {
 
     pub fn window_overlay_rect(&self, idx: usize) -> Option<Rect> {
         let wf = self.windows.get(idx)?.frame;
-        Some(window_frame_to_overlay_rect(
-            wf,
-            self.display_origin(),
-            self.bounds,
-        ))
+        window_frame_to_overlay_rect(wf, self.display_origin(), self.bounds)
+    }
+
+    pub fn display_for_window(&self, idx: usize) -> Option<u32> {
+        let wf = self.windows.get(idx)?.frame;
+        let cx = wf.x + wf.width * 0.5;
+        let cy = wf.y + wf.height * 0.5;
+        if let Some(d) = self.displays.iter().find(|d| d.frame.contains(cx, cy)) {
+            return Some(d.display_id);
+        }
+        self.displays
+            .iter()
+            .find(|d| {
+                let ix0 = wf.x.max(d.frame.x);
+                let iy0 = wf.y.max(d.frame.y);
+                let ix1 = wf.right().min(d.frame.right());
+                let iy1 = wf.top_y_up().min(d.frame.top_y_up());
+                ix1 > ix0 && iy1 > iy0
+            })
+            .map(|d| d.display_id)
     }
 
     pub fn hit_test_window_at(
