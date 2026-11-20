@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use quick_screen_recorder::capture::RecordingCodec;
 use quick_screen_recorder::export::av_writer::write_rgba_frames_to_mp4;
@@ -8,7 +10,9 @@ use quick_screen_recorder::export::avfoundation::{
     RgbaFrame, extract_rgba_frame, probe_video_metadata,
 };
 use quick_screen_recorder::export::ffmpeg::detect_ffmpeg_binary;
-use quick_screen_recorder::export::{ExportFormat, ExportRequest, run_export};
+use quick_screen_recorder::export::{
+    ExportFormat, ExportRequest, run_export, run_export_with_progress,
+};
 use quick_screen_recorder::fs_safety::next_unique_token;
 use quick_screen_recorder::observe::summarize_perf_log;
 
@@ -149,18 +153,23 @@ fn end_to_end_native_exports_codec_resize_metadata_and_telemetry() {
         "expected H.264 after converting from HEVC"
     );
 
-    // 4. Native GIF export
+    // 4. Native GIF export (also verifies real-time progress reaches 1000 = 100%)
     let out_gif = work.join("out.gif");
-    let gif_res = run_export(&ExportRequest {
-        input: src_mp4.clone(),
-        output: out_gif.clone(),
-        format: ExportFormat::Gif,
-        fps: 15,
-        start_sec: Some(0.1),
-        end_sec: Some(1.0),
-        max_width: Some(320),
-    })
+    let gif_prog = Arc::new(AtomicU32::new(0));
+    let gif_res = run_export_with_progress(
+        &ExportRequest {
+            input: src_mp4.clone(),
+            output: out_gif.clone(),
+            format: ExportFormat::Gif,
+            fps: 15,
+            start_sec: Some(0.1),
+            end_sec: Some(1.0),
+            max_width: Some(320),
+        },
+        Some(&gif_prog),
+    )
     .expect("export gif");
+    assert_eq!(gif_prog.load(Ordering::Relaxed), 1000);
     assert!(gif_res.output_bytes > 500);
     assert!(fs::read(&out_gif).expect("read gif").starts_with(b"GIF89a"));
 

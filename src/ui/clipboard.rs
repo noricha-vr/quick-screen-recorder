@@ -90,7 +90,33 @@ pub fn capture_window_view_to_png(window: &NSWindow, output_path: &Path) -> Resu
         unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &empty_props) }
             .ok_or("Failed to encode window bitmap as PNG")?;
 
-    let bytes = png_data.to_vec();
+    let bytes = strip_ancillary_png_chunks(&png_data.to_vec());
     crate::fs_safety::atomic_write_private(output_path, &bytes)
         .map_err(|e| format!("Failed writing PNG screenshot: {e}"))
+}
+
+/// Retains only `IHDR`, `IDAT`, and `IEND` PNG chunks so display ICC color profile names never leak.
+fn strip_ancillary_png_chunks(png: &[u8]) -> Vec<u8> {
+    const SIG: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if png.len() < 8 || &png[..8] != SIG {
+        return png.to_vec();
+    }
+    let mut out = Vec::with_capacity(png.len());
+    out.extend_from_slice(SIG);
+    let mut pos = 8_usize;
+    while pos + 12 <= png.len() {
+        let len = u32::from_be_bytes([png[pos], png[pos + 1], png[pos + 2], png[pos + 3]]) as usize;
+        let Some(chunk_end) = pos.checked_add(12).and_then(|n| n.checked_add(len)) else {
+            return png.to_vec();
+        };
+        if chunk_end > png.len() {
+            return png.to_vec();
+        }
+        let tag = &png[pos + 4..pos + 8];
+        if matches!(tag, b"IHDR" | b"IDAT" | b"IEND") {
+            out.extend_from_slice(&png[pos..chunk_end]);
+        }
+        pos = chunk_end;
+    }
+    out
 }

@@ -1,3 +1,4 @@
+pub mod av_decode;
 pub mod av_writer;
 pub mod avfoundation;
 pub mod ffmpeg;
@@ -5,12 +6,23 @@ pub mod gif_apng;
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
 use crate::fs_safety::{ExclusiveStagingDir, ensure_distinct_files};
 use crate::observe::{PerfEvent, PerfKind, now_unix_secs, record_perf_event};
+
+/// Atomic export progress in permille (`0..=1000`, representing `0.0%..=100.0%`).
+pub type SharedExportProgress = Arc<AtomicU32>;
+
+pub fn set_progress_permille(progress: Option<&SharedExportProgress>, permille: u32) {
+    if let Some(p) = progress {
+        p.fetch_max(permille.min(1000), Ordering::Relaxed);
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -110,6 +122,16 @@ pub struct ExportResult {
 }
 
 pub fn run_export(req: &ExportRequest) -> Result<ExportResult, String> {
+    run_export_with_progress(req, None)
+}
+
+pub fn run_export_with_progress(
+    req: &ExportRequest,
+    progress: Option<&SharedExportProgress>,
+) -> Result<ExportResult, String> {
+    if let Some(p) = progress {
+        p.store(0, Ordering::Relaxed);
+    }
     if !req.input.exists() {
         return Err("Input recording file does not exist".to_string());
     }
@@ -123,6 +145,7 @@ pub fn run_export(req: &ExportRequest) -> Result<ExportResult, String> {
     let canon_input = fs::canonicalize(&req.input)
         .map_err(|e| format!("Failed resolving input file path: {e}"))?;
     let stage = ExclusiveStagingDir::create_for_target(&req.output, req.format.extension())?;
+    set_progress_permille(progress, 30);
 
     let meta = avfoundation::probe_video_metadata(&canon_input)?;
     let start = req.start_sec.unwrap_or(0.0).clamp(0.0, meta.duration_sec);
@@ -133,6 +156,7 @@ pub fn run_export(req: &ExportRequest) -> Result<ExportResult, String> {
     if end <= start + 0.02 {
         return Err("Selected trim range is too short (minimum 0.02s)".to_string());
     }
+    set_progress_permille(progress, 50);
     let clip_duration_ms = ((end - start) * 1000.0).round() as u64;
 
     let staged_req = ExportRequest {
@@ -148,11 +172,13 @@ pub fn run_export(req: &ExportRequest) -> Result<ExportResult, String> {
     let t0 = Instant::now();
     let res = match staged_req.format {
         ExportFormat::Mp4 | ExportFormat::Hevc => {
-            avfoundation::export_mp4_or_hevc(&staged_req, &meta)
+            avfoundation::export_mp4_or_hevc(&staged_req, &meta, progress)
         }
-        ExportFormat::Gif => gif_apng::export_gif(&staged_req, &meta),
-        ExportFormat::Apng => gif_apng::export_apng(&staged_req, &meta),
-        ExportFormat::Webm | ExportFormat::Av1 => ffmpeg::export_with_ffmpeg(&staged_req),
+        ExportFormat::Gif => gif_apng::export_gif(&staged_req, &meta, progress),
+        ExportFormat::Apng => gif_apng::export_apng(&staged_req, &meta, progress),
+        ExportFormat::Webm | ExportFormat::Av1 => {
+            ffmpeg::export_with_ffmpeg(&staged_req, (end - start).max(0.05), progress)
+        }
     };
     let elapsed_ms = t0.elapsed().as_millis() as u64;
 
@@ -174,6 +200,7 @@ pub fn run_export(req: &ExportRequest) -> Result<ExportResult, String> {
                     return Err(err);
                 }
             };
+            set_progress_permille(progress, 1000);
             record_perf_event(&PerfEvent {
                 ts_unix: now_unix_secs(),
                 kind: PerfKind::Export,

@@ -113,6 +113,18 @@ pub fn query_shareable_content() -> Result<ShareableSnapshot, String> {
             if app.processID() == current_pid {
                 continue;
             }
+            let bundle_id = app.bundleIdentifier().to_string();
+            if matches!(
+                bundle_id.as_str(),
+                "com.apple.dock"
+                    | "com.apple.WindowManager"
+                    | "com.apple.controlcenter"
+                    | "com.apple.notificationcenterui"
+                    | "com.apple.systemuiserver"
+                    | "com.apple.wallpaper.agent"
+            ) {
+                continue;
+            }
             let app_name = app.applicationName().to_string();
             if app_name.trim().is_empty() {
                 continue;

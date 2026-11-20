@@ -1,6 +1,6 @@
 use std::ffi::CString;
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::os::fd::FromRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -9,7 +9,7 @@ use std::ptr;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::export::{ExportFormat, ExportRequest};
+use crate::export::{ExportFormat, ExportRequest, SharedExportProgress, set_progress_permille};
 use crate::fs_safety::sanitize_terminal_text;
 
 const ALLOWLISTED_FFMPEG_PATHS: [&str; 3] = [
@@ -41,7 +41,11 @@ pub fn detect_ffmpeg_binary() -> Option<PathBuf> {
     None
 }
 
-pub fn export_with_ffmpeg(req: &ExportRequest) -> Result<(), String> {
+pub fn export_with_ffmpeg(
+    req: &ExportRequest,
+    clip_duration_sec: f64,
+    progress: Option<&SharedExportProgress>,
+) -> Result<(), String> {
     let ffmpeg = detect_ffmpeg_binary().ok_or_else(|| {
         format!(
             "{} export requires a trusted 'ffmpeg' binary at /opt/homebrew/bin/ffmpeg or /usr/local/bin/ffmpeg. MP4, HEVC, GIF, and APNG work natively without ffmpeg.",
@@ -75,6 +79,8 @@ pub fn export_with_ffmpeg(req: &ExportRequest) -> Result<(), String> {
                 "libopus",
             ],
             "webm",
+            clip_duration_sec,
+            progress,
         ),
         ExportFormat::Av1 => {
             let svt = run_ffmpeg_encode(
@@ -95,6 +101,8 @@ pub fn export_with_ffmpeg(req: &ExportRequest) -> Result<(), String> {
                     "aac",
                 ],
                 "mp4",
+                clip_duration_sec,
+                progress,
             );
             if svt.is_ok() {
                 return Ok(());
@@ -119,6 +127,8 @@ pub fn export_with_ffmpeg(req: &ExportRequest) -> Result<(), String> {
                     "aac",
                 ],
                 "mp4",
+                clip_duration_sec,
+                progress,
             )
         }
         other => Err(format!(
@@ -128,6 +138,7 @@ pub fn export_with_ffmpeg(req: &ExportRequest) -> Result<(), String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_ffmpeg_encode(
     ffmpeg_bin: &Path,
     input_file_url: &str,
@@ -135,12 +146,17 @@ fn run_ffmpeg_encode(
     req: &ExportRequest,
     codec_args: &[&str],
     container: &str,
+    clip_duration_sec: f64,
+    progress: Option<&SharedExportProgress>,
 ) -> Result<(), String> {
     let mut args: Vec<String> = vec![
         "-nostdin".into(),
         "-hide_banner".into(),
         "-loglevel".into(),
         "error".into(),
+        "-nostats".into(),
+        "-progress".into(),
+        "pipe:1".into(),
         "-y".into(),
         "-protocol_whitelist".into(),
         "file".into(),
@@ -201,7 +217,13 @@ fn run_ffmpeg_encode(
         output_file_url.into(),
     ]);
 
-    spawn_disclaimed_with_timeout(ffmpeg_bin, &args, FFMPEG_TIMEOUT)
+    spawn_disclaimed_with_timeout(
+        ffmpeg_bin,
+        &args,
+        FFMPEG_TIMEOUT,
+        clip_duration_sec,
+        progress.cloned(),
+    )
 }
 
 /// Spawns `bin` with `responsibility_spawnattrs_setdisclaim` so the child process does NOT inherit
@@ -210,6 +232,8 @@ fn spawn_disclaimed_with_timeout(
     bin: &Path,
     args: &[String],
     timeout: Duration,
+    clip_duration_sec: f64,
+    progress: Option<SharedExportProgress>,
 ) -> Result<(), String> {
     let prog_c = CString::new(bin.as_os_str().as_bytes())
         .map_err(|_| "Executable path contains NUL byte")?;
@@ -230,8 +254,18 @@ fn spawn_disclaimed_with_timeout(
         env_c.iter().map(|s| s.as_ptr().cast_mut()).collect();
     env_ptrs.push(ptr::null_mut());
 
+    let mut out_fds = [0_i32; 2];
+    if unsafe { libc::pipe(out_fds.as_mut_ptr()) } != 0 {
+        return Err("Failed creating stdout progress pipe for ffmpeg".to_string());
+    }
+    let (out_read_fd, out_write_fd) = (out_fds[0], out_fds[1]);
+
     let mut pipe_fds = [0_i32; 2];
     if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+        unsafe {
+            libc::close(out_read_fd);
+            libc::close(out_write_fd);
+        }
         return Err("Failed creating stderr pipe for ffmpeg".to_string());
     }
     let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
@@ -251,14 +285,14 @@ fn spawn_disclaimed_with_timeout(
             libc::O_RDONLY,
             0,
         );
-        libc::posix_spawn_file_actions_addopen(
+        libc::posix_spawn_file_actions_adddup2(
             &mut file_actions,
+            out_write_fd,
             libc::STDOUT_FILENO,
-            devnull_c.as_ptr(),
-            libc::O_WRONLY,
-            0,
         );
         libc::posix_spawn_file_actions_adddup2(&mut file_actions, write_fd, libc::STDERR_FILENO);
+        libc::posix_spawn_file_actions_addclose(&mut file_actions, out_read_fd);
+        libc::posix_spawn_file_actions_addclose(&mut file_actions, out_write_fd);
         libc::posix_spawn_file_actions_addclose(&mut file_actions, read_fd);
         libc::posix_spawn_file_actions_addclose(&mut file_actions, write_fd);
 
@@ -281,13 +315,35 @@ fn spawn_disclaimed_with_timeout(
     unsafe {
         libc::posix_spawn_file_actions_destroy(&mut file_actions);
         libc::posix_spawnattr_destroy(&mut attrs);
+        libc::close(out_write_fd);
         libc::close(write_fd);
     }
 
     if spawn_rc != 0 {
-        unsafe { libc::close(read_fd) };
+        unsafe {
+            libc::close(out_read_fd);
+            libc::close(read_fd);
+        }
         return Err(format!("posix_spawn failed for ffmpeg: errno {spawn_rc}"));
     }
+
+    let dur = clip_duration_sec.max(0.05);
+    let stdout_handle = thread::spawn(move || {
+        let file = unsafe { fs::File::from_raw_fd(out_read_fd) };
+        let mut reader = BufReader::new(file.take(1_048_576));
+        let mut line = String::new();
+        while reader.read_line(&mut line).unwrap_or(0) > 0 {
+            if let Some(us_raw) = line.trim().strip_prefix("out_time_us=") {
+                if let Ok(us) = us_raw.parse::<i64>() {
+                    if us >= 0 {
+                        let frac = ((us as f64 / 1_000_000.0) / dur).clamp(0.0, 1.0);
+                        set_progress_permille(progress.as_ref(), 50 + (frac * 910.0) as u32);
+                    }
+                }
+            }
+            line.clear();
+        }
+    });
 
     let stderr_handle = thread::spawn(move || {
         let mut reader = unsafe { fs::File::from_raw_fd(read_fd) };
@@ -311,11 +367,14 @@ fn spawn_disclaimed_with_timeout(
                 libc::kill(child_pid, libc::SIGKILL);
                 libc::waitpid(child_pid, &mut status, 0);
             }
+            let _ = stdout_handle.join();
+            let _ = stderr_handle.join();
             return Err("Timed out running ffmpeg export".to_string());
         }
         thread::sleep(Duration::from_millis(15));
     }
 
+    let _ = stdout_handle.join();
     let stderr_bytes = stderr_handle.join().unwrap_or_default();
     if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
         Ok(())

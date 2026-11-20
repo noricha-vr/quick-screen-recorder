@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::capture::{AudioCaptureMode, RecordingCodec};
 use crate::export::ExportFormat;
-use crate::fs_safety::{atomic_write_private, ensure_private_dir, valid_home_dir};
+use crate::fs_safety::{
+    atomic_write_private, default_desktop_export_dir, ensure_private_dir, is_usable_export_dir,
+    valid_home_dir,
+};
 use crate::geometry::{AspectRatio, Rect};
 
 pub const APP_SUPPORT_DIR_NAME: &str = "QuickScreenRecorder";
@@ -24,6 +27,8 @@ pub struct Preferences {
     pub recording_codec: RecordingCodec,
     pub default_export_format: ExportFormat,
     pub export_max_width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_dir: Option<PathBuf>,
 }
 
 impl Default for Preferences {
@@ -38,11 +43,21 @@ impl Default for Preferences {
             recording_codec: RecordingCodec::H264,
             default_export_format: ExportFormat::Mp4,
             export_max_width: None,
+            export_dir: None,
         }
     }
 }
 
 impl Preferences {
+    /// Resolves the pre-selected export destination directory, defaulting to `~/Desktop`.
+    pub fn resolved_export_dir(&self) -> PathBuf {
+        if let Some(dir) = &self.export_dir {
+            if is_usable_export_dir(dir) {
+                return dir.clone();
+            }
+        }
+        default_desktop_export_dir()
+    }
     pub fn default_path() -> Option<PathBuf> {
         let home = valid_home_dir()?;
         Some(
@@ -88,6 +103,13 @@ impl Preferences {
             15 | 24 | 30 | 60 | 120 => prefs.fps,
             _ => 60,
         };
+        if prefs
+            .export_dir
+            .as_ref()
+            .is_some_and(|p| !is_usable_export_dir(p))
+        {
+            prefs.export_dir = None;
+        }
         Ok(prefs)
     }
 
@@ -130,12 +152,22 @@ mod tests {
             recording_codec: RecordingCodec::Hevc,
             default_export_format: ExportFormat::Gif,
             export_max_width: Some(800),
+            export_dir: None,
         };
         prefs.save_to(&tmp).expect("save preferences");
         let raw = std::fs::read_to_string(&tmp).expect("read raw json");
         assert!(!raw.contains("/Users/"));
         let loaded = Preferences::load_from(&tmp).expect("load preferences");
         assert_eq!(loaded, prefs);
+        assert_eq!(loaded.resolved_export_dir(), default_desktop_export_dir());
+
+        let custom_dir = dir.join("exports");
+        std::fs::create_dir_all(&custom_dir).expect("mkdir exports");
+        let mut with_dir = loaded;
+        with_dir.export_dir = Some(custom_dir.clone());
+        with_dir.save_to(&tmp).expect("save custom export_dir");
+        let loaded_custom = Preferences::load_from(&tmp).expect("load custom export_dir");
+        assert_eq!(loaded_custom.resolved_export_dir(), custom_dir);
 
         let link = dir.join("prefs-link.json");
         std::os::unix::fs::symlink(&tmp, &link).expect("symlink");

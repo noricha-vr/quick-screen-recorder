@@ -45,6 +45,88 @@ pub fn valid_home_dir() -> Option<PathBuf> {
     if p.is_absolute() { Some(p) } else { None }
 }
 
+/// Returns `~/Desktop` when available as a real directory owned by the current user, falling back to `HOME` or temp dir.
+pub fn default_desktop_export_dir() -> PathBuf {
+    if let Some(home) = valid_home_dir() {
+        let desktop = home.join("Desktop");
+        if is_usable_export_dir(&desktop) {
+            return desktop;
+        }
+        if is_usable_export_dir(&home) {
+            return home;
+        }
+    }
+    std::env::temp_dir()
+}
+
+pub fn is_usable_export_dir(dir: &Path) -> bool {
+    if !dir.is_absolute() {
+        return false;
+    }
+    match fs::symlink_metadata(dir) {
+        Ok(meta) => !meta.file_type().is_symlink() && meta.is_dir(),
+        Err(_) => false,
+    }
+}
+
+/// Formats a directory path with `~` substitution for UI display so personal home usernames never appear on screen.
+pub fn format_tilde_path(path: &Path) -> String {
+    if let Some(home) = valid_home_dir() {
+        if let Ok(rel) = path.strip_prefix(&home) {
+            if rel.as_os_str().is_empty() {
+                return "~".to_string();
+            }
+            return format!(
+                "~/{}",
+                sanitize_terminal_text(&rel.display().to_string(), false)
+            );
+        }
+    }
+    sanitize_terminal_text(&path.display().to_string(), false)
+}
+
+/// Generates a local-timestamped output path `Recording-YYYY-MM-DD-HHMMSS.<ext>` inside `dir`
+/// without overwriting any existing file or symlink.
+pub fn next_recording_output_path(dir: &Path, ext: &str) -> PathBuf {
+    let clean_ext = ext.trim_start_matches('.');
+    let stem = local_recording_stem(now_unix_secs());
+    next_non_colliding_path(dir, &stem, clean_ext)
+}
+
+pub fn next_non_colliding_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
+    let first = dir.join(format!("{stem}.{ext}"));
+    if matches!(fs::symlink_metadata(&first), Err(e) if e.kind() == io::ErrorKind::NotFound) {
+        return first;
+    }
+    for suffix in 2..=9999_u32 {
+        let candidate = dir.join(format!("{stem}-{suffix}.{ext}"));
+        if matches!(fs::symlink_metadata(&candidate), Err(e) if e.kind() == io::ErrorKind::NotFound)
+        {
+            return candidate;
+        }
+    }
+    dir.join(format!("{stem}-{}.{ext}", random_hex_token()))
+}
+
+fn local_recording_stem(unix_secs: u64) -> String {
+    let ts = unix_secs as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let ok = unsafe { !libc::localtime_r(&ts, &mut tm).is_null() };
+    if ok {
+        format!(
+            "Recording-{:04}-{:02}-{:02}-{:02}{:02}{:02}",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec
+        )
+    } else {
+        format!("Recording-{unix_secs}")
+    }
+}
+
 pub fn ensure_distinct_files(input: &Path, output: &Path) -> Result<(), String> {
     if input == output {
         return Err("Output path must be different from input recording path".to_string());
@@ -369,5 +451,29 @@ mod tests {
     fn sanitizes_escape_and_bidi_sequences() {
         let dirty = "bad\x1b[31mred\u{202E}gpj.exe";
         assert_eq!(sanitize_terminal_text(dirty, false), "bad?[31mred?gpj.exe");
+    }
+
+    #[test]
+    fn non_colliding_recording_path_never_overwrites_files_or_symlinks() {
+        let dir = std::env::temp_dir().join(format!("qsr-noncollide-{}", random_hex_token()));
+        fs::create_dir_all(&dir).expect("mkdir");
+        let p1 = next_non_colliding_path(&dir, "Recording-2026-11-21-120000", "mp4");
+        assert_eq!(p1.file_name().unwrap(), "Recording-2026-11-21-120000.mp4");
+        fs::write(&p1, b"clip1").expect("write p1");
+
+        // Even a dangling symlink at -2 must be skipped
+        let link2 = dir.join("Recording-2026-11-21-120000-2.mp4");
+        std::os::unix::fs::symlink(dir.join("missing.mp4"), &link2).expect("dangling symlink");
+
+        let p3 = next_non_colliding_path(&dir, "Recording-2026-11-21-120000", "mp4");
+        assert_eq!(p3.file_name().unwrap(), "Recording-2026-11-21-120000-3.mp4");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn format_tilde_hides_home_prefix() {
+        if let Some(home) = valid_home_dir() {
+            assert_eq!(format_tilde_path(&home.join("Desktop")), "~/Desktop");
+        }
     }
 }

@@ -21,15 +21,15 @@ Unlike Electron-based recorders that keep a full Chromium runtime resident in me
 - **Zero Electron / Zero WebView** — Pure Rust + native AppKit status-bar app and borderless overlay. Instant startup and minimal idle memory.
 - **Hardware-Direct Recording (`SCRecordingOutput`)** — Streams selected regions, individual windows, or full displays directly to hardware H.264 / HEVC MP4 with near-zero CPU overhead.
 - **Flexible Capture Selector**
-  - **Area mode**: Drag to select, 8-way resize handles, aspect-ratio lock (`Free`, `16:9`, `16:10`, `4:3`, `3:2`, `1:1`, `9:16`), and exact `W × H` pixel input.
-  - **Window mode**: Independent single-window capture (overlapping windows are excluded automatically).
+  - **Area mode**: Drag to create, grab inside to reposition, 8-way resize handles, aspect-ratio lock (`Free`, `16:9`, `16:10`, `4:3`, `3:2`, `1:1`, `9:16`), and exact `W × H` pixel input.
+  - **Window mode**: Hover and click any on-screen window to switch the capture target on the fly (overlapping windows are excluded automatically during capture).
   - **Screen mode**: Full-display capture across multi-monitor setups.
   - Toggle **cursor visibility**, **native click highlights**, **system audio**, and **microphone** right from the floating bar.
 - **Instant Trim & Multi-Format Export Editor**
-  - Scrub start/end trim points with live hardware-decoded frame preview.
+  - **Dual-bracket `IN` / `OUT` timeline**: Drag rectangular start/end trim brackets or scrub the playhead with live hardware-decoded frame preview.
   - **Zero-dependency native exports**: **MP4 (H.264)**, **MP4 (HEVC)**, **GIF** (multithreaded NeuQuant global palette + frame-delta bounding-box optimization), and **APNG**.
   - **Optional FFmpeg exports**: Automatically unlocks **WebM (VP9)** and **MP4 (AV1)** when `ffmpeg` is installed on your Mac.
-  - One-click **Copy** to macOS Pasteboard (paste directly into GitHub PRs, Slack, Discord, or Finder) or **Save...** to disk.
+  - **Instant Desktop Save & Real-Time Progress**: Defaults to `~/Desktop` (customizable ahead of time via **`Folder...`**) so clicking **`Save`** writes a non-colliding timestamped file immediately with a live progress bar—or click **`Copy`** to place the file directly on the macOS Pasteboard.
 - **Privacy by Design**
   - 100% local execution with **zero network access** and **zero external telemetry**.
   - Container metadata is stripped automatically on export (`setMetadata(None)` / `-map_metadata -1`).
@@ -67,7 +67,7 @@ On first capture, macOS will prompt for **Screen & System Audio Recording** perm
 2. Click **`◉ Rec` → `New Recording...`** or press **`Cmd + Shift + 6`** anywhere to open the selection overlay (`Esc` cancels).
 3. Choose **Area**, **Window**, or **Screen**, adjust aspect ratio / dimensions / FPS (`30` or `60`) / audio / cursor / click highlights, and click **`● Record`**.
 4. During recording, the menu bar displays elapsed time (`● 00:08`). Click **`Stop Recording`** in the menu bar or press **`Cmd + Shift + 6`** again to finish.
-5. In the **Trim & Export** window, adjust **Start / End** sliders if needed, pick your format (**MP4**, **HEVC**, **GIF**, **APNG**, **WebM**, **AV1**) and resolution preset, then click **`Copy`** or **`Save...`**.
+5. In the **Trim & Export** window, drag the **`IN` / `OUT`** trim brackets if needed, pick your format (**MP4**, **HEVC**, **GIF**, **APNG**, **WebM**, **AV1**) and resolution preset, optionally change the destination folder via **`Folder...`** (defaults to `~/Desktop`), then click **`Copy`** or **`Save`**.
 
 ### Command-Line Interface (CLI)
 

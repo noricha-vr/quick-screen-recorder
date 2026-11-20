@@ -35,6 +35,7 @@ pub fn build_toolbar_actions(
 
     let st_mode = Rc::clone(state);
     let cv_mode = canvas_view.clone();
+    let cwin_mode = canvas_window.clone();
     let ap_mode = aspect_popup.clone();
     let wf_mode = w_field.clone();
     let hf_mode = h_field.clone();
@@ -55,6 +56,7 @@ pub fn build_toolbar_actions(
     let cv_pick = canvas_view.clone();
     let cwin_pick = canvas_window.clone();
     let twin_pick = toolbar_window.clone();
+    let sf_pick = Rc::clone(sync_fields);
 
     let st_fps = Rc::clone(state);
     let st_audio = Rc::clone(state);
@@ -74,6 +76,8 @@ pub fn build_toolbar_actions(
                     _ => SelectionMode::Area,
                 };
                 let is_area = st.mode == SelectionMode::Area;
+                let is_demo = st.demo_backdrop;
+                st.hovered_window_idx = None;
                 ap_mode.setHidden(!is_area);
                 wf_mode.setHidden(!is_area);
                 hf_mode.setHidden(!is_area);
@@ -92,22 +96,7 @@ pub fn build_toolbar_actions(
                             }
                             let idx = st.selected_window_idx.min(st.windows.len() - 1);
                             tp_mode.selectItemAtIndex(idx as isize);
-                            let wf = st.windows[idx].frame;
-                            let disp_origin = st
-                                .displays
-                                .iter()
-                                .find(|d| d.display_id == st.overlay_display_id)
-                                .map(|d| (d.frame.x, d.frame.y))
-                                .unwrap_or((0.0, 0.0));
-                            let local_wf = Rect::new(
-                                wf.x - disp_origin.0,
-                                wf.y - disp_origin.1,
-                                wf.width,
-                                wf.height,
-                            );
-                            st.selection = local_wf
-                                .top_left_to_appkit(st.bounds.height)
-                                .clamp_and_align_even(st.bounds);
+                            st.select_window(idx);
                         }
                     }
                     SelectionMode::Screen => {
@@ -126,6 +115,9 @@ pub fn build_toolbar_actions(
                 drop(st);
                 sf_mode();
                 cv_mode.setNeedsDisplay(true);
+                if !is_demo {
+                    cwin_mode.makeKeyWindow();
+                }
             }),
             on_aspect: Box::new(move |idx| {
                 let mut st = st_aspect.borrow_mut();
@@ -149,27 +141,11 @@ pub fn build_toolbar_actions(
             }),
             on_target_pick: Box::new(move |idx| {
                 let mut st = st_pick.borrow_mut();
+                let is_demo = st.demo_backdrop;
                 let u = idx.max(0) as usize;
                 match st.mode {
                     SelectionMode::Window => {
-                        if let Some(w) = st.windows.get(u).cloned() {
-                            st.selected_window_idx = u;
-                            let disp_origin = st
-                                .displays
-                                .iter()
-                                .find(|d| d.display_id == st.overlay_display_id)
-                                .map(|d| (d.frame.x, d.frame.y))
-                                .unwrap_or((0.0, 0.0));
-                            let local_wf = Rect::new(
-                                w.frame.x - disp_origin.0,
-                                w.frame.y - disp_origin.1,
-                                w.frame.width,
-                                w.frame.height,
-                            );
-                            st.selection = local_wf
-                                .top_left_to_appkit(st.bounds.height)
-                                .clamp_and_align_even(st.bounds);
-                        }
+                        st.select_window(u);
                     }
                     SelectionMode::Screen => {
                         if let Some(did) = st.displays.get(u).map(|d| d.display_id) {
@@ -187,7 +163,11 @@ pub fn build_toolbar_actions(
                     SelectionMode::Area => {}
                 }
                 drop(st);
+                sf_pick();
                 cv_pick.setNeedsDisplay(true);
+                if !is_demo {
+                    cwin_pick.makeKeyWindow();
+                }
             }),
             on_fps: Box::new(move |idx| {
                 st_fps.borrow_mut().fps = if idx == 0 { 30 } else { 60 };
