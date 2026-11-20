@@ -1,0 +1,287 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
+use objc2::MainThreadMarker;
+use objc2::rc::Retained;
+use objc2_app_kit::{NSPopUpButton, NSScreen, NSTextField, NSView, NSWindow};
+use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+
+use crate::capture::{AudioCaptureMode, CaptureConfig, CaptureTarget};
+use crate::config::Preferences;
+use crate::geometry::{AspectRatio, Rect, apply_aspect_to_rect};
+use crate::ui::overlay::{
+    OverlayState, SelectionMode, StartCaptureCallback, extract_nsscreen_display_id,
+};
+use crate::ui::overlay_toolbar::{OverlayToolbarActions, ToolbarActionIvars};
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_toolbar_actions(
+    mtm: MainThreadMarker,
+    state: &Rc<RefCell<OverlayState>>,
+    canvas_window: &Retained<NSWindow>,
+    toolbar_window: &Retained<NSWindow>,
+    canvas_view: &Retained<NSView>,
+    aspect_popup: &Retained<NSPopUpButton>,
+    w_field: &Retained<NSTextField>,
+    h_field: &Retained<NSTextField>,
+    target_popup: &Retained<NSPopUpButton>,
+    sync_fields: &Rc<dyn Fn()>,
+    prefs: &Preferences,
+    on_start: StartCaptureCallback,
+    on_cancel: Rc<dyn Fn()>,
+) -> Retained<OverlayToolbarActions> {
+    let cwin_num = canvas_window.windowNumber() as u32;
+    let twin_num = toolbar_window.windowNumber() as u32;
+
+    let st_mode = Rc::clone(state);
+    let cv_mode = canvas_view.clone();
+    let ap_mode = aspect_popup.clone();
+    let wf_mode = w_field.clone();
+    let hf_mode = h_field.clone();
+    let tp_mode = target_popup.clone();
+    let sf_mode = Rc::clone(sync_fields);
+
+    let st_aspect = Rc::clone(state);
+    let cv_aspect = canvas_view.clone();
+    let sf_aspect = Rc::clone(sync_fields);
+
+    let st_size = Rc::clone(state);
+    let cv_size = canvas_view.clone();
+    let wf_size = w_field.clone();
+    let hf_size = h_field.clone();
+    let sf_size = Rc::clone(sync_fields);
+
+    let st_pick = Rc::clone(state);
+    let cv_pick = canvas_view.clone();
+    let cwin_pick = canvas_window.clone();
+    let twin_pick = toolbar_window.clone();
+
+    let st_fps = Rc::clone(state);
+    let st_audio = Rc::clone(state);
+    let st_cursor = Rc::clone(state);
+    let st_clicks = Rc::clone(state);
+    let st_rec = Rc::clone(state);
+    let base_prefs = prefs.clone();
+
+    OverlayToolbarActions::new(
+        mtm,
+        ToolbarActionIvars {
+            on_mode: Box::new(move |seg| {
+                let mut st = st_mode.borrow_mut();
+                st.mode = match seg {
+                    1 => SelectionMode::Window,
+                    2 => SelectionMode::Screen,
+                    _ => SelectionMode::Area,
+                };
+                let is_area = st.mode == SelectionMode::Area;
+                ap_mode.setHidden(!is_area);
+                wf_mode.setHidden(!is_area);
+                hf_mode.setHidden(!is_area);
+                tp_mode.setHidden(is_area);
+                tp_mode.removeAllItems();
+                match st.mode {
+                    SelectionMode::Area => {
+                        st.selection = st.selection.clamp_and_align_even(st.bounds);
+                    }
+                    SelectionMode::Window => {
+                        if st.windows.is_empty() {
+                            tp_mode.addItemWithTitle(&NSString::from_str("No windows available"));
+                        } else {
+                            for w in &st.windows {
+                                tp_mode.addItemWithTitle(&NSString::from_str(&w.display_label()));
+                            }
+                            let idx = st.selected_window_idx.min(st.windows.len() - 1);
+                            tp_mode.selectItemAtIndex(idx as isize);
+                            let wf = st.windows[idx].frame;
+                            let disp_origin = st
+                                .displays
+                                .iter()
+                                .find(|d| d.display_id == st.overlay_display_id)
+                                .map(|d| (d.frame.x, d.frame.y))
+                                .unwrap_or((0.0, 0.0));
+                            let local_wf = Rect::new(
+                                wf.x - disp_origin.0,
+                                wf.y - disp_origin.1,
+                                wf.width,
+                                wf.height,
+                            );
+                            st.selection = local_wf
+                                .top_left_to_appkit(st.bounds.height)
+                                .clamp_and_align_even(st.bounds);
+                        }
+                    }
+                    SelectionMode::Screen => {
+                        for (i, d) in st.displays.iter().enumerate() {
+                            tp_mode.addItemWithTitle(&NSString::from_str(&format!(
+                                "Display {} ({}×{})",
+                                i + 1,
+                                d.width,
+                                d.height
+                            )));
+                        }
+                        tp_mode.selectItemAtIndex(st.selected_display_idx as isize);
+                        st.selection = st.bounds;
+                    }
+                }
+                drop(st);
+                sf_mode();
+                cv_mode.setNeedsDisplay(true);
+            }),
+            on_aspect: Box::new(move |idx| {
+                let mut st = st_aspect.borrow_mut();
+                st.aspect = AspectRatio::from_index(idx.max(0) as usize);
+                st.selection = apply_aspect_to_rect(st.selection, st.aspect, st.bounds);
+                drop(st);
+                sf_aspect();
+                cv_aspect.setNeedsDisplay(true);
+            }),
+            on_size_commit: Box::new(move || {
+                let wt = wf_size.stringValue().to_string();
+                let ht = hf_size.stringValue().to_string();
+                if let (Ok(px_w), Ok(px_h)) = (wt.trim().parse::<f64>(), ht.trim().parse::<f64>()) {
+                    let mut st = st_size.borrow_mut();
+                    let sf = st.scale_factor.max(1.0);
+                    st.selection = Rect::new(st.selection.x, st.selection.y, px_w / sf, px_h / sf)
+                        .clamp_and_align_for_scale(st.bounds, sf);
+                }
+                sf_size();
+                cv_size.setNeedsDisplay(true);
+            }),
+            on_target_pick: Box::new(move |idx| {
+                let mut st = st_pick.borrow_mut();
+                let u = idx.max(0) as usize;
+                match st.mode {
+                    SelectionMode::Window => {
+                        if let Some(w) = st.windows.get(u).cloned() {
+                            st.selected_window_idx = u;
+                            let disp_origin = st
+                                .displays
+                                .iter()
+                                .find(|d| d.display_id == st.overlay_display_id)
+                                .map(|d| (d.frame.x, d.frame.y))
+                                .unwrap_or((0.0, 0.0));
+                            let local_wf = Rect::new(
+                                w.frame.x - disp_origin.0,
+                                w.frame.y - disp_origin.1,
+                                w.frame.width,
+                                w.frame.height,
+                            );
+                            st.selection = local_wf
+                                .top_left_to_appkit(st.bounds.height)
+                                .clamp_and_align_even(st.bounds);
+                        }
+                    }
+                    SelectionMode::Screen => {
+                        if let Some(did) = st.displays.get(u).map(|d| d.display_id) {
+                            st.selected_display_idx = u;
+                            st.screen_display_id = did;
+                            if !st.demo_backdrop {
+                                if let Some(m) = MainThreadMarker::new() {
+                                    relocate_overlay_to_display(
+                                        m, did, &mut st, &cwin_pick, &twin_pick,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    SelectionMode::Area => {}
+                }
+                drop(st);
+                cv_pick.setNeedsDisplay(true);
+            }),
+            on_fps: Box::new(move |idx| {
+                st_fps.borrow_mut().fps = if idx == 0 { 30 } else { 60 };
+            }),
+            on_audio: Box::new(move |idx| {
+                st_audio.borrow_mut().audio_mode =
+                    AudioCaptureMode::from_index(idx.max(0) as usize);
+            }),
+            on_cursor: Box::new(move |on| {
+                st_cursor.borrow_mut().show_cursor = on;
+            }),
+            on_clicks: Box::new(move |on| {
+                st_clicks.borrow_mut().highlight_clicks = on;
+            }),
+            on_record: Box::new(move || {
+                let st = st_rec.borrow();
+                let target = match st.mode {
+                    SelectionMode::Area => CaptureTarget::Region {
+                        // Always record on the exact display where the selection rectangle is drawn
+                        display_id: st.overlay_display_id,
+                        rect_points: st.selection.appkit_to_top_left(st.bounds.height),
+                        scale_factor: st.scale_factor,
+                    },
+                    SelectionMode::Window => {
+                        let Some(win) = st.windows.get(st.selected_window_idx) else {
+                            let err = "No shareable window available to record".to_string();
+                            drop(st);
+                            on_start(Err(err));
+                            return;
+                        };
+                        CaptureTarget::Window {
+                            window_id: win.window_id,
+                        }
+                    }
+                    SelectionMode::Screen => CaptureTarget::Display {
+                        display_id: st.screen_display_id,
+                        scale_factor: st.scale_factor,
+                    },
+                };
+                let mut updated = base_prefs.clone();
+                updated.fps = st.fps;
+                updated.show_cursor = st.show_cursor;
+                updated.highlight_clicks = st.highlight_clicks;
+                updated.audio_mode = st.audio_mode;
+                updated.aspect_ratio = st.aspect;
+                if st.mode == SelectionMode::Area {
+                    updated.last_region = st.selection;
+                }
+                let cfg = CaptureConfig {
+                    target,
+                    fps: st.fps,
+                    codec: updated.recording_codec,
+                    show_cursor: st.show_cursor,
+                    highlight_clicks: st.highlight_clicks,
+                    audio_mode: st.audio_mode,
+                    excluded_window_ids: vec![cwin_num, twin_num],
+                };
+                drop(st);
+                on_start(Ok((cfg, updated)));
+            }),
+            on_cancel: Box::new(move || {
+                on_cancel();
+            }),
+        },
+    )
+}
+
+fn relocate_overlay_to_display(
+    mtm: MainThreadMarker,
+    target_display_id: u32,
+    st: &mut OverlayState,
+    canvas_window: &NSWindow,
+    toolbar_window: &NSWindow,
+) {
+    let screens = NSScreen::screens(mtm);
+    for i in 0..screens.count() {
+        let s = screens.objectAtIndex(i);
+        if extract_nsscreen_display_id(&s) == Some(target_display_id) {
+            let sf = s.frame();
+            st.overlay_display_id = target_display_id;
+            st.scale_factor = s.backingScaleFactor();
+            st.bounds = Rect::new(0.0, 0.0, sf.size.width, sf.size.height);
+            st.selection = st.bounds;
+            canvas_window.setFrame_display(sf, true);
+            let tb_frame = toolbar_window.frame();
+            let next_tb = NSRect::new(
+                NSPoint::new(
+                    sf.origin.x + (sf.size.width - tb_frame.size.width) * 0.5,
+                    sf.origin.y + 36.0,
+                ),
+                NSSize::new(tb_frame.size.width, tb_frame.size.height),
+            );
+            toolbar_window.setFrame_display(next_tb, true);
+            break;
+        }
+    }
+}

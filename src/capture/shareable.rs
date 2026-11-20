@@ -1,0 +1,135 @@
+use std::sync::mpsc;
+use std::time::Duration;
+
+use block2::RcBlock;
+use objc2::rc::Retained;
+use objc2_foundation::NSError;
+use objc2_screen_capture_kit::{SCDisplay, SCShareableContent, SCWindow};
+
+use crate::geometry::Rect;
+
+#[derive(Debug, Clone)]
+pub struct DisplayInfo {
+    pub display_id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub frame: Rect,
+}
+
+#[derive(Debug, Clone)]
+pub struct WindowInfo {
+    pub window_id: u32,
+    pub app_name: String,
+    pub title: String,
+    pub frame: Rect,
+}
+
+impl WindowInfo {
+    pub fn display_label(&self) -> String {
+        if self.title.trim().is_empty() {
+            self.app_name.clone()
+        } else {
+            let clean_title: String = self.title.chars().take(48).collect();
+            format!("{} — {}", self.app_name, clean_title)
+        }
+    }
+}
+
+pub struct ShareableSnapshot {
+    pub content: Retained<SCShareableContent>,
+    pub displays: Vec<DisplayInfo>,
+    pub windows: Vec<WindowInfo>,
+}
+
+pub fn query_shareable_content() -> Result<ShareableSnapshot, String> {
+    let (tx, rx) = mpsc::sync_channel::<Result<Retained<SCShareableContent>, String>>(1);
+
+    let handler = RcBlock::new(
+        move |content: *mut SCShareableContent, error: *mut NSError| {
+            let res = if !error.is_null() {
+                // SAFETY: `error` is valid for the duration of the completion block.
+                let err_desc = unsafe { (&*error).localizedDescription().to_string() };
+                Err(format!(
+                    "ScreenCaptureKit shareable content error: {err_desc}"
+                ))
+            } else if let Some(retained) = unsafe { Retained::retain(content) } {
+                Ok(retained)
+            } else {
+                Err("ScreenCaptureKit returned no shareable content".to_string())
+            };
+            let _ = tx.send(res);
+        },
+    );
+
+    // SAFETY: Completion handler is heap-allocated via RcBlock and valid across threads.
+    unsafe {
+        SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
+            true,
+            true,
+            &handler,
+        );
+    }
+
+    let content = rx
+        .recv_timeout(Duration::from_secs(5))
+        .map_err(|_| {
+            "Timed out querying ScreenCaptureKit content. Ensure Screen Recording permission is granted."
+                .to_string()
+        })??;
+
+    let current_pid = std::process::id() as i32;
+    let mut displays = Vec::new();
+    // SAFETY: Reading immutable properties from retained SCDisplay objects.
+    unsafe {
+        let sc_displays = content.displays();
+        for i in 0..sc_displays.count() {
+            let d: Retained<SCDisplay> = sc_displays.objectAtIndex(i);
+            let f = d.frame();
+            displays.push(DisplayInfo {
+                display_id: d.displayID(),
+                width: d.width().max(1) as u32,
+                height: d.height().max(1) as u32,
+                frame: Rect::new(f.origin.x, f.origin.y, f.size.width, f.size.height),
+            });
+        }
+    }
+
+    let mut windows = Vec::new();
+    // SAFETY: Reading immutable properties from retained SCWindow objects.
+    unsafe {
+        let sc_windows = content.windows();
+        for i in 0..sc_windows.count() {
+            let w: Retained<SCWindow> = sc_windows.objectAtIndex(i);
+            if !w.isOnScreen() || w.windowLayer() != 0 {
+                continue;
+            }
+            let f = w.frame();
+            if f.size.width < 80.0 || f.size.height < 80.0 {
+                continue;
+            }
+            let Some(app) = w.owningApplication() else {
+                continue;
+            };
+            if app.processID() == current_pid {
+                continue;
+            }
+            let app_name = app.applicationName().to_string();
+            if app_name.trim().is_empty() {
+                continue;
+            }
+            let title = w.title().map(|t| t.to_string()).unwrap_or_default();
+            windows.push(WindowInfo {
+                window_id: w.windowID(),
+                app_name,
+                title,
+                frame: Rect::new(f.origin.x, f.origin.y, f.size.width, f.size.height),
+            });
+        }
+    }
+
+    Ok(ShareableSnapshot {
+        content,
+        displays,
+        windows,
+    })
+}
