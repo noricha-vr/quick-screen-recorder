@@ -1,0 +1,9 @@
+/target
+/*.app
+/dist
+.DS_Store
+*.swp
+*.swo
+.env
+.env.*
+!.env.example
