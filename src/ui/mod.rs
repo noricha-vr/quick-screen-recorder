@@ -1,6 +1,7 @@
 pub mod clipboard;
 pub mod editor;
 pub mod editor_worker;
+pub mod folder_picker;
 pub mod hotkey;
 pub mod overlay;
 pub mod overlay_actions;
@@ -62,6 +63,7 @@ pub fn run_gui(
 
     let prefs = Preferences::load();
     let initial_codec = prefs.recording_codec;
+    let initial_export_dir = prefs.resolved_export_dir();
     let runtime = Rc::new(RefCell::new(AppRuntime {
         prefs,
         status_bar: None,
@@ -74,15 +76,41 @@ pub fn run_gui(
 
     let rt_primary = Rc::clone(&runtime);
     let rt_open = Rc::clone(&runtime);
+    let rt_sel_dir = Rc::clone(&runtime);
+    let rt_pick_dir = Rc::clone(&runtime);
     let rt_codec = Rc::clone(&runtime);
     let rt_quit = Rc::clone(&runtime);
 
     let status_bar = StatusBarController::new(
         mtm,
         initial_codec,
+        initial_export_dir.as_deref(),
         StatusBarCallbacks {
             on_primary_click: Box::new(move |m| toggle_select_or_stop(m, &rt_primary)),
             on_open_video: Box::new(move |m| prompt_open_video_in_editor(m, &rt_open)),
+            on_select_export_dir: Box::new(move |m, dir| {
+                if !crate::fs_safety::is_usable_export_dir(&dir) {
+                    show_error_alert(
+                        m,
+                        "Invalid Export Folder",
+                        "Selected destination is unavailable or unsafe. Please choose another folder.",
+                    );
+                    let cur = rt_sel_dir.borrow().prefs.resolved_export_dir();
+                    if let Some(sb) = &rt_sel_dir.borrow().status_bar {
+                        sb.set_export_dir(m, cur.as_deref());
+                    }
+                    return;
+                }
+                apply_export_dir_change(m, &rt_sel_dir, dir);
+            }),
+            on_choose_export_folder: Box::new(move |m| {
+                let cur = rt_pick_dir.borrow().prefs.resolved_export_dir();
+                match crate::ui::folder_picker::choose_export_directory(m, cur.as_deref()) {
+                    None => {}
+                    Some(Err(msg)) => show_error_alert(m, "Invalid Export Folder", msg),
+                    Some(Ok(picked)) => apply_export_dir_change(m, &rt_pick_dir, picked),
+                }
+            }),
             on_toggle_codec: Box::new(move |_m| {
                 let mut rt = rt_codec.borrow_mut();
                 rt.prefs.recording_codec = match rt.prefs.recording_codec {
@@ -264,6 +292,25 @@ fn stop_active_recording(mtm: MainThreadMarker, runtime: &Rc<RefCell<AppRuntime>
     }
 }
 
+fn apply_export_dir_change(
+    mtm: MainThreadMarker,
+    runtime: &Rc<RefCell<AppRuntime>>,
+    new_dir: PathBuf,
+) {
+    {
+        let mut rt = runtime.borrow_mut();
+        rt.prefs.export_dir = Some(new_dir.clone());
+        let _ = rt.prefs.save();
+    }
+    let rt = runtime.borrow();
+    if let Some(sb) = &rt.status_bar {
+        sb.set_export_dir(mtm, Some(&new_dir));
+    }
+    for ed in &rt.editors {
+        ed.set_export_dir(mtm, new_dir.clone());
+    }
+}
+
 fn open_editor_for_file(
     mtm: MainThreadMarker,
     runtime: &Rc<RefCell<AppRuntime>>,
@@ -277,9 +324,9 @@ fn open_editor_for_file(
         &prefs,
         false,
         Rc::new(move |new_dir| {
-            let mut rt = rt_dir.borrow_mut();
-            rt.prefs.export_dir = Some(new_dir);
-            let _ = rt.prefs.save();
+            if let Some(m) = MainThreadMarker::new() {
+                apply_export_dir_change(m, &rt_dir, new_dir);
+            }
         }),
     )?;
     let app = NSApplication::sharedApplication(mtm);

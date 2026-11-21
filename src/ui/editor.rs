@@ -21,8 +21,10 @@ use crate::fs_safety::{
 use crate::ui::clipboard::rgba_to_nsimage;
 use crate::ui::editor_worker::{
     EditorState, ExportProgressView, FPS_PRESETS, ProgressVisualState, SIZE_PRESETS,
-    build_export_popups, build_preview_stage, choose_export_directory, compact_folder_badge,
-    spawn_async_export,
+    build_export_popups, build_preview_stage, spawn_async_export,
+};
+use crate::ui::folder_picker::{
+    FolderMenuItem, handle_editor_folder_popup_selection, populate_folder_popup,
 };
 use crate::ui::trim_view::TrimTimelineView;
 
@@ -30,7 +32,7 @@ struct EditorActionIvars {
     on_format_change: Box<dyn Fn(isize)>,
     on_fps_change: Box<dyn Fn(isize)>,
     on_size_change: Box<dyn Fn(isize)>,
-    on_pick_folder: Box<dyn Fn()>,
+    on_folder_change: Box<dyn Fn(isize)>,
     on_copy: Box<dyn Fn()>,
     on_save: Box<dyn Fn()>,
 }
@@ -57,9 +59,9 @@ define_class!(
         fn size_changed(&self, sender: &NSPopUpButton) {
             (self.ivars().on_size_change)(sender.indexOfSelectedItem());
         }
-        #[unsafe(method(pickFolderClicked:))]
-        fn pick_folder_clicked(&self, _sender: Option<&AnyObject>) {
-            (self.ivars().on_pick_folder)();
+        #[unsafe(method(folderChanged:))]
+        fn folder_changed(&self, sender: &NSPopUpButton) {
+            (self.ivars().on_folder_change)(sender.indexOfSelectedItem());
         }
         #[unsafe(method(copyClicked:))]
         fn copy_clicked(&self, _sender: Option<&AnyObject>) {
@@ -74,6 +76,11 @@ define_class!(
 
 pub struct EditorWindow {
     pub window: Retained<NSWindow>,
+    state: Rc<RefCell<EditorState>>,
+    folder_popup: Retained<NSPopUpButton>,
+    folder_items: Rc<RefCell<Vec<FolderMenuItem>>>,
+    status_label: Retained<NSTextField>,
+    demo_showcase: bool,
     _actions: Retained<EditorActions>,
 }
 
@@ -137,7 +144,6 @@ impl EditorWindow {
 
         let image_view = build_preview_stage(mtm, &root, win_w, win_h, input_path, init_playhead);
 
-        // Subtle divider separating controls from progress + action bar
         let divider = NSBox::initWithFrame(
             NSBox::alloc(mtm),
             NSRect::new(NSPoint::new(20.0, 72.0), NSSize::new(win_w - 40.0, 1.0)),
@@ -156,43 +162,36 @@ impl EditorWindow {
         let initial_fmt = popups.initial_fmt;
         let initial_fps = popups.initial_fps;
 
-        let initial_export_dir = prefs.resolved_export_dir();
-        let badge_text = if demo_showcase && initial_export_dir.is_none() {
-            "Save to: ~/Desktop".to_string()
-        } else {
-            compact_folder_badge(initial_export_dir.as_deref())
-        };
-        let folder_label = NSTextField::labelWithString(&NSString::from_str(&badge_text), mtm);
-        folder_label.setFont(Some(&NSFont::monospacedDigitSystemFontOfSize_weight(
-            11.5, 0.15,
+        let save_to_lbl = NSTextField::labelWithString(&NSString::from_str("Save to"), mtm);
+        save_to_lbl.setFont(Some(&NSFont::systemFontOfSize_weight(12.0, 0.2)));
+        save_to_lbl.setTextColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
+            0.74, 0.79, 0.89, 1.0,
         )));
-        folder_label.setTextColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
-            0.78, 0.83, 0.92, 1.0,
-        )));
-        folder_label.setAlignment(NSTextAlignment::Right);
-        folder_label.setFrame(NSRect::new(
-            NSPoint::new(436.0, 90.0),
-            NSSize::new(210.0, 20.0),
+        save_to_lbl.setAlignment(NSTextAlignment::Right);
+        save_to_lbl.setFrame(NSRect::new(
+            NSPoint::new(420.0, 92.0),
+            NSSize::new(54.0, 20.0),
         ));
-        root.addSubview(&folder_label);
+        root.addSubview(&save_to_lbl);
 
-        let folder_btn = unsafe {
-            NSButton::buttonWithTitle_target_action(
-                &NSString::from_str("Folder..."),
-                None,
-                None,
-                mtm,
-            )
-        };
-        folder_btn.setFrame(NSRect::new(
-            NSPoint::new(652.0, 88.0),
-            NSSize::new(88.0, 28.0),
+        let initial_export_dir = prefs.resolved_export_dir();
+        let folder_popup = NSPopUpButton::new(mtm);
+        folder_popup.setFrame(NSRect::new(
+            NSPoint::new(480.0, 88.0),
+            NSSize::new(260.0, 28.0),
         ));
-        root.addSubview(&folder_btn);
+        let init_items = populate_folder_popup(
+            mtm,
+            &folder_popup,
+            initial_export_dir.as_deref(),
+            demo_showcase,
+        );
+        let folder_items = Rc::new(RefCell::new(init_items));
+        root.addSubview(&folder_popup);
 
         let ready_text = match &initial_export_dir {
             Some(dir) => format!("Ready · Saves to {}", format_tilde_path(dir)),
-            None => "Choose an export folder via Folder... before saving".to_string(),
+            None => "Choose an export folder from Save to before saving".to_string(),
         };
         let status_label = NSTextField::labelWithString(&NSString::from_str(&ready_text), mtm);
         status_label.setFont(Some(&NSFont::monospacedDigitSystemFontOfSize_weight(
@@ -284,7 +283,8 @@ impl EditorWindow {
         let st_sz = Rc::clone(&state);
 
         let st_dir = Rc::clone(&state);
-        let fld_lbl_dir = folder_label.clone();
+        let fld_pop_dir = folder_popup.clone();
+        let fld_items_dir = Rc::clone(&folder_items);
         let status_dir = status_label.clone();
 
         let st_copy = Rc::clone(&state);
@@ -292,14 +292,14 @@ impl EditorWindow {
         let prog_copy = progress_view.clone();
         let copy_c = copy_btn.clone();
         let save_c = save_btn.clone();
-        let folder_c = folder_btn.clone();
+        let folder_c = folder_popup.clone();
 
         let st_save = Rc::clone(&state);
         let status_save = status_label.clone();
         let prog_save = progress_view.clone();
         let copy_s = copy_btn.clone();
         let save_s = save_btn.clone();
-        let folder_s = folder_btn.clone();
+        let folder_s = folder_popup.clone();
 
         let actions: Retained<EditorActions> = {
             let ivars = EditorActionIvars {
@@ -323,37 +323,18 @@ impl EditorWindow {
                     st_sz.borrow_mut().max_width =
                         SIZE_PRESETS.get(idx.max(0) as usize).and_then(|(_, w)| *w);
                 }),
-                on_pick_folder: Box::new(move || {
-                    let Some(m) = MainThreadMarker::new() else {
-                        return;
-                    };
-                    let cur_dir = {
-                        let st = st_dir.borrow();
-                        if st.busy {
-                            return;
-                        }
-                        st.export_dir.clone()
-                    };
-                    match choose_export_directory(m, cur_dir.as_deref()) {
-                        None => {}
-                        Some(Err(msg)) => {
-                            status_dir.setTextColor(Some(&NSColor::systemRedColor()));
-                            status_dir.setStringValue(&NSString::from_str(msg));
-                        }
-                        Some(Ok(picked)) => {
-                            st_dir.borrow_mut().export_dir = Some(picked.clone());
-                            fld_lbl_dir.setStringValue(&NSString::from_str(&compact_folder_badge(
-                                Some(&picked),
-                            )));
-                            status_dir.setTextColor(Some(
-                                &NSColor::colorWithSRGBRed_green_blue_alpha(0.68, 0.74, 0.84, 1.0),
-                            ));
-                            status_dir.setStringValue(&NSString::from_str(&format!(
-                                "Ready · Saves to {}",
-                                format_tilde_path(&picked)
-                            )));
-                            on_export_dir_change(picked);
-                        }
+                on_folder_change: Box::new(move |idx| {
+                    if let Some(m) = MainThreadMarker::new() {
+                        handle_editor_folder_popup_selection(
+                            m,
+                            idx,
+                            &st_dir,
+                            &fld_pop_dir,
+                            &fld_items_dir,
+                            &status_dir,
+                            demo_showcase,
+                            on_export_dir_change.as_ref(),
+                        );
                     }
                 }),
                 on_copy: Box::new(move || {
@@ -402,14 +383,14 @@ impl EditorWindow {
                         let Some(export_dir) = st.export_dir.clone() else {
                             status_save.setTextColor(Some(&NSColor::systemRedColor()));
                             status_save.setStringValue(&NSString::from_str(
-                                "No persistent export folder set; select one via Folder...",
+                                "No persistent export folder set; select one from Save to",
                             ));
                             return;
                         };
                         if !is_usable_export_dir(&export_dir) {
                             status_save.setTextColor(Some(&NSColor::systemRedColor()));
                             status_save.setStringValue(&NSString::from_str(
-                                "Export folder is unavailable or unsafe; choose another via Folder...",
+                                "Export folder is unavailable or unsafe; choose another from Save to",
                             ));
                             return;
                         }
@@ -449,8 +430,8 @@ impl EditorWindow {
             fps_popup.setAction(Some(sel!(fpsChanged:)));
             size_popup.setTarget(Some(&actions));
             size_popup.setAction(Some(sel!(sizeChanged:)));
-            folder_btn.setTarget(Some(&actions));
-            folder_btn.setAction(Some(sel!(pickFolderClicked:)));
+            folder_popup.setTarget(Some(&actions));
+            folder_popup.setAction(Some(sel!(folderChanged:)));
             copy_btn.setTarget(Some(&actions));
             copy_btn.setAction(Some(sel!(copyClicked:)));
             save_btn.setTarget(Some(&actions));
@@ -460,7 +441,34 @@ impl EditorWindow {
         window.makeKeyAndOrderFront(None);
         Ok(Self {
             window,
+            state,
+            folder_popup,
+            folder_items,
+            status_label,
+            demo_showcase,
             _actions: actions,
         })
+    }
+
+    pub fn set_export_dir(&self, mtm: MainThreadMarker, dir: PathBuf) {
+        let is_busy = {
+            let mut st = self.state.borrow_mut();
+            st.export_dir = Some(dir.clone());
+            st.busy
+        };
+        let refreshed =
+            populate_folder_popup(mtm, &self.folder_popup, Some(&dir), self.demo_showcase);
+        *self.folder_items.borrow_mut() = refreshed;
+        if !is_busy {
+            self.status_label
+                .setTextColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
+                    0.68, 0.74, 0.84, 1.0,
+                )));
+            self.status_label
+                .setStringValue(&NSString::from_str(&format!(
+                    "Ready · Saves to {}",
+                    format_tilde_path(&dir)
+                )));
+        }
     }
 }

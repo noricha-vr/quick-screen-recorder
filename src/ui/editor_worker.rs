@@ -10,15 +10,15 @@ use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
-    NSBezierPath, NSBox, NSBoxType, NSButton, NSColor, NSImageScaling, NSImageView,
-    NSModalResponseOK, NSOpenPanel, NSPopUpButton, NSTextField, NSView,
+    NSBezierPath, NSBox, NSBoxType, NSButton, NSColor, NSImageScaling, NSImageView, NSPopUpButton,
+    NSTextField, NSView,
 };
-use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer, NSURL};
+use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer};
 
 use crate::config::Preferences;
 use crate::export::avfoundation::{VideoMetadata, extract_rgba_frame};
 use crate::export::{ExportFormat, ExportRequest, ExportResult, run_export_with_options};
-use crate::fs_safety::{format_tilde_path, is_usable_export_dir, sanitize_terminal_text};
+use crate::fs_safety::{format_tilde_path, sanitize_terminal_text};
 use crate::ui::clipboard::{copy_file_to_clipboard, rgba_to_nsimage};
 
 pub const SIZE_PRESETS: [(&str, Option<u32>); 5] = [
@@ -67,7 +67,7 @@ pub fn build_export_popups(
     }
     format_popup.setFrame(NSRect::new(
         NSPoint::new(20.0, 88.0),
-        NSSize::new(166.0, 28.0),
+        NSSize::new(158.0, 28.0),
     ));
     root.addSubview(&format_popup);
 
@@ -86,8 +86,8 @@ pub fn build_export_popups(
         .unwrap_or(1);
     fps_popup.selectItemAtIndex(fps_idx as isize);
     fps_popup.setFrame(NSRect::new(
-        NSPoint::new(194.0, 88.0),
-        NSSize::new(90.0, 28.0),
+        NSPoint::new(184.0, 88.0),
+        NSSize::new(88.0, 28.0),
     ));
     root.addSubview(&fps_popup);
 
@@ -101,8 +101,8 @@ pub fn build_export_popups(
         .unwrap_or(0);
     size_popup.selectItemAtIndex(size_idx as isize);
     size_popup.setFrame(NSRect::new(
-        NSPoint::new(292.0, 88.0),
-        NSSize::new(138.0, 28.0),
+        NSPoint::new(278.0, 88.0),
+        NSSize::new(134.0, 28.0),
     ));
     root.addSubview(&size_popup);
 
@@ -269,7 +269,7 @@ pub fn spawn_async_export(
     progress_view: Retained<ExportProgressView>,
     copy_btn: Retained<NSButton>,
     save_btn: Retained<NSButton>,
-    folder_btn: Retained<NSButton>,
+    folder_popup: Retained<NSPopUpButton>,
 ) {
     let fmt_label = req.format.label();
     status_label.setTextColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
@@ -281,7 +281,7 @@ pub fn spawn_async_export(
     progress_view.set_progress(25, ProgressVisualState::Running);
     copy_btn.setEnabled(false);
     save_btn.setEnabled(false);
-    folder_btn.setEnabled(false);
+    folder_popup.setEnabled(false);
 
     let progress = Arc::new(AtomicU32::new(25));
     let progress_bg = Arc::clone(&progress);
@@ -305,7 +305,7 @@ pub fn spawn_async_export(
                 state.borrow_mut().busy = false;
                 copy_btn.setEnabled(true);
                 save_btn.setEnabled(true);
-                folder_btn.setEnabled(true);
+                folder_popup.setEnabled(true);
 
                 match result {
                     Ok(res) => {
@@ -360,7 +360,7 @@ pub fn spawn_async_export(
                 state.borrow_mut().busy = false;
                 copy_btn.setEnabled(true);
                 save_btn.setEnabled(true);
-                folder_btn.setEnabled(true);
+                folder_popup.setEnabled(true);
                 progress_view.set_progress(1000, ProgressVisualState::Failed);
                 status_label.setTextColor(Some(&NSColor::systemRedColor()));
                 status_label
@@ -371,53 +371,5 @@ pub fn spawn_async_export(
 
     unsafe {
         let _ = NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.035, true, &poll_block);
-    }
-}
-
-pub fn compact_folder_badge(dir: Option<&std::path::Path>) -> String {
-    let Some(dir) = dir else {
-        return "Save to: Choose Folder...".to_string();
-    };
-    let tilde = format_tilde_path(dir);
-    let chars: Vec<char> = tilde.chars().collect();
-    if chars.len() <= 24 {
-        format!("Save to: {tilde}")
-    } else {
-        let tail: String = chars[chars.len() - 21..].iter().collect();
-        format!("Save to: …{tail}")
-    }
-}
-
-pub fn choose_export_directory(
-    mtm: MainThreadMarker,
-    current_dir: Option<&std::path::Path>,
-) -> Option<Result<PathBuf, &'static str>> {
-    let panel = NSOpenPanel::openPanel(mtm);
-    panel.setCanChooseFiles(false);
-    panel.setCanChooseDirectories(true);
-    panel.setCanCreateDirectories(true);
-    panel.setAllowsMultipleSelection(false);
-    panel.setPrompt(Some(&NSString::from_str("Select Folder")));
-    if let Some(s) = current_dir.and_then(|d| d.to_str()) {
-        let url = NSURL::fileURLWithPath(&NSString::from_str(s));
-        panel.setDirectoryURL(Some(&url));
-    }
-    if panel.runModal() != NSModalResponseOK {
-        return None;
-    }
-    let picked_raw = panel
-        .URL()
-        .and_then(|u| u.path())
-        .map(|p| PathBuf::from(p.to_string()))?;
-    if !is_usable_export_dir(&picked_raw) {
-        return Some(Err(
-            "Selected destination must be a real folder owned by your user (not a symlink)",
-        ));
-    }
-    let picked = std::fs::canonicalize(&picked_raw).unwrap_or(picked_raw);
-    if is_usable_export_dir(&picked) {
-        Some(Ok(picked))
-    } else {
-        Some(Err("Selected destination is not a valid folder"))
     }
 }

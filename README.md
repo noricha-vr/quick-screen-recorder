@@ -29,7 +29,7 @@ Unlike Electron-based recorders that keep a full Chromium runtime resident in me
   - **Dual-bracket `IN` / `OUT` timeline**: Drag rectangular start/end trim brackets or scrub the playhead with live hardware-decoded frame preview.
   - **Zero-dependency native exports**: **MP4 (H.264)**, **MP4 (HEVC)**, **GIF** (multithreaded NeuQuant global palette + frame-delta bounding-box optimization), and **APNG**.
   - **Optional FFmpeg exports**: Automatically unlocks **WebM (VP9)** and **MP4 (AV1)** when `ffmpeg` is installed on your Mac.
-  - **Instant Desktop Save & Real-Time Progress**: Defaults to `~/Desktop` (customizable ahead of time via **`Folder...`**) so clicking **`Save`** writes a non-colliding timestamped file immediately with a live progress bar—or click **`Copy`** to place the file directly on the macOS Pasteboard.
+  - **Selectable Export Folder & Real-Time Progress**: Defaults to `~/Desktop` and lets you switch destinations anytime via the **`Save to`** dropdown in the editor or **`Save Folder`** in the `◉ Rec` menu bar (`~/Desktop`, `~/Movies`, `~/Downloads`, `~/Documents`, or **`Choose Folder...`** with New Folder creation). Clicking **`Save`** writes a non-colliding timestamped file immediately with a live progress bar—or click **`Copy`** to place the file directly on the macOS Pasteboard.
 - **Privacy by Design**
   - 100% local execution with **zero network access** and **zero external telemetry**.
   - Container metadata is stripped automatically on export (`setMetadata(None)` / `-map_metadata -1`).
@@ -67,7 +67,7 @@ On first capture, macOS will prompt for **Screen & System Audio Recording** perm
 2. Click **`◉ Rec` → `New Recording...`** or press **`Cmd + Shift + 6`** anywhere to open the selection overlay (`Esc` cancels).
 3. Choose **Area**, **Window**, or **Screen**, adjust aspect ratio / dimensions / FPS (`30` or `60`) / audio / cursor / click highlights, and click **`● Record`**.
 4. During recording, the menu bar displays elapsed time (`● 00:08`). Click **`Stop Recording`** in the menu bar or press **`Cmd + Shift + 6`** again to finish.
-5. In the **Trim & Export** window, drag the **`IN` / `OUT`** trim brackets if needed, pick your format (**MP4**, **HEVC**, **GIF**, **APNG**, **WebM**, **AV1**) and resolution preset, optionally change the destination folder via **`Folder...`** (defaults to `~/Desktop`), then click **`Copy`** or **`Save`**.
+5. In the **Trim & Export** window, drag the **`IN` / `OUT`** trim brackets if needed, pick your format (**MP4**, **HEVC**, **GIF**, **APNG**, **WebM**, **AV1**), resolution preset, and **`Save to`** destination folder (defaults to `~/Desktop`, persisted across launches and also configurable from **`◉ Rec` → `Save Folder`**), then click **`Copy`** or **`Save`**.
 
 ### Command-Line Interface (CLI)
 

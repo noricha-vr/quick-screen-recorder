@@ -5,6 +5,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-21
+
+### Added
+
+- User-selectable **`Save to` folder dropdown** in the Trim & Export editor and **`Save Folder` submenu** in the `◉ Rec` menu bar item, with instant switching across `~/Desktop`, `~/Movies`, `~/Downloads`, `~/Documents`, and **`Choose Folder...`** (with Finder **New Folder** creation and live preference sync).
+
 ## [0.2.0] - 2026-11-21
 
 ### Added
