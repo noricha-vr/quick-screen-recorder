@@ -558,7 +558,15 @@ pub fn prune_stale_cache_files(max_age: Duration) {
                 .to_string_lossy()
                 .starts_with(".qsr-work-")
         {
-            let _ = fs::remove_dir_all(entry.path());
+            if let Ok(dfd) = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(entry.path())
+            {
+                if unsafe { libc::flock(dfd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                    let _ = fs::remove_dir_all(entry.path());
+                }
+            }
         }
     }
 }
