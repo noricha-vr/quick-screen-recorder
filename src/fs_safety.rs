@@ -235,25 +235,27 @@ fn is_acl_text_allowlisted(acl_text: &str, euid: u32) -> bool {
         if line.is_empty() || line.starts_with("!#acl") {
             continue;
         }
-        // Darwin acl_to_text format: <tag>:<uuid>:<name>:<id>:<allow|deny>[:<flags>]:<perms>
+        // Darwin acl_to_text format: <tag>:<uuid>:<name>:<id>:<allow|deny>[,<flag>...]:<perms>
         let parts: Vec<&str> = line.split(':').collect();
-        if parts.len() < 6 {
+        if parts.len() != 6 {
             return false;
         }
         let tag = parts[0];
         let id_str = parts[3];
-        let action = parts[4];
-        if action == "deny" {
+        let mut action_and_flags = parts[4].split(',');
+        let base_action = action_and_flags.next().unwrap_or("");
+        let has_inherit_or_flags = action_and_flags.any(|f| !f.trim().is_empty());
+        if base_action == "deny" {
             continue;
         }
-        if action != "allow" {
+        if base_action != "allow" {
             return false;
         }
         if tag == "user" && id_str.parse::<u32>() == Ok(euid) {
             continue;
         }
-        // Reject any third-party `allow` ACE carrying inheritance flags (e.g. file_inherit / directory_inherit)
-        if parts.len() > 6 {
+        // Reject any third-party `allow` ACE carrying inheritance flags (e.g. allow,file_inherit:read)
+        if has_inherit_or_flags {
             return false;
         }
         let perms = parts[5];
@@ -469,7 +471,11 @@ pub fn atomic_write_private(target: &Path, bytes: &[u8]) -> io::Result<()> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .mode(0o600)
         .open(&tmp)?;
-    let _ = clear_fd_extended_acl(file.as_raw_fd());
+    if let Err(e) = clear_fd_extended_acl(file.as_raw_fd()) {
+        drop(file);
+        let _ = fs::remove_file(&tmp);
+        return Err(io::Error::other(e));
+    }
     if let Err(e) = file.write_all(bytes).and_then(|()| file.sync_all()) {
         let _ = fs::remove_file(&tmp);
         return Err(e);
@@ -648,12 +654,16 @@ mod tests {
             "!#acl 1\ngroup:ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C:everyone:12:deny:delete\n",
             501
         ));
+        assert!(is_acl_text_allowlisted(
+            "!#acl 1\ngroup:ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C:everyone:12:deny,file_inherit,directory_inherit:delete\n",
+            501
+        ));
         assert!(!is_acl_text_allowlisted(
             "!#acl 1\ngroup:ABCDEFAB-CDEF-ABCD-EFAB-CDEF00000014:staff:20:allow:write,add_file\n",
             501
         ));
         assert!(!is_acl_text_allowlisted(
-            "!#acl 1\ngroup:ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C:everyone:12:allow:file_inherit:read\n",
+            "!#acl 1\ngroup:ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C:everyone:12:allow,file_inherit:read\n",
             501
         ));
 

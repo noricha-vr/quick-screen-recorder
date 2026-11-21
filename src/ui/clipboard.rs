@@ -140,6 +140,10 @@ pub fn strip_ancillary_png_chunks(png: &[u8]) -> Result<Vec<u8>, String> {
                 if saw_ihdr || len != 13 {
                     return Err("Invalid or duplicate PNG IHDR chunk".to_string());
                 }
+                let color_type = png[pos + 8 + 9];
+                if !matches!(color_type, 0 | 2 | 4 | 6) {
+                    return Err("Unsupported indexed or non-standard PNG color type".to_string());
+                }
                 saw_ihdr = true;
                 out.extend_from_slice(&png[pos..chunk_end]);
             }

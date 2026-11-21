@@ -209,7 +209,8 @@ impl ExclusiveStagingDir {
             .file_name()
             .and_then(|s| s.to_str())
             .ok_or("Invalid UTF-8 output filename")?;
-        if self.try_move_or_copy_excl(initial_name)? {
+        let mut xdev_tmp: Option<CString> = None;
+        if self.try_publish_excl(initial_name, &mut xdev_tmp)? {
             return Ok(initial_name.to_string());
         }
 
@@ -227,20 +228,36 @@ impl ExclusiveStagingDir {
 
         for suffix in 2..=9999_u32 {
             let candidate = format!("{base_stem}-{suffix}.{ext}");
-            if self.try_move_or_copy_excl(&candidate)? {
-                return Ok(candidate);
+            match self.try_publish_excl(&candidate, &mut xdev_tmp) {
+                Ok(true) => return Ok(candidate),
+                Ok(false) => {}
+                Err(e) => {
+                    cleanup_xdev_tmp(self.dest_dir_fd.as_raw_fd(), &xdev_tmp);
+                    return Err(e);
+                }
             }
         }
         let fallback = format!("{base_stem}-{}.{ext}", random_hex_token());
-        if self.try_move_or_copy_excl(&fallback)? {
-            Ok(fallback)
-        } else {
-            Err("Failed finding non-colliding output filename".to_string())
+        let res = self.try_publish_excl(&fallback, &mut xdev_tmp);
+        if !matches!(res, Ok(true)) {
+            cleanup_xdev_tmp(self.dest_dir_fd.as_raw_fd(), &xdev_tmp);
+        }
+        match res {
+            Ok(true) => Ok(fallback),
+            Ok(false) => Err("Failed finding non-colliding output filename".to_string()),
+            Err(e) => Err(e),
         }
     }
 
-    fn try_move_or_copy_excl(&self, file_name: &str) -> Result<bool, String> {
+    fn try_publish_excl(
+        &self,
+        file_name: &str,
+        xdev_tmp: &mut Option<CString>,
+    ) -> Result<bool, String> {
         let name_c = CString::new(file_name.as_bytes()).map_err(|_| "Invalid target filename")?;
+        if let Some(tmp_c) = xdev_tmp.as_ref() {
+            return rename_excl_within_dir(self.dest_dir_fd.as_raw_fd(), tmp_c, &name_c);
+        }
         let rc = unsafe {
             libc::renameatx_np(
                 self.stage_dir_fd.as_raw_fd(),
@@ -257,7 +274,14 @@ impl ExclusiveStagingDir {
         match err.raw_os_error() {
             Some(libc::EEXIST) => Ok(false),
             Some(libc::EXDEV) => {
-                copy_into_pinned_dir_excl(&self.staged_file, self.dest_dir_fd.as_raw_fd(), &name_c)
+                let tmp_c =
+                    stage_once_on_dest_volume(&self.staged_file, self.dest_dir_fd.as_raw_fd())?;
+                let published =
+                    rename_excl_within_dir(self.dest_dir_fd.as_raw_fd(), &tmp_c, &name_c)?;
+                if !published {
+                    *xdev_tmp = Some(tmp_c);
+                }
+                Ok(published)
             }
             _ => Err(format!("Atomic exclusive rename failed: {err}")),
         }
@@ -305,12 +329,7 @@ fn fstatat_overwrite_mode(dir_fd: libc::c_int, name_c: &CString, euid: u32) -> R
     }
 }
 
-fn copy_into_pinned_dir_excl(
-    staged: &Path,
-    dest_dir_fd: libc::c_int,
-    name_c: &CString,
-) -> Result<bool, String> {
-    // Stage into a protected 0600 temp file on the target volume first so partial/empty files never appear
+fn stage_once_on_dest_volume(staged: &Path, dest_dir_fd: libc::c_int) -> Result<CString, String> {
     let tmp_name = format!(".qsr-xdev-{}", random_hex_token());
     let tmp_c = CString::new(tmp_name.as_bytes()).unwrap();
     let mut src = File::open(staged).map_err(|e| format!("Failed opening staged file: {e}"))?;
@@ -341,13 +360,19 @@ fn copy_into_pinned_dir_excl(
         unsafe { libc::unlinkat(dest_dir_fd, tmp_c.as_ptr(), 0) };
         return Err(format!("Failed writing cross-volume output file: {e}"));
     }
-    drop(out_file);
+    Ok(tmp_c)
+}
 
+fn rename_excl_within_dir(
+    dir_fd: libc::c_int,
+    tmp_c: &CString,
+    name_c: &CString,
+) -> Result<bool, String> {
     let rc = unsafe {
         libc::renameatx_np(
-            dest_dir_fd,
+            dir_fd,
             tmp_c.as_ptr(),
-            dest_dir_fd,
+            dir_fd,
             name_c.as_ptr(),
             libc::RENAME_EXCL,
         )
@@ -356,11 +381,18 @@ fn copy_into_pinned_dir_excl(
         return Ok(true);
     }
     let err = io::Error::last_os_error();
-    unsafe { libc::unlinkat(dest_dir_fd, tmp_c.as_ptr(), 0) };
     if err.raw_os_error() == Some(libc::EEXIST) {
         Ok(false)
     } else {
         Err(format!("Failed publishing cross-volume output file: {err}"))
+    }
+}
+
+fn cleanup_xdev_tmp(dir_fd: libc::c_int, xdev_tmp: &Option<CString>) {
+    if let Some(tmp_c) = xdev_tmp.as_ref() {
+        unsafe {
+            libc::unlinkat(dir_fd, tmp_c.as_ptr(), 0);
+        }
     }
 }
 
