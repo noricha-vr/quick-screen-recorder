@@ -7,6 +7,7 @@ pub mod overlay_actions;
 pub mod overlay_canvas;
 pub mod overlay_toolbar;
 pub mod status_bar;
+pub mod trim_math;
 pub mod trim_view;
 
 use std::cell::RefCell;

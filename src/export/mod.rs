@@ -2,6 +2,7 @@ pub mod av_decode;
 pub mod av_writer;
 pub mod avfoundation;
 pub mod ffmpeg;
+mod ffmpeg_spawn;
 pub mod gif_apng;
 
 use std::fs;
