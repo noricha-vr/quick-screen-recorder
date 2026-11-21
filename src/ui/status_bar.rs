@@ -1,20 +1,31 @@
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
+
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
-use objc2_app_kit::{NSMenu, NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength};
+use objc2_app_kit::{
+    NSControlStateValueOff, NSControlStateValueOn, NSMenu, NSMenuItem, NSStatusBar, NSStatusItem,
+    NSVariableStatusItemLength,
+};
 use objc2_foundation::{NSObject, NSObjectProtocol, NSString};
 
 use crate::capture::RecordingCodec;
+use crate::fs_safety::is_usable_export_dir;
+use crate::ui::folder_picker::{FolderMenuItem, compact_tilde_folder, live_folder_menu_model};
 
 pub struct StatusBarCallbacks {
     pub on_primary_click: Box<dyn Fn(MainThreadMarker)>,
     pub on_open_video: Box<dyn Fn(MainThreadMarker)>,
+    pub on_select_export_dir: Box<dyn Fn(MainThreadMarker, PathBuf)>,
+    pub on_choose_export_folder: Box<dyn Fn(MainThreadMarker)>,
     pub on_toggle_codec: Box<dyn Fn(MainThreadMarker)>,
     pub on_quit: Box<dyn Fn(MainThreadMarker)>,
 }
 
 struct HandlerIvars {
     callbacks: StatusBarCallbacks,
+    folder_targets: RefCell<Vec<PathBuf>>,
 }
 
 define_class!(
@@ -29,33 +40,49 @@ define_class!(
     impl StatusBarHandler {
         #[unsafe(method(onPrimaryAction:))]
         fn on_primary_action(&self, _sender: Option<&AnyObject>) {
-            let mtm = self.mtm();
-            (self.ivars().callbacks.on_primary_click)(mtm);
+            (self.ivars().callbacks.on_primary_click)(self.mtm());
         }
 
         #[unsafe(method(onOpenVideoAction:))]
         fn on_open_video_action(&self, _sender: Option<&AnyObject>) {
-            let mtm = self.mtm();
-            (self.ivars().callbacks.on_open_video)(mtm);
+            (self.ivars().callbacks.on_open_video)(self.mtm());
+        }
+
+        #[unsafe(method(onSelectFolderItem:))]
+        fn on_select_folder_item(&self, sender: &NSMenuItem) {
+            let idx = sender.tag();
+            if idx < 0 {
+                return;
+            }
+            let target = self.ivars().folder_targets.borrow().get(idx as usize).cloned();
+            if let Some(dir) = target {
+                (self.ivars().callbacks.on_select_export_dir)(self.mtm(), dir);
+            }
+        }
+
+        #[unsafe(method(onChooseFolderAction:))]
+        fn on_choose_folder_action(&self, _sender: Option<&AnyObject>) {
+            (self.ivars().callbacks.on_choose_export_folder)(self.mtm());
         }
 
         #[unsafe(method(onToggleCodecAction:))]
         fn on_toggle_codec_action(&self, _sender: Option<&AnyObject>) {
-            let mtm = self.mtm();
-            (self.ivars().callbacks.on_toggle_codec)(mtm);
+            (self.ivars().callbacks.on_toggle_codec)(self.mtm());
         }
 
         #[unsafe(method(onQuitAction:))]
         fn on_quit_action(&self, _sender: Option<&AnyObject>) {
-            let mtm = self.mtm();
-            (self.ivars().callbacks.on_quit)(mtm);
+            (self.ivars().callbacks.on_quit)(self.mtm());
         }
     }
 );
 
 impl StatusBarHandler {
     fn new(mtm: MainThreadMarker, callbacks: StatusBarCallbacks) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(HandlerIvars { callbacks });
+        let this = Self::alloc(mtm).set_ivars(HandlerIvars {
+            callbacks,
+            folder_targets: RefCell::new(Vec::new()),
+        });
         unsafe { msg_send![super(this), init] }
     }
 }
@@ -63,14 +90,17 @@ impl StatusBarHandler {
 pub struct StatusBarController {
     status_item: Retained<NSStatusItem>,
     record_item: Retained<NSMenuItem>,
+    folder_item: Retained<NSMenuItem>,
+    folder_submenu: Retained<NSMenu>,
     codec_item: Retained<NSMenuItem>,
-    _handler: Retained<StatusBarHandler>,
+    handler: Retained<StatusBarHandler>,
 }
 
 impl StatusBarController {
     pub fn new(
         mtm: MainThreadMarker,
         codec: RecordingCodec,
+        initial_export_dir: Option<&Path>,
         callbacks: StatusBarCallbacks,
     ) -> Self {
         let handler = StatusBarHandler::new(mtm, callbacks);
@@ -111,6 +141,19 @@ impl StatusBarController {
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 
+        let folder_submenu = NSMenu::new(mtm);
+        folder_submenu.setAutoenablesItems(false);
+        let folder_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str("Save Folder"),
+                None,
+                &NSString::from_str(""),
+            )
+        };
+        folder_item.setSubmenu(Some(&folder_submenu));
+        menu.addItem(&folder_item);
+
         let codec_item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 NSMenuItem::alloc(mtm),
@@ -141,12 +184,16 @@ impl StatusBarController {
 
         status_item.setMenu(Some(&menu));
 
-        Self {
+        let controller = Self {
             status_item,
             record_item,
+            folder_item,
+            folder_submenu,
             codec_item,
-            _handler: handler,
-        }
+            handler,
+        };
+        controller.set_export_dir(mtm, initial_export_dir);
+        controller
     }
 
     pub fn set_idle(&self, mtm: MainThreadMarker) {
@@ -172,5 +219,70 @@ impl StatusBarController {
             "Capture Codec: {}",
             codec.label()
         )));
+    }
+
+    pub fn set_export_dir(&self, mtm: MainThreadMarker, current: Option<&Path>) {
+        let header = match current.filter(|d| is_usable_export_dir(d)) {
+            Some(dir) => format!("Save Folder: {}", compact_tilde_folder(dir, 24)),
+            None => "Save Folder: Choose...".to_string(),
+        };
+        self.folder_item.setTitle(&NSString::from_str(&header));
+
+        self.folder_submenu.removeAllItems();
+        let (items, _) = live_folder_menu_model(current, false, 34);
+        let mut targets = Vec::new();
+
+        for item in items {
+            match item {
+                FolderMenuItem::Dir {
+                    path,
+                    label,
+                    selected,
+                } => {
+                    let tag = targets.len() as isize;
+                    targets.push(path);
+                    let mi = unsafe {
+                        NSMenuItem::initWithTitle_action_keyEquivalent(
+                            NSMenuItem::alloc(mtm),
+                            &NSString::from_str(&label),
+                            Some(sel!(onSelectFolderItem:)),
+                            &NSString::from_str(""),
+                        )
+                    };
+                    unsafe {
+                        mi.setTarget(Some(&self.handler));
+                    }
+                    mi.setTag(tag);
+                    mi.setState(if selected {
+                        NSControlStateValueOn
+                    } else {
+                        NSControlStateValueOff
+                    });
+                    mi.setEnabled(true);
+                    self.folder_submenu.addItem(&mi);
+                }
+                FolderMenuItem::Placeholder => {}
+                FolderMenuItem::Separator => {
+                    self.folder_submenu.addItem(&NSMenuItem::separatorItem(mtm));
+                }
+                FolderMenuItem::ChooseCustom => {
+                    let mi = unsafe {
+                        NSMenuItem::initWithTitle_action_keyEquivalent(
+                            NSMenuItem::alloc(mtm),
+                            &NSString::from_str("Choose Folder..."),
+                            Some(sel!(onChooseFolderAction:)),
+                            &NSString::from_str(""),
+                        )
+                    };
+                    unsafe {
+                        mi.setTarget(Some(&self.handler));
+                    }
+                    mi.setEnabled(true);
+                    self.folder_submenu.addItem(&mi);
+                }
+            }
+        }
+
+        *self.handler.ivars().folder_targets.borrow_mut() = targets;
     }
 }
