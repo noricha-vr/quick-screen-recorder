@@ -128,6 +128,16 @@ impl Preferences {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         atomic_write_private(path, body.as_bytes())
     }
+
+    /// Applies only capture-overlay fields so concurrent Menu Bar / Editor updates (such as `export_dir` or `recording_codec`) are preserved.
+    pub fn merge_capture_selection(&mut self, overlay_prefs: &Self) {
+        self.fps = overlay_prefs.fps;
+        self.show_cursor = overlay_prefs.show_cursor;
+        self.highlight_clicks = overlay_prefs.highlight_clicks;
+        self.audio_mode = overlay_prefs.audio_mode;
+        self.aspect_ratio = overlay_prefs.aspect_ratio;
+        self.last_region = overlay_prefs.last_region;
+    }
 }
 
 #[cfg(test)]
@@ -181,6 +191,24 @@ mod tests {
         let link = dir.join("prefs-link.json");
         std::os::unix::fs::symlink(&tmp, &link).expect("symlink");
         assert!(Preferences::load_from(&link).is_err());
+
+        // Overlay snapshot merge must preserve concurrent export_dir and recording_codec updates
+        let stale_overlay_snapshot = Preferences {
+            fps: 30,
+            export_dir: None,
+            recording_codec: RecordingCodec::H264,
+            ..Preferences::default()
+        };
+        let mut live = Preferences {
+            fps: 60,
+            export_dir: Some(PathBuf::from("/tmp/preserved-dir")),
+            recording_codec: RecordingCodec::Hevc,
+            ..Preferences::default()
+        };
+        live.merge_capture_selection(&stale_overlay_snapshot);
+        assert_eq!(live.fps, 30);
+        assert_eq!(live.export_dir, Some(PathBuf::from("/tmp/preserved-dir")));
+        assert_eq!(live.recording_codec, RecordingCodec::Hevc);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

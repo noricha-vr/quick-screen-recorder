@@ -219,12 +219,13 @@ fn show_selector(mtm: MainThreadMarker, runtime: &Rc<RefCell<AppRuntime>>) {
 fn start_recording_from_overlay(
     mtm: MainThreadMarker,
     runtime: &Rc<RefCell<AppRuntime>>,
-    cfg: CaptureConfig,
+    mut cfg: CaptureConfig,
     updated_prefs: Preferences,
 ) {
     {
         let mut rt = runtime.borrow_mut();
-        rt.prefs = updated_prefs;
+        rt.prefs.merge_capture_selection(&updated_prefs);
+        cfg.codec = rt.prefs.recording_codec;
         let _ = rt.prefs.save();
         if let Some(ov) = rt.overlay.take() {
             ov.close();
