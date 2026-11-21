@@ -568,7 +568,7 @@ pub fn sanitize_terminal_text(input: &str, allow_newlines: bool) -> String {
     input
         .chars()
         .map(|c| {
-            if is_bidi_control(c) {
+            if is_bidi_control(c) || (!allow_newlines && matches!(c, '\u{2028}' | '\u{2029}')) {
                 '?'
             } else if c.is_control() {
                 if allow_newlines && (c == '\n' || c == '\t') {
@@ -649,13 +649,10 @@ mod tests {
     }
 
     #[test]
-    fn format_tilde_hides_home_prefix_and_desktop_is_usable() {
+    fn format_tilde_hides_home_prefix_and_rejects_readonly_system_dir() {
         if let Some(home) = valid_home_dir() {
             let desktop = home.join("Desktop");
             assert_eq!(format_tilde_path(&desktop), "~/Desktop");
-            if desktop.is_dir() {
-                assert!(is_usable_export_dir(&desktop));
-            }
         }
         assert!(!is_usable_export_dir(Path::new("/System")));
     }

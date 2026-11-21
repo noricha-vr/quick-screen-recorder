@@ -93,6 +93,8 @@ impl ExclusiveStagingDir {
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&stage_dir_path)
             .map_err(|e| format!("Failed opening staging directory descriptor: {e}"))?;
+        // Hold a kernel advisory lock for the lifetime of this session so cache pruning never deletes active recordings
+        let _ = unsafe { libc::flock(stage_dir_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if let Err(e) = clear_fd_extended_acl(stage_dir_file.as_raw_fd()) {
             let _ = fs::remove_dir_all(&stage_dir_path);
             return Err(e);
