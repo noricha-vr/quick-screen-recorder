@@ -188,13 +188,13 @@ pub fn run_export_with_options(
             ffmpeg::export_with_ffmpeg(&staged_req, (end - start).max(0.05), progress)
         }
     };
-    let elapsed_ms = t0.elapsed().as_millis() as u64;
 
     match res {
         Ok(()) => {
             let (committed_path, bytes) = match stage.commit_with_policy(prevent_overwrite) {
                 Ok(pair) => pair,
                 Err(err) => {
+                    let elapsed_ms = t0.elapsed().as_millis() as u64;
                     record_perf_event(&PerfEvent {
                         ts_unix: now_unix_secs(),
                         kind: PerfKind::Export,
@@ -208,6 +208,7 @@ pub fn run_export_with_options(
                     return Err(err);
                 }
             };
+            let elapsed_ms = t0.elapsed().as_millis() as u64;
             set_progress_permille(progress, 1000);
             record_perf_event(&PerfEvent {
                 ts_unix: now_unix_secs(),
@@ -230,6 +231,7 @@ pub fn run_export_with_options(
             })
         }
         Err(err) => {
+            let elapsed_ms = t0.elapsed().as_millis() as u64;
             record_perf_event(&PerfEvent {
                 ts_unix: now_unix_secs(),
                 kind: PerfKind::Export,

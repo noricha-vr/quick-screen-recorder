@@ -209,8 +209,11 @@ impl ExclusiveStagingDir {
             .file_name()
             .and_then(|s| s.to_str())
             .ok_or("Invalid UTF-8 output filename")?;
-        let mut xdev_tmp: Option<CString> = None;
-        if self.try_publish_excl(initial_name, &mut xdev_tmp)? {
+        let mut xdev_guard = XdevTempGuard {
+            dir_fd: self.dest_dir_fd.as_raw_fd(),
+            name_c: None,
+        };
+        if self.try_publish_excl(initial_name, &mut xdev_guard)? {
             return Ok(initial_name.to_string());
         }
 
@@ -228,35 +231,30 @@ impl ExclusiveStagingDir {
 
         for suffix in 2..=9999_u32 {
             let candidate = format!("{base_stem}-{suffix}.{ext}");
-            match self.try_publish_excl(&candidate, &mut xdev_tmp) {
-                Ok(true) => return Ok(candidate),
-                Ok(false) => {}
-                Err(e) => {
-                    cleanup_xdev_tmp(self.dest_dir_fd.as_raw_fd(), &xdev_tmp);
-                    return Err(e);
-                }
+            if self.try_publish_excl(&candidate, &mut xdev_guard)? {
+                return Ok(candidate);
             }
         }
         let fallback = format!("{base_stem}-{}.{ext}", random_hex_token());
-        let res = self.try_publish_excl(&fallback, &mut xdev_tmp);
-        if !matches!(res, Ok(true)) {
-            cleanup_xdev_tmp(self.dest_dir_fd.as_raw_fd(), &xdev_tmp);
-        }
-        match res {
-            Ok(true) => Ok(fallback),
-            Ok(false) => Err("Failed finding non-colliding output filename".to_string()),
-            Err(e) => Err(e),
+        if self.try_publish_excl(&fallback, &mut xdev_guard)? {
+            Ok(fallback)
+        } else {
+            Err("Failed finding non-colliding output filename".to_string())
         }
     }
 
     fn try_publish_excl(
         &self,
         file_name: &str,
-        xdev_tmp: &mut Option<CString>,
+        xdev_guard: &mut XdevTempGuard,
     ) -> Result<bool, String> {
         let name_c = CString::new(file_name.as_bytes()).map_err(|_| "Invalid target filename")?;
-        if let Some(tmp_c) = xdev_tmp.as_ref() {
-            return rename_excl_within_dir(self.dest_dir_fd.as_raw_fd(), tmp_c, &name_c);
+        if let Some(tmp_c) = xdev_guard.name_c.as_ref() {
+            let published = rename_excl_within_dir(self.dest_dir_fd.as_raw_fd(), tmp_c, &name_c)?;
+            if published {
+                xdev_guard.name_c = None;
+            }
+            return Ok(published);
         }
         let rc = unsafe {
             libc::renameatx_np(
@@ -276,10 +274,14 @@ impl ExclusiveStagingDir {
             Some(libc::EXDEV) => {
                 let tmp_c =
                     stage_once_on_dest_volume(&self.staged_file, self.dest_dir_fd.as_raw_fd())?;
-                let published =
-                    rename_excl_within_dir(self.dest_dir_fd.as_raw_fd(), &tmp_c, &name_c)?;
-                if !published {
-                    *xdev_tmp = Some(tmp_c);
+                xdev_guard.name_c = Some(tmp_c);
+                let published = rename_excl_within_dir(
+                    self.dest_dir_fd.as_raw_fd(),
+                    xdev_guard.name_c.as_ref().unwrap(),
+                    &name_c,
+                )?;
+                if published {
+                    xdev_guard.name_c = None;
                 }
                 Ok(published)
             }
@@ -388,10 +390,17 @@ fn rename_excl_within_dir(
     }
 }
 
-fn cleanup_xdev_tmp(dir_fd: libc::c_int, xdev_tmp: &Option<CString>) {
-    if let Some(tmp_c) = xdev_tmp.as_ref() {
-        unsafe {
-            libc::unlinkat(dir_fd, tmp_c.as_ptr(), 0);
+struct XdevTempGuard {
+    dir_fd: libc::c_int,
+    name_c: Option<CString>,
+}
+
+impl Drop for XdevTempGuard {
+    fn drop(&mut self) {
+        if let Some(ref tmp_c) = self.name_c {
+            unsafe {
+                libc::unlinkat(self.dir_fd, tmp_c.as_ptr(), 0);
+            }
         }
     }
 }
