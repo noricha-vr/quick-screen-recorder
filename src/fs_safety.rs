@@ -50,42 +50,65 @@ pub fn next_unique_token() -> String {
     random_hex_token()
 }
 
-/// Returns `HOME` only if it is non-empty and an absolute path.
+/// Returns `HOME` if it is non-empty and absolute, falling back to OS `getpwuid_r` for `geteuid()`.
 pub fn valid_home_dir() -> Option<PathBuf> {
-    let raw = std::env::var_os("HOME")?;
-    if raw.is_empty() {
-        return None;
+    if let Some(raw) = std::env::var_os("HOME") {
+        if !raw.is_empty() {
+            let p = PathBuf::from(raw);
+            if p.is_absolute() {
+                return Some(p);
+            }
+        }
     }
-    let p = PathBuf::from(raw);
-    if p.is_absolute() { Some(p) } else { None }
+    pwuid_home_dir()
 }
 
-/// Returns `~/Desktop` when available as a verified writable directory owned by the current user,
-/// falling back to `HOME` or a persistent `0700` exports folder (never the auto-pruned cache dir).
-pub fn default_desktop_export_dir() -> PathBuf {
-    if let Some(home) = valid_home_dir() {
-        let desktop = home.join("Desktop");
-        if is_usable_export_dir(&desktop) {
-            return desktop;
-        }
-        if is_usable_export_dir(&home) {
-            return home;
-        }
-        let app_exports = home
-            .join("Library")
-            .join("Application Support")
-            .join(APP_SUPPORT_DIR_NAME)
-            .join("Exports");
-        if ensure_private_dir(&app_exports).is_ok() && is_usable_export_dir(&app_exports) {
-            return app_exports;
-        }
+fn pwuid_home_dir() -> Option<PathBuf> {
+    let euid = unsafe { libc::geteuid() };
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = ptr::null_mut();
+    let mut buf = vec![0_u8; 4096];
+    let rc = unsafe {
+        libc::getpwuid_r(
+            euid,
+            &mut pwd,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() || pwd.pw_dir.is_null() {
+        return None;
     }
-    let fallback = PathBuf::from(format!(
-        "/private/tmp/{APP_SUPPORT_DIR_NAME}-Exports-{}",
-        unsafe { libc::geteuid() }
-    ));
-    let _ = ensure_private_dir(&fallback);
-    fallback
+    let s = unsafe { CStr::from_ptr(pwd.pw_dir).to_str().ok()? };
+    if s.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(s);
+    p.is_absolute().then_some(p)
+}
+
+/// Returns `~/Desktop` when available as a verified writable persistent directory owned by the current user,
+/// falling back to `HOME` or `~/Library/Application Support/QuickScreenRecorder/Exports`.
+/// Never falls back to `/tmp` or auto-pruned cache directories (`None` prompts user to pick a folder).
+pub fn default_desktop_export_dir() -> Option<PathBuf> {
+    let home = valid_home_dir()?;
+    let desktop = home.join("Desktop");
+    if is_usable_export_dir(&desktop) {
+        return Some(desktop);
+    }
+    if is_usable_export_dir(&home) {
+        return Some(home);
+    }
+    let app_exports = home
+        .join("Library")
+        .join("Application Support")
+        .join(APP_SUPPORT_DIR_NAME)
+        .join("Exports");
+    if ensure_private_dir(&app_exports).is_ok() && is_usable_export_dir(&app_exports) {
+        return Some(app_exports);
+    }
+    None
 }
 
 /// Verifies `dir` is an absolute, dot-free, writable, non-symlink directory with safe group/ACL
@@ -510,10 +533,13 @@ pub fn prune_stale_cache_files(max_age: Duration) {
     };
     let now = SystemTime::now();
     for entry in entries.flatten() {
-        let Ok(meta) = entry.metadata() else {
+        let Ok(meta) = entry
+            .file_type()
+            .and_then(|_| fs::symlink_metadata(entry.path()))
+        else {
             continue;
         };
-        if !meta.is_file() {
+        if meta.file_type().is_symlink() {
             continue;
         }
         let expired = meta
@@ -521,8 +547,18 @@ pub fn prune_stale_cache_files(max_age: Duration) {
             .ok()
             .and_then(|m| now.duration_since(m).ok())
             .is_some_and(|age| age > max_age);
-        if expired {
+        if !expired {
+            continue;
+        }
+        if meta.is_file() {
             let _ = fs::remove_file(entry.path());
+        } else if meta.is_dir()
+            && entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".qsr-work-")
+        {
+            let _ = fs::remove_dir_all(entry.path());
         }
     }
 }

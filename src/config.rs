@@ -49,11 +49,11 @@ impl Default for Preferences {
 }
 
 impl Preferences {
-    /// Resolves the pre-selected export destination directory, defaulting to `~/Desktop`.
-    pub fn resolved_export_dir(&self) -> PathBuf {
+    /// Resolves the pre-selected persistent export destination directory, defaulting to `~/Desktop`.
+    pub fn resolved_export_dir(&self) -> Option<PathBuf> {
         if let Some(dir) = &self.export_dir {
             if is_usable_export_dir(dir) {
-                return dir.clone();
+                return Some(dir.clone());
             }
         }
         default_desktop_export_dir()
@@ -163,11 +163,20 @@ mod tests {
 
         let custom_dir = dir.join("exports");
         std::fs::create_dir_all(&custom_dir).expect("mkdir exports");
+        std::os::unix::fs::PermissionsExt::set_mode(
+            &mut std::fs::metadata(&custom_dir).unwrap().permissions(),
+            0o700,
+        );
+        std::fs::set_permissions(
+            &custom_dir,
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .expect("chmod exports 0700");
         let mut with_dir = loaded;
         with_dir.export_dir = Some(custom_dir.clone());
         with_dir.save_to(&tmp).expect("save custom export_dir");
         let loaded_custom = Preferences::load_from(&tmp).expect("load custom export_dir");
-        assert_eq!(loaded_custom.resolved_export_dir(), custom_dir);
+        assert_eq!(loaded_custom.resolved_export_dir(), Some(custom_dir));
 
         let link = dir.join("prefs-link.json");
         std::os::unix::fs::symlink(&tmp, &link).expect("symlink");

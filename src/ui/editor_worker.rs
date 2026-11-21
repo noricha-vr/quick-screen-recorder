@@ -124,7 +124,7 @@ pub struct EditorState {
     pub format: ExportFormat,
     pub fps: u32,
     pub max_width: Option<u32>,
-    pub export_dir: PathBuf,
+    pub export_dir: Option<PathBuf>,
     pub busy: bool,
 }
 
@@ -324,7 +324,8 @@ pub fn spawn_async_export(
                                 Err(e) => {
                                     progress_view.set_progress(1000, ProgressVisualState::Failed);
                                     status_label.setTextColor(Some(&NSColor::systemRedColor()));
-                                    status_label.setStringValue(&NSString::from_str(&e));
+                                    let safe = sanitize_terminal_text(&e, false);
+                                    status_label.setStringValue(&NSString::from_str(&safe));
                                 }
                             }
                         } else {
@@ -349,7 +350,8 @@ pub fn spawn_async_export(
                     Err(err) => {
                         progress_view.set_progress(1000, ProgressVisualState::Failed);
                         status_label.setTextColor(Some(&NSColor::systemRedColor()));
-                        status_label.setStringValue(&NSString::from_str(&err));
+                        let safe = sanitize_terminal_text(&err, false);
+                        status_label.setStringValue(&NSString::from_str(&safe));
                     }
                 }
             }
@@ -372,7 +374,10 @@ pub fn spawn_async_export(
     }
 }
 
-pub fn compact_folder_badge(dir: &std::path::Path) -> String {
+pub fn compact_folder_badge(dir: Option<&std::path::Path>) -> String {
+    let Some(dir) = dir else {
+        return "Save to: Choose Folder...".to_string();
+    };
     let tilde = format_tilde_path(dir);
     let chars: Vec<char> = tilde.chars().collect();
     if chars.len() <= 24 {
@@ -385,7 +390,7 @@ pub fn compact_folder_badge(dir: &std::path::Path) -> String {
 
 pub fn choose_export_directory(
     mtm: MainThreadMarker,
-    current_dir: &std::path::Path,
+    current_dir: Option<&std::path::Path>,
 ) -> Option<Result<PathBuf, &'static str>> {
     let panel = NSOpenPanel::openPanel(mtm);
     panel.setCanChooseFiles(false);
@@ -393,7 +398,7 @@ pub fn choose_export_directory(
     panel.setCanCreateDirectories(true);
     panel.setAllowsMultipleSelection(false);
     panel.setPrompt(Some(&NSString::from_str("Select Folder")));
-    if let Some(s) = current_dir.to_str() {
+    if let Some(s) = current_dir.and_then(|d| d.to_str()) {
         let url = NSURL::fileURLWithPath(&NSString::from_str(s));
         panel.setDirectoryURL(Some(&url));
     }

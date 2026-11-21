@@ -157,10 +157,12 @@ impl EditorWindow {
         let initial_fps = popups.initial_fps;
 
         let initial_export_dir = prefs.resolved_export_dir();
-        let folder_label = NSTextField::labelWithString(
-            &NSString::from_str(&compact_folder_badge(&initial_export_dir)),
-            mtm,
-        );
+        let badge_text = if demo_showcase && initial_export_dir.is_none() {
+            "Save to: ~/Desktop".to_string()
+        } else {
+            compact_folder_badge(initial_export_dir.as_deref())
+        };
+        let folder_label = NSTextField::labelWithString(&NSString::from_str(&badge_text), mtm);
         folder_label.setFont(Some(&NSFont::monospacedDigitSystemFontOfSize_weight(
             11.5, 0.15,
         )));
@@ -188,13 +190,11 @@ impl EditorWindow {
         ));
         root.addSubview(&folder_btn);
 
-        let status_label = NSTextField::labelWithString(
-            &NSString::from_str(&format!(
-                "Ready · Saves to {}",
-                format_tilde_path(&initial_export_dir)
-            )),
-            mtm,
-        );
+        let ready_text = match &initial_export_dir {
+            Some(dir) => format!("Ready · Saves to {}", format_tilde_path(dir)),
+            None => "Choose an export folder via Folder... before saving".to_string(),
+        };
+        let status_label = NSTextField::labelWithString(&NSString::from_str(&ready_text), mtm);
         status_label.setFont(Some(&NSFont::monospacedDigitSystemFontOfSize_weight(
             12.0, 0.15,
         )));
@@ -334,16 +334,16 @@ impl EditorWindow {
                         }
                         st.export_dir.clone()
                     };
-                    match choose_export_directory(m, &cur_dir) {
+                    match choose_export_directory(m, cur_dir.as_deref()) {
                         None => {}
                         Some(Err(msg)) => {
                             status_dir.setTextColor(Some(&NSColor::systemRedColor()));
                             status_dir.setStringValue(&NSString::from_str(msg));
                         }
                         Some(Ok(picked)) => {
-                            st_dir.borrow_mut().export_dir = picked.clone();
+                            st_dir.borrow_mut().export_dir = Some(picked.clone());
                             fld_lbl_dir.setStringValue(&NSString::from_str(&compact_folder_badge(
-                                &picked,
+                                Some(&picked),
                             )));
                             status_dir.setTextColor(Some(
                                 &NSColor::colorWithSRGBRed_green_blue_alpha(0.68, 0.74, 0.84, 1.0),
@@ -399,7 +399,14 @@ impl EditorWindow {
                         if st.busy {
                             return;
                         }
-                        if !is_usable_export_dir(&st.export_dir) {
+                        let Some(export_dir) = st.export_dir.clone() else {
+                            status_save.setTextColor(Some(&NSColor::systemRedColor()));
+                            status_save.setStringValue(&NSString::from_str(
+                                "No persistent export folder set; select one via Folder...",
+                            ));
+                            return;
+                        };
+                        if !is_usable_export_dir(&export_dir) {
                             status_save.setTextColor(Some(&NSColor::systemRedColor()));
                             status_save.setStringValue(&NSString::from_str(
                                 "Export folder is unavailable or unsafe; choose another via Folder...",
@@ -407,7 +414,7 @@ impl EditorWindow {
                             return;
                         }
                         let out_path =
-                            next_recording_output_path(&st.export_dir, st.format.extension());
+                            next_recording_output_path(&export_dir, st.format.extension());
                         st.busy = true;
                         ExportRequest {
                             input: st.input_path.clone(),
