@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::export::{ExportFormat, ExportRequest, SharedExportProgress, set_progress_permille};
-use crate::fs_safety::sanitize_terminal_text;
+use crate::fs_safety::{has_only_safe_acls, sanitize_terminal_text};
 
 const ALLOWLISTED_FFMPEG_PATHS: [&str; 3] = [
     "/opt/homebrew/bin/ffmpeg",
@@ -259,9 +259,6 @@ fn spawn_disclaimed_with_timeout(
         return Err("Failed creating stdout progress pipe for ffmpeg".to_string());
     }
     let (out_read_fd, out_write_fd) = (out_fds[0], out_fds[1]);
-    set_fd_cloexec_and_nonblock(out_read_fd, true);
-    set_fd_cloexec_and_nonblock(out_write_fd, false);
-
     let mut pipe_fds = [0_i32; 2];
     if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
         unsafe {
@@ -271,8 +268,19 @@ fn spawn_disclaimed_with_timeout(
         return Err("Failed creating stderr pipe for ffmpeg".to_string());
     }
     let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
-    set_fd_cloexec_and_nonblock(read_fd, true);
-    set_fd_cloexec_and_nonblock(write_fd, false);
+    if let Err(e) = set_fd_cloexec_and_nonblock(out_read_fd, true)
+        .and_then(|()| set_fd_cloexec_and_nonblock(out_write_fd, false))
+        .and_then(|()| set_fd_cloexec_and_nonblock(read_fd, true))
+        .and_then(|()| set_fd_cloexec_and_nonblock(write_fd, false))
+    {
+        unsafe {
+            libc::close(out_read_fd);
+            libc::close(out_write_fd);
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+        return Err(e);
+    }
 
     let mut file_actions: libc::posix_spawn_file_actions_t = ptr::null_mut();
     let mut attrs: libc::posix_spawnattr_t = ptr::null_mut();
@@ -445,6 +453,9 @@ fn verify_trusted_binary(candidate: &Path, euid: u32) -> Option<PathBuf> {
     if meta.uid() != 0 && meta.uid() != euid {
         return None;
     }
+    if !has_only_safe_acls(&canon, euid) {
+        return None;
+    }
 
     verify_ancestor_chain(canon.parent(), euid)?;
     Some(canon)
@@ -466,6 +477,9 @@ fn verify_ancestor_chain(mut cur: Option<&Path>, euid: u32) -> Option<()> {
         if dm.uid() != 0 && dm.uid() != euid {
             return None;
         }
+        if !has_only_safe_acls(dir, euid) {
+            return None;
+        }
         cur = dir.parent();
     }
     Some(())
@@ -475,24 +489,26 @@ const fn is_trusted_admin_group(gid: u32) -> bool {
     gid == 0 || gid == 80
 }
 
-fn set_fd_cloexec_and_nonblock(fd: libc::c_int, nonblock: bool) {
+fn set_fd_cloexec_and_nonblock(fd: libc::c_int, nonblock: bool) -> Result<(), String> {
     unsafe {
         let fd_flags = libc::fcntl(fd, libc::F_GETFD);
-        if fd_flags >= 0 {
-            let _ = libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC);
+        if fd_flags < 0 || libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) < 0 {
+            return Err("Failed setting FD_CLOEXEC on ffmpeg pipe".to_string());
         }
         if nonblock {
             let fl = libc::fcntl(fd, libc::F_GETFL);
-            if fl >= 0 {
-                let _ = libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+            if fl < 0 || libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) < 0 {
+                return Err("Failed setting O_NONBLOCK on ffmpeg pipe".to_string());
             }
         }
     }
+    Ok(())
 }
 
+/// Reads at most 32 chunks (64 KiB) per poll tick so continuous pipe output can never starve timeout checks.
 fn drain_nonblocking_fd(fd: libc::c_int, dst: &mut Vec<u8>, max_keep: usize) {
     let mut chunk = [0_u8; 2048];
-    loop {
+    for _ in 0..32 {
         let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
         if n <= 0 {
             break;

@@ -96,10 +96,10 @@ pub fn capture_window_view_to_png(window: &NSWindow, output_path: &Path) -> Resu
 }
 
 /// Retains only `IHDR`, `IDAT`, and `IEND` PNG chunks so display ICC color profile names never leak.
-/// Fails closed with `Err` if the PNG signature, chunk bounds, or `IEND` trailer is malformed.
+/// Validates PNG signature, `IHDR` first (`len == 13`), CRC-32 of every chunk, and `IEND` last (`len == 0`).
 pub fn strip_ancillary_png_chunks(png: &[u8]) -> Result<Vec<u8>, String> {
     const SIG: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
-    if png.len() < 8 || &png[..8] != SIG {
+    if png.len() < 33 || &png[..8] != SIG {
         return Err("Invalid PNG signature".to_string());
     }
     let mut out = Vec::with_capacity(png.len());
@@ -108,6 +108,7 @@ pub fn strip_ancillary_png_chunks(png: &[u8]) -> Result<Vec<u8>, String> {
     let mut saw_ihdr = false;
     let mut saw_idat = false;
     let mut saw_iend = false;
+
     while pos < png.len() {
         if pos + 12 > png.len() {
             return Err("Truncated PNG chunk header".to_string());
@@ -121,16 +122,38 @@ pub fn strip_ancillary_png_chunks(png: &[u8]) -> Result<Vec<u8>, String> {
             return Err("Truncated PNG chunk payload".to_string());
         }
         let tag = &png[pos + 4..pos + 8];
+        let crc_pos = pos + 8 + len;
+        let expected_crc = u32::from_be_bytes([
+            png[crc_pos],
+            png[crc_pos + 1],
+            png[crc_pos + 2],
+            png[crc_pos + 3],
+        ]);
+        if png_crc32(&png[pos + 4..crc_pos]) != expected_crc {
+            return Err("PNG chunk CRC mismatch".to_string());
+        }
+        if !saw_ihdr && tag != b"IHDR" {
+            return Err("First PNG chunk must be IHDR".to_string());
+        }
         match tag {
             b"IHDR" => {
+                if saw_ihdr || len != 13 {
+                    return Err("Invalid or duplicate PNG IHDR chunk".to_string());
+                }
                 saw_ihdr = true;
                 out.extend_from_slice(&png[pos..chunk_end]);
             }
             b"IDAT" => {
+                if len == 0 {
+                    return Err("Empty PNG IDAT chunk".to_string());
+                }
                 saw_idat = true;
                 out.extend_from_slice(&png[pos..chunk_end]);
             }
             b"IEND" => {
+                if len != 0 || chunk_end != png.len() {
+                    return Err("Invalid non-empty or non-terminal PNG IEND chunk".to_string());
+                }
                 saw_iend = true;
                 out.extend_from_slice(&png[pos..chunk_end]);
                 break;
@@ -143,6 +166,21 @@ pub fn strip_ancillary_png_chunks(png: &[u8]) -> Result<Vec<u8>, String> {
         return Err("PNG missing required IHDR/IDAT/IEND chunks".to_string());
     }
     Ok(out)
+}
+
+fn png_crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFF_u32;
+    for &b in bytes {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = if (crc & 1) != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
 }
 
 #[cfg(test)]

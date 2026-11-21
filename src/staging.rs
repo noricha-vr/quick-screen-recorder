@@ -7,8 +7,8 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::path::{Path, PathBuf};
 
 use crate::fs_safety::{
-    is_usable_export_dir, private_cache_dir, random_hex_token, strip_extended_acl,
-    verify_pre_canonical_target_parent,
+    clear_fd_extended_acl, has_only_safe_acls, is_usable_export_dir, private_cache_dir,
+    random_hex_token, verify_pre_canonical_target_parent,
 };
 
 /// Exclusively created (`0700`) staging directory inside our private cache directory, paired with
@@ -87,22 +87,26 @@ impl ExclusiveStagingDir {
             .mode(0o700)
             .create(&stage_dir_path)
             .map_err(|e| format!("Failed creating exclusive 0700 staging directory: {e}"))?;
-        strip_extended_acl(&stage_dir_path);
 
         let stage_dir_file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&stage_dir_path)
             .map_err(|e| format!("Failed opening staging directory descriptor: {e}"))?;
+        if let Err(e) = clear_fd_extended_acl(stage_dir_file.as_raw_fd()) {
+            let _ = fs::remove_dir_all(&stage_dir_path);
+            return Err(e);
+        }
         let dir_meta = stage_dir_file
             .metadata()
             .map_err(|e| format!("Failed verifying staging directory metadata: {e}"))?;
         if !dir_meta.is_dir()
             || dir_meta.uid() != euid
             || (dir_meta.permissions().mode() & 0o077 != 0)
+            || !has_only_safe_acls(&stage_dir_path, euid)
         {
             let _ = fs::remove_dir_all(&stage_dir_path);
-            return Err("Staging directory ownership or 0700 mode check failed".to_string());
+            return Err("Staging directory ownership, 0700 mode, or ACL check failed".to_string());
         }
         let stage_dir_fd = OwnedFd::from(stage_dir_file);
 
@@ -306,28 +310,58 @@ fn copy_into_pinned_dir_excl(
     dest_dir_fd: libc::c_int,
     name_c: &CString,
 ) -> Result<bool, String> {
+    // Stage into a protected 0600 temp file on the target volume first so partial/empty files never appear
+    let tmp_name = format!(".qsr-xdev-{}", random_hex_token());
+    let tmp_c = CString::new(tmp_name.as_bytes()).unwrap();
+    let mut src = File::open(staged).map_err(|e| format!("Failed opening staged file: {e}"))?;
     let fd = unsafe {
         libc::openat(
             dest_dir_fd,
-            name_c.as_ptr(),
+            tmp_c.as_ptr(),
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
             0o600_u32,
         )
     };
     if fd < 0 {
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EEXIST) {
-            return Ok(false);
+        return Err(format!(
+            "Failed creating cross-volume staging file: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    if let Err(e) = clear_fd_extended_acl(fd) {
+        unsafe {
+            libc::close(fd);
+            libc::unlinkat(dest_dir_fd, tmp_c.as_ptr(), 0);
         }
-        return Err(format!("Failed creating cross-volume output file: {err}"));
+        return Err(e);
     }
     let mut out_file = unsafe { File::from_owned_fd_compat(fd) };
-    let mut src = File::open(staged).map_err(|e| format!("Failed opening staged file: {e}"))?;
     if let Err(e) = io::copy(&mut src, &mut out_file).and_then(|_| out_file.sync_all()) {
-        unsafe { libc::unlinkat(dest_dir_fd, name_c.as_ptr(), 0) };
+        drop(out_file);
+        unsafe { libc::unlinkat(dest_dir_fd, tmp_c.as_ptr(), 0) };
         return Err(format!("Failed writing cross-volume output file: {e}"));
     }
-    Ok(true)
+    drop(out_file);
+
+    let rc = unsafe {
+        libc::renameatx_np(
+            dest_dir_fd,
+            tmp_c.as_ptr(),
+            dest_dir_fd,
+            name_c.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let err = io::Error::last_os_error();
+    unsafe { libc::unlinkat(dest_dir_fd, tmp_c.as_ptr(), 0) };
+    if err.raw_os_error() == Some(libc::EEXIST) {
+        Ok(false)
+    } else {
+        Err(format!("Failed publishing cross-volume output file: {err}"))
+    }
 }
 
 fn copy_into_pinned_dir_overwrite(
@@ -338,6 +372,7 @@ fn copy_into_pinned_dir_overwrite(
 ) -> Result<(), String> {
     let tmp_name = format!(".qsr-xdev-{}", random_hex_token());
     let tmp_c = CString::new(tmp_name.as_bytes()).unwrap();
+    let mut src = File::open(staged).map_err(|e| format!("Failed opening staged file: {e}"))?;
     let fd = unsafe {
         libc::openat(
             dest_dir_fd,
@@ -352,9 +387,16 @@ fn copy_into_pinned_dir_overwrite(
             io::Error::last_os_error()
         ));
     }
+    if let Err(e) = clear_fd_extended_acl(fd) {
+        unsafe {
+            libc::close(fd);
+            libc::unlinkat(dest_dir_fd, tmp_c.as_ptr(), 0);
+        }
+        return Err(e);
+    }
     let mut out_file = unsafe { File::from_owned_fd_compat(fd) };
-    let mut src = File::open(staged).map_err(|e| format!("Failed opening staged file: {e}"))?;
     if let Err(e) = io::copy(&mut src, &mut out_file).and_then(|_| out_file.sync_all()) {
+        drop(out_file);
         unsafe { libc::unlinkat(dest_dir_fd, tmp_c.as_ptr(), 0) };
         return Err(format!("Failed copying cross-volume output file: {e}"));
     }

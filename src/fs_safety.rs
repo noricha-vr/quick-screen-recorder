@@ -1,6 +1,7 @@
 use std::ffi::{CStr, CString};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -17,6 +18,9 @@ const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
 
 unsafe extern "C" {
     fn acl_get_link_np(path: *const libc::c_char, acl_type: libc::c_int) -> *mut libc::c_void;
+    fn acl_init(count: libc::c_int) -> *mut libc::c_void;
+    fn acl_set_fd_np(fd: libc::c_int, acl: *mut libc::c_void, acl_type: libc::c_int)
+    -> libc::c_int;
     fn acl_to_text(acl: *mut libc::c_void, len_p: *mut libc::ssize_t) -> *mut libc::c_char;
     fn acl_free(obj_p: *mut libc::c_void) -> libc::c_int;
 }
@@ -94,7 +98,7 @@ pub fn is_usable_export_dir(dir: &Path) -> bool {
     if meta.uid() != euid && !(meta.uid() == 0 && sticky) {
         return false;
     }
-    if !is_safe_dir_mode_and_group(mode, meta.gid()) || !has_only_safe_acls(dir, euid, sticky) {
+    if !is_safe_dir_mode_and_group(mode, meta.gid()) || !has_only_safe_acls(dir, euid) {
         return false;
     }
     if !is_dir_writable(dir) {
@@ -127,11 +131,10 @@ pub(crate) fn verify_pre_canonical_target_parent(parent: &Path, euid: u32) -> Re
                 }
                 if !lmeta.file_type().is_symlink() {
                     let mode = lmeta.permissions().mode();
-                    let sticky = (mode & 0o1000) != 0;
                     if !lmeta.is_dir()
                         || (lmeta.uid() != euid && lmeta.uid() != 0)
                         || !is_safe_dir_mode_and_group(mode, lmeta.gid())
-                        || !has_only_safe_acls(p, euid, sticky)
+                        || !has_only_safe_acls(p, euid)
                     {
                         return Err(
                             "Output ancestor directory failed ownership or permission check"
@@ -163,11 +166,10 @@ fn verify_safe_dir_ancestors(mut cur: Option<&Path>, euid: u32) -> bool {
             return false;
         };
         let dmode = dmeta.permissions().mode();
-        let sticky = (dmode & 0o1000) != 0;
         if !dmeta.is_dir()
             || (dmeta.uid() != euid && dmeta.uid() != 0)
             || !is_safe_dir_mode_and_group(dmode, dmeta.gid())
-            || !has_only_safe_acls(anc, euid, sticky)
+            || !has_only_safe_acls(anc, euid)
         {
             return false;
         }
@@ -197,19 +199,19 @@ fn is_dir_writable(dir: &Path) -> bool {
     unsafe { libc::access(c_path.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
 }
 
-/// Allowlist check for Darwin extended ACLs (`<sys/acl.h>`): allows absent ACLs, `deny` entries
-/// (such as macOS's default `group:everyone deny delete` on `~/Desktop`), `allow` entries scoped to
-/// `euid` itself, or strictly read-only `allow` permissions. Any third-party write/modify ACL fails closed.
-fn has_only_safe_acls(dir: &Path, euid: u32, sticky: bool) -> bool {
-    if sticky {
-        return true;
-    }
+/// Allowlist check for Darwin extended ACLs (`<sys/acl.h>`): checked on EVERY directory (including sticky).
+/// Distinguishes `ENOENT` (no extended ACL) from real errors (`EACCES`, `EIO`, `ENOMEM`), failing closed on errors.
+pub fn has_only_safe_acls(dir: &Path, euid: u32) -> bool {
     let Ok(c_path) = CString::new(dir.as_os_str().as_bytes()) else {
         return false;
     };
+    unsafe {
+        *libc::__error() = 0;
+    }
     let acl = unsafe { acl_get_link_np(c_path.as_ptr(), ACL_TYPE_EXTENDED) };
     if acl.is_null() {
-        return true;
+        let err = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        return err == libc::ENOENT || err == 0;
     }
     let mut text_len: libc::ssize_t = 0;
     let text_ptr = unsafe { acl_to_text(acl, &mut text_len) };
@@ -233,7 +235,7 @@ fn is_acl_text_allowlisted(acl_text: &str, euid: u32) -> bool {
         if line.is_empty() || line.starts_with("!#acl") {
             continue;
         }
-        // Darwin acl_to_text format: <tag>:<uuid>:<name>:<id>:<allow|deny>:<perms>
+        // Darwin acl_to_text format: <tag>:<uuid>:<name>:<id>:<allow|deny>[:<flags>]:<perms>
         let parts: Vec<&str> = line.split(':').collect();
         if parts.len() < 6 {
             return false;
@@ -241,7 +243,6 @@ fn is_acl_text_allowlisted(acl_text: &str, euid: u32) -> bool {
         let tag = parts[0];
         let id_str = parts[3];
         let action = parts[4];
-        let perms = parts[5];
         if action == "deny" {
             continue;
         }
@@ -251,6 +252,11 @@ fn is_acl_text_allowlisted(acl_text: &str, euid: u32) -> bool {
         if tag == "user" && id_str.parse::<u32>() == Ok(euid) {
             continue;
         }
+        // Reject any third-party `allow` ACE carrying inheritance flags (e.g. file_inherit / directory_inherit)
+        if parts.len() > 6 {
+            return false;
+        }
+        let perms = parts[5];
         let all_readonly = perms.split(',').all(|p| {
             matches!(
                 p.trim(),
@@ -270,12 +276,21 @@ fn is_acl_text_allowlisted(acl_text: &str, euid: u32) -> bool {
     true
 }
 
-pub(crate) fn strip_extended_acl(path: &Path) {
-    if let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) {
-        let attr = c"com.apple.system.Security";
-        unsafe {
-            let _ = libc::removexattr(c_path.as_ptr(), attr.as_ptr(), libc::XATTR_NOFOLLOW);
-        }
+/// Clears any inherited Darwin extended ACL on an open descriptor via `acl_init(0)` + `acl_set_fd_np`.
+pub(crate) fn clear_fd_extended_acl(fd: libc::c_int) -> Result<(), String> {
+    let empty = unsafe { acl_init(0) };
+    if empty.is_null() {
+        return Err("acl_init(0) failed".to_string());
+    }
+    let rc = unsafe { acl_set_fd_np(fd, empty, ACL_TYPE_EXTENDED) };
+    let err = io::Error::last_os_error();
+    unsafe {
+        acl_free(empty);
+    }
+    if rc == 0 || err.raw_os_error() == Some(libc::ENOTSUP) {
+        Ok(())
+    } else {
+        Err(format!("Failed clearing extended ACL on descriptor: {err}"))
     }
 }
 
@@ -361,25 +376,26 @@ pub fn private_cache_dir() -> Result<PathBuf, String> {
     };
 
     ensure_private_dir(&base)?;
-    strip_extended_acl(&base);
     Ok(base)
 }
 
 pub fn ensure_private_dir(dir: &Path) -> Result<(), String> {
-    if !dir.is_absolute() {
-        return Err("Private directory path must be absolute".to_string());
+    if !dir.is_absolute()
+        || dir
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Err("Private directory path must be absolute and dot-free".to_string());
     }
+    let euid = unsafe { libc::geteuid() };
+    verify_pre_canonical_target_parent(dir.parent().unwrap_or(Path::new("/")), euid)?;
     if let Some(parent) = dir.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed creating parent directory: {e}"))?;
         }
-        if let Ok(pm) = fs::symlink_metadata(parent) {
-            if pm.file_type().is_symlink() && pm.uid() != 0 {
-                return Err("Refusing to use symlinked parent directory".to_string());
-            }
-        }
     }
+    verify_pre_canonical_target_parent(dir.parent().unwrap_or(Path::new("/")), euid)?;
 
     match fs::symlink_metadata(dir) {
         Ok(sym_meta) => {
@@ -398,19 +414,22 @@ pub fn ensure_private_dir(dir: &Path) -> Result<(), String> {
 
     let verified = fs::symlink_metadata(dir)
         .map_err(|e| format!("Failed verifying private directory: {e}"))?;
-    let euid = unsafe { libc::geteuid() };
     if verified.file_type().is_symlink() || !verified.is_dir() || verified.uid() != euid {
         return Err("Private directory must be owned by the current user".to_string());
     }
 
     let dir_fd = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(dir)
         .map_err(|e| format!("Failed opening private directory without following symlinks: {e}"))?;
     dir_fd
         .set_permissions(fs::Permissions::from_mode(0o700))
         .map_err(|e| format!("Failed setting 0700 permissions on private directory: {e}"))?;
+    clear_fd_extended_acl(dir_fd.as_raw_fd())?;
+    if !has_only_safe_acls(dir, euid) {
+        return Err("Private directory still carries unsafe extended ACL".to_string());
+    }
     let _ = ptr::null::<u8>();
     Ok(())
 }
@@ -447,9 +466,10 @@ pub fn atomic_write_private(target: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .mode(0o600)
         .open(&tmp)?;
+    let _ = clear_fd_extended_acl(file.as_raw_fd());
     if let Err(e) = file.write_all(bytes).and_then(|()| file.sync_all()) {
         let _ = fs::remove_file(&tmp);
         return Err(e);
@@ -630,6 +650,10 @@ mod tests {
         ));
         assert!(!is_acl_text_allowlisted(
             "!#acl 1\ngroup:ABCDEFAB-CDEF-ABCD-EFAB-CDEF00000014:staff:20:allow:write,add_file\n",
+            501
+        ));
+        assert!(!is_acl_text_allowlisted(
+            "!#acl 1\ngroup:ABCDEFAB-CDEF-ABCD-EFAB-CDEF0000000C:everyone:12:allow:file_inherit:read\n",
             501
         ));
 

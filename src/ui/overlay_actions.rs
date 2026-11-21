@@ -122,6 +122,18 @@ pub fn build_toolbar_actions(
                                 d.height
                             )));
                         }
+                        if st.screen_display_id != st.overlay_display_id && !st.demo_backdrop {
+                            let target_did = st.screen_display_id;
+                            if let Some(m) = MainThreadMarker::new() {
+                                relocate_overlay_to_display(
+                                    m,
+                                    target_did,
+                                    &mut st,
+                                    &cwin_mode,
+                                    &twin_pick_mode,
+                                );
+                            }
+                        }
                         tp_mode.selectItemAtIndex(st.selected_display_idx as isize);
                         st.selection = st.bounds;
                     }
@@ -271,6 +283,14 @@ fn relocate_overlay_to_display(
         if extract_nsscreen_display_id(&s) == Some(target_display_id) {
             let sf = s.frame();
             st.overlay_display_id = target_display_id;
+            st.screen_display_id = target_display_id;
+            if let Some(pos) = st
+                .displays
+                .iter()
+                .position(|d| d.display_id == target_display_id)
+            {
+                st.selected_display_idx = pos;
+            }
             st.scale_factor = s.backingScaleFactor();
             st.bounds = Rect::new(0.0, 0.0, sf.size.width, sf.size.height);
             st.selection = st.bounds;
