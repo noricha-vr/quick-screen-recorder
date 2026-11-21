@@ -61,7 +61,7 @@ pub fn valid_home_dir() -> Option<PathBuf> {
 }
 
 /// Returns `~/Desktop` when available as a verified writable directory owned by the current user,
-/// falling back to `HOME` or the private `0700` cache directory.
+/// falling back to `HOME` or a persistent `0700` exports folder (never the auto-pruned cache dir).
 pub fn default_desktop_export_dir() -> PathBuf {
     if let Some(home) = valid_home_dir() {
         let desktop = home.join("Desktop");
@@ -71,8 +71,21 @@ pub fn default_desktop_export_dir() -> PathBuf {
         if is_usable_export_dir(&home) {
             return home;
         }
+        let app_exports = home
+            .join("Library")
+            .join("Application Support")
+            .join(APP_SUPPORT_DIR_NAME)
+            .join("Exports");
+        if ensure_private_dir(&app_exports).is_ok() && is_usable_export_dir(&app_exports) {
+            return app_exports;
+        }
     }
-    private_cache_dir().unwrap_or_else(|_| PathBuf::from("/private/tmp"))
+    let fallback = PathBuf::from(format!(
+        "/private/tmp/{APP_SUPPORT_DIR_NAME}-Exports-{}",
+        unsafe { libc::geteuid() }
+    ));
+    let _ = ensure_private_dir(&fallback);
+    fallback
 }
 
 /// Verifies `dir` is an absolute, dot-free, writable, non-symlink directory with safe group/ACL

@@ -287,29 +287,52 @@ fn spawn_disclaimed_with_timeout(
     let root_c = CString::new("/").unwrap();
     let devnull_c = CString::new("/dev/null").unwrap();
 
-    unsafe {
-        libc::posix_spawn_file_actions_init(&mut file_actions);
-        posix_spawn_file_actions_addchdir_np(&mut file_actions, root_c.as_ptr());
-        libc::posix_spawn_file_actions_addopen(
-            &mut file_actions,
-            libc::STDIN_FILENO,
-            devnull_c.as_ptr(),
-            libc::O_RDONLY,
-            0,
-        );
-        libc::posix_spawn_file_actions_adddup2(
-            &mut file_actions,
-            out_write_fd,
-            libc::STDOUT_FILENO,
-        );
-        libc::posix_spawn_file_actions_adddup2(&mut file_actions, write_fd, libc::STDERR_FILENO);
-
-        libc::posix_spawnattr_init(&mut attrs);
+    let (fa_inited, attr_inited, setup_ok) = unsafe {
+        let fa_ok = libc::posix_spawn_file_actions_init(&mut file_actions) == 0;
+        let attr_ok = libc::posix_spawnattr_init(&mut attrs) == 0;
         let flags =
             (libc::POSIX_SPAWN_SETPGROUP as libc::c_short) | DARWIN_POSIX_SPAWN_CLOEXEC_DEFAULT;
-        libc::posix_spawnattr_setflags(&mut attrs, flags);
-        libc::posix_spawnattr_setpgroup(&mut attrs, 0);
-        let _ = responsibility_spawnattrs_setdisclaim(&mut attrs, 1);
+
+        let ok = fa_ok
+            && attr_ok
+            && posix_spawn_file_actions_addchdir_np(&mut file_actions, root_c.as_ptr()) == 0
+            && libc::posix_spawn_file_actions_addopen(
+                &mut file_actions,
+                libc::STDIN_FILENO,
+                devnull_c.as_ptr(),
+                libc::O_RDONLY,
+                0,
+            ) == 0
+            && libc::posix_spawn_file_actions_adddup2(
+                &mut file_actions,
+                out_write_fd,
+                libc::STDOUT_FILENO,
+            ) == 0
+            && libc::posix_spawn_file_actions_adddup2(
+                &mut file_actions,
+                write_fd,
+                libc::STDERR_FILENO,
+            ) == 0
+            && libc::posix_spawnattr_setflags(&mut attrs, flags) == 0
+            && libc::posix_spawnattr_setpgroup(&mut attrs, 0) == 0
+            && responsibility_spawnattrs_setdisclaim(&mut attrs, 1) == 0;
+        (fa_ok, attr_ok, ok)
+    };
+
+    if !setup_ok {
+        unsafe {
+            if fa_inited {
+                libc::posix_spawn_file_actions_destroy(&mut file_actions);
+            }
+            if attr_inited {
+                libc::posix_spawnattr_destroy(&mut attrs);
+            }
+            libc::close(out_read_fd);
+            libc::close(out_write_fd);
+            libc::close(read_fd);
+            libc::close(write_fd);
+        }
+        return Err("Failed configuring sandboxed posix_spawn attributes for ffmpeg".to_string());
     }
 
     let mut child_pid: libc::pid_t = 0;

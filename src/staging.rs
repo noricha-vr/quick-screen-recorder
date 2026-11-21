@@ -356,6 +356,16 @@ fn stage_once_on_dest_volume(staged: &Path, dest_dir_fd: libc::c_int) -> Result<
         }
         return Err(e);
     }
+    if unsafe { libc::fchmod(fd, 0o600 as libc::mode_t) } != 0 {
+        let err = io::Error::last_os_error();
+        unsafe {
+            libc::close(fd);
+            libc::unlinkat(dest_dir_fd, tmp_c.as_ptr(), 0);
+        }
+        return Err(format!(
+            "Failed setting 0600 permissions on cross-volume staging file: {err}"
+        ));
+    }
     let mut out_file = unsafe { File::from_owned_fd_compat(fd) };
     if let Err(e) = io::copy(&mut src, &mut out_file).and_then(|_| out_file.sync_all()) {
         drop(out_file);
@@ -434,6 +444,16 @@ fn copy_into_pinned_dir_overwrite(
             libc::unlinkat(dest_dir_fd, tmp_c.as_ptr(), 0);
         }
         return Err(e);
+    }
+    if unsafe { libc::fchmod(fd, mode as libc::mode_t) } != 0 {
+        let err = io::Error::last_os_error();
+        unsafe {
+            libc::close(fd);
+            libc::unlinkat(dest_dir_fd, tmp_c.as_ptr(), 0);
+        }
+        return Err(format!(
+            "Failed preserving permissions on cross-volume file: {err}"
+        ));
     }
     let mut out_file = unsafe { File::from_owned_fd_compat(fd) };
     if let Err(e) = io::copy(&mut src, &mut out_file).and_then(|_| out_file.sync_all()) {
