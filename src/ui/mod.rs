@@ -4,8 +4,11 @@ pub mod editor_worker;
 pub mod hotkey;
 pub mod overlay;
 pub mod overlay_actions;
+pub mod overlay_canvas;
 pub mod overlay_toolbar;
 pub mod status_bar;
+pub mod trim_math;
+pub mod trim_view;
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -177,6 +180,8 @@ fn show_selector(mtm: MainThreadMarker, runtime: &Rc<RefCell<AppRuntime>>) {
             let app = NSApplication::sharedApplication(mtm);
             #[allow(deprecated)]
             app.activateIgnoringOtherApps(true);
+            ov.canvas_window.makeKeyAndOrderFront(None);
+            ov.toolbar_window.orderFrontRegardless();
             runtime.borrow_mut().overlay = Some(ov);
         }
         Err(err) => show_error_alert(mtm, "Overlay Error", &err),
@@ -265,7 +270,18 @@ fn open_editor_for_file(
     video_path: &std::path::Path,
 ) -> Result<(), String> {
     let prefs = runtime.borrow().prefs.clone();
-    let editor = EditorWindow::open(mtm, video_path, &prefs)?;
+    let rt_dir = Rc::clone(runtime);
+    let editor = EditorWindow::open(
+        mtm,
+        video_path,
+        &prefs,
+        false,
+        Rc::new(move |new_dir| {
+            let mut rt = rt_dir.borrow_mut();
+            rt.prefs.export_dir = Some(new_dir);
+            let _ = rt.prefs.save();
+        }),
+    )?;
     let app = NSApplication::sharedApplication(mtm);
     #[allow(deprecated)]
     app.activateIgnoringOtherApps(true);
@@ -343,7 +359,7 @@ fn run_demo_flow(
 ) -> Result<(), String> {
     match demo {
         DemoMode::Overlay { screenshot_out } => {
-            let prefs = runtime.borrow().prefs.clone();
+            let prefs = Preferences::default();
             let displays = vec![DisplayInfo {
                 display_id: 1,
                 width: 1920,
@@ -380,8 +396,8 @@ fn run_demo_flow(
             input,
             screenshot_out,
         } => {
-            let prefs = runtime.borrow().prefs.clone();
-            let ed = EditorWindow::open(mtm, &input, &prefs)?;
+            let prefs = Preferences::default();
+            let ed = EditorWindow::open(mtm, &input, &prefs, true, Rc::new(|_| {}))?;
             if let Some(shot_path) = screenshot_out {
                 let win_clone = ed.window.clone();
                 let block = RcBlock::new(move |t: NonNull<NSTimer>| {

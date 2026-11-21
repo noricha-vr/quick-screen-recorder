@@ -23,36 +23,31 @@ impl Rect {
     pub fn right(&self) -> f64 {
         self.x + self.width
     }
-
     pub fn top_y_up(&self) -> f64 {
         self.y + self.height
     }
-
     pub fn contains(&self, px: f64, py: f64) -> bool {
         px >= self.x && px <= self.x + self.width && py >= self.y && py <= self.y + self.height
     }
-
-    /// Converts a rectangle in AppKit screen-local coordinates (origin at bottom-left, Y-up)
-    /// into ScreenCaptureKit / CoreGraphics display-local coordinates (origin at top-left, Y-down).
+    /// Converts AppKit screen-local coordinates (bottom-left, Y-up) into top-left (Y-down).
     pub fn appkit_to_top_left(&self, display_height: f64) -> Self {
-        let flipped_y = (display_height - (self.y + self.height)).max(0.0);
-        Self {
-            x: self.x.max(0.0),
-            y: flipped_y,
-            width: self.width.max(MIN_CAPTURE_DIMENSION),
-            height: self.height.max(MIN_CAPTURE_DIMENSION),
-        }
+        let y = (display_height - (self.y + self.height)).max(0.0);
+        Self::new(
+            self.x.max(0.0),
+            y,
+            self.width.max(MIN_CAPTURE_DIMENSION),
+            self.height.max(MIN_CAPTURE_DIMENSION),
+        )
     }
-
-    /// Converts a top-left (CoreGraphics) display-local rectangle into AppKit bottom-left coordinates.
+    /// Converts top-left (CoreGraphics) display-local coordinates into AppKit bottom-left coordinates.
     pub fn top_left_to_appkit(&self, display_height: f64) -> Self {
-        let appkit_y = (display_height - (self.y + self.height)).max(0.0);
-        Self {
-            x: self.x.max(0.0),
-            y: appkit_y,
-            width: self.width.max(MIN_CAPTURE_DIMENSION),
-            height: self.height.max(MIN_CAPTURE_DIMENSION),
-        }
+        let y = (display_height - (self.y + self.height)).max(0.0);
+        Self::new(
+            self.x.max(0.0),
+            y,
+            self.width.max(MIN_CAPTURE_DIMENSION),
+            self.height.max(MIN_CAPTURE_DIMENSION),
+        )
     }
 
     /// Clamps rectangle inside `bounds` and aligns dimensions so `dim * scale_factor` is an even pixel integer.
@@ -250,13 +245,19 @@ pub fn apply_drag(
 
     match mode {
         DragMode::Create => drag_rect_from_points(start_x, start_y, cur_x, cur_y, aspect, bounds),
-        DragMode::Move => Rect::new(
-            initial.x + dx,
-            initial.y + dy,
-            initial.width,
-            initial.height,
-        )
-        .clamp_and_align_even(bounds),
+        DragMode::Move => {
+            let max_w = bounds.width.max(MIN_CAPTURE_DIMENSION);
+            let max_h = bounds.height.max(MIN_CAPTURE_DIMENSION);
+            let w = initial.width.clamp(MIN_CAPTURE_DIMENSION, max_w);
+            let h = initial.height.clamp(MIN_CAPTURE_DIMENSION, max_h);
+            let x = (initial.x + dx)
+                .clamp(bounds.x, (bounds.right() - w).max(bounds.x))
+                .round();
+            let y = (initial.y + dy)
+                .clamp(bounds.y, (bounds.top_y_up() - h).max(bounds.y))
+                .round();
+            Rect::new(x, y, w, h)
+        }
         DragMode::ResizeBottomRight => {
             drag_rect_from_points(initial.x, initial.top_y_up(), cur_x, cur_y, aspect, bounds)
         }
@@ -331,6 +332,60 @@ pub fn scaled_even_dimensions(src_w: u32, src_h: u32, max_width: Option<u32>) ->
     ((w & !1).max(2), (h & !1).max(2))
 }
 
+/// Hit-tests ScreenCaptureKit windows (ordered front-to-back in CoreGraphics global top-left coordinates)
+/// from an AppKit overlay-local point `(local_x, local_y)` (origin at bottom-left, Y-up).
+/// Selects the frontmost window at that point, or cycles through overlapping windows if already selected.
+pub fn hit_test_window_frames(
+    window_frames: &[Rect],
+    display_origin: (f64, f64),
+    overlay_height: f64,
+    local_x: f64,
+    local_y: f64,
+    current_selected: Option<usize>,
+) -> Option<usize> {
+    let cg_x = display_origin.0 + local_x;
+    let cg_y = display_origin.1 + (overlay_height - local_y);
+    let hits: Vec<usize> = window_frames
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| f.contains(cg_x, cg_y).then_some(i))
+        .collect();
+    let first = *hits.first()?;
+    if let Some(cur) = current_selected {
+        if let Some(pos) = hits.iter().position(|&idx| idx == cur) {
+            return Some(hits[(pos + 1) % hits.len()]);
+        }
+    }
+    Some(first)
+}
+
+/// Projects a ScreenCaptureKit global top-left window frame onto the active display's AppKit overlay bounds,
+/// clipping any off-screen overhang. Returns `None` if the window does not intersect this display.
+pub fn window_frame_to_overlay_rect(
+    win_frame: Rect,
+    display_origin: (f64, f64),
+    overlay_bounds: Rect,
+) -> Option<Rect> {
+    let lx0 = win_frame.x - display_origin.0;
+    let ly0 = win_frame.y - display_origin.1;
+    let lx1 = lx0 + win_frame.width;
+    let ly1 = ly0 + win_frame.height;
+
+    let cx0 = lx0.clamp(0.0, overlay_bounds.width);
+    let cy0 = ly0.clamp(0.0, overlay_bounds.height);
+    let cx1 = lx1.clamp(0.0, overlay_bounds.width);
+    let cy1 = ly1.clamp(0.0, overlay_bounds.height);
+
+    let vis_w = cx1 - cx0;
+    let vis_h = cy1 - cy0;
+    if vis_w < 1.0 || vis_h < 1.0 {
+        return None;
+    }
+    let appkit_y =
+        (overlay_bounds.height - cy1).clamp(0.0, (overlay_bounds.height - vis_h).max(0.0));
+    Some(Rect::new(cx0, appkit_y, vis_w, vis_h))
+}
+
 fn round_down_even(v: f64) -> f64 {
     let n = v.floor() as i64;
     (n & !1).max(2) as f64
@@ -342,71 +397,5 @@ fn round_nearest_even(v: f64) -> f64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn coordinate_flip_round_trip() {
-        let screen_h = 1440.0;
-        let appkit = Rect::new(100.0, 240.0, 800.0, 600.0);
-        let cg = appkit.appkit_to_top_left(screen_h);
-        assert_eq!(cg, Rect::new(100.0, 600.0, 800.0, 600.0));
-        let back = cg.top_left_to_appkit(screen_h);
-        assert_eq!(back, appkit);
-    }
-
-    #[test]
-    fn clamp_and_even_alignment() {
-        let bounds = Rect::new(0.0, 0.0, 1920.0, 1080.0);
-        let odd = Rect::new(1800.0, -25.0, 301.0, 205.0).clamp_and_align_even(bounds);
-        assert_eq!(odd.width as u32 % 2, 0);
-        assert_eq!(odd.height as u32 % 2, 0);
-        assert!(odd.right() <= bounds.right());
-        assert_eq!(odd.y, 0.0);
-    }
-
-    #[test]
-    fn aspect_ratio_3x2_lock() {
-        let bounds = Rect::new(0.0, 0.0, 2560.0, 1440.0);
-        let r = drag_rect_from_points(100.0, 100.0, 700.0, 350.0, AspectRatio::R3x2, bounds);
-        let actual_ratio = r.width / r.height;
-        assert!(
-            (actual_ratio - 1.5).abs() < 0.02,
-            "ratio was {actual_ratio}"
-        );
-    }
-
-    #[test]
-    fn hit_test_handles_and_move() {
-        let rect = Rect::new(100.0, 100.0, 400.0, 300.0);
-        assert_eq!(
-            hit_test_selection(rect, 100.0, 400.0, 8.0),
-            Some(DragMode::ResizeTopLeft)
-        );
-        assert_eq!(
-            hit_test_selection(rect, 500.0, 100.0, 8.0),
-            Some(DragMode::ResizeBottomRight)
-        );
-        assert_eq!(
-            hit_test_selection(rect, 250.0, 250.0, 8.0),
-            Some(DragMode::Move)
-        );
-        assert_eq!(hit_test_selection(rect, 20.0, 20.0, 8.0), None);
-    }
-
-    #[test]
-    fn scaled_dimensions_keep_even_aspect() {
-        assert_eq!(scaled_even_dimensions(2560, 1440, Some(1280)), (1280, 720));
-        assert_eq!(scaled_even_dimensions(801, 601, None), (800, 600));
-        assert_eq!(scaled_even_dimensions(640, 480, Some(1280)), (640, 480));
-    }
-
-    #[test]
-    fn retina_2x_pixel_alignment_preserves_800x450() {
-        let bounds = Rect::new(0.0, 0.0, 1440.0, 900.0);
-        let r = Rect::new(100.0, 100.0, 800.0 / 2.0, 450.0 / 2.0)
-            .clamp_and_align_for_scale(bounds, 2.0);
-        assert_eq!((r.width * 2.0).round() as u32, 800);
-        assert_eq!((r.height * 2.0).round() as u32, 450);
-    }
-}
+#[path = "geometry_tests.rs"]
+mod tests;

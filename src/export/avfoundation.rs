@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::ptr;
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 use block2::RcBlock;
 use objc2::rc::Retained;
@@ -14,17 +14,15 @@ use objc2_av_foundation::{
     AVMutableVideoCompositionInstruction, AVMutableVideoCompositionLayerInstruction, AVURLAsset,
     AVURLAssetReferenceRestrictionsKey, AVVideoCompositionInstructionProtocol,
 };
-use objc2_core_foundation::{CGAffineTransform, CGPoint, CGRect, CGSize};
-use objc2_core_graphics::{
-    CGBitmapContextCreate, CGBitmapContextGetData, CGColorSpace, CGContext, CGImage,
-    CGImageAlphaInfo,
-};
+use objc2_core_foundation::{CGAffineTransform, CGSize};
 use objc2_core_media::{CMFormatDescription, CMTime, CMTimeFlags, CMTimeRange};
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString, NSURL};
 
 use crate::capture::RecordingCodec;
+use crate::export::av_decode::cgimage_to_rgba_sized;
+pub use crate::export::av_decode::{RgbaFrame, extract_rgba_frame, stream_rgba_sequence};
 use crate::export::av_writer::stream_rgba_frames_to_mp4;
-use crate::export::{ExportFormat, ExportRequest};
+use crate::export::{ExportFormat, ExportRequest, SharedExportProgress, set_progress_permille};
 use crate::geometry::scaled_even_dimensions;
 
 pub const MAX_ANIMATED_FRAMES: usize = 1800;
@@ -53,13 +51,6 @@ impl VideoMetadata {
     pub fn is_hevc(&self) -> bool {
         self.codec_fourcc == FOURCC_HVC1 || self.codec_fourcc == FOURCC_HEV1
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct RgbaFrame {
-    pub width: u32,
-    pub height: u32,
-    pub pixels: Vec<u8>,
 }
 
 /// Opens a local media file with `AVAssetReferenceRestrictions::ForbidAll` so container reference
@@ -145,10 +136,13 @@ pub fn probe_video_metadata(path: &Path) -> Result<VideoMetadata, String> {
     })
 }
 
-pub fn export_mp4_or_hevc(req: &ExportRequest, meta: &VideoMetadata) -> Result<(), String> {
+pub fn export_mp4_or_hevc(
+    req: &ExportRequest,
+    meta: &VideoMetadata,
+    progress: Option<&SharedExportProgress>,
+) -> Result<(), String> {
     let start = req.start_sec.unwrap_or(0.0);
     let end = req.end_sec.unwrap_or(meta.duration_sec);
-    // Preserve full source resolution (including 4K+) when `max_width` is None
     let (target_w, target_h) = scaled_even_dimensions(meta.width, meta.height, req.max_width);
     let clamped_fps = req.fps.clamp(1, 120);
 
@@ -161,17 +155,26 @@ pub fn export_mp4_or_hevc(req: &ExportRequest, meta: &VideoMetadata) -> Result<(
     let fps_matches = (f64::from(clamped_fps) - f64::from(meta.nominal_fps)).abs() <= 1.5;
 
     if codec_matches && size_matches && fps_matches && !meta.has_extra_tracks {
-        return run_export_session(req, start, end, None, true);
+        return run_export_session(req, start, end, None, true, progress);
     }
 
-    // Stream frame-by-frame when there is no audio track so memory stays O(1 frame) for any duration/resolution
     if !meta.has_audio {
-        return stream_video_only_transcode(req, meta, start, end, target_w, target_h, clamped_fps);
+        return stream_video_only_transcode(
+            req,
+            meta,
+            start,
+            end,
+            target_w,
+            target_h,
+            clamped_fps,
+            progress,
+        );
     }
 
-    run_export_session(req, start, end, Some((target_w, target_h)), false)
+    run_export_session(req, start, end, Some((target_w, target_h)), false, progress)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stream_video_only_transcode(
     req: &ExportRequest,
     meta: &VideoMetadata,
@@ -180,6 +183,7 @@ fn stream_video_only_transcode(
     target_w: u32,
     target_h: u32,
     fps: u32,
+    progress: Option<&SharedExportProgress>,
 ) -> Result<(), String> {
     let frame_step = 1.0 / f64::from(fps);
     let duration = (end_sec - start_sec).max(frame_step);
@@ -204,7 +208,7 @@ fn stream_video_only_transcode(
     };
     let mut last_good: Option<RgbaFrame> = None;
 
-    stream_rgba_frames_to_mp4(
+    let res = stream_rgba_frames_to_mp4(
         target_w,
         target_h,
         total_frames,
@@ -217,21 +221,30 @@ fn stream_video_only_transcode(
             let cg_res = unsafe {
                 generator.copyCGImageAtTime_actualTime_error(secs_to_cmtime(t), ptr::null_mut())
             };
-            match cg_res {
+            let decoded = match cg_res {
                 Ok(cg_img) => {
                     let frame =
                         cgimage_to_rgba_sized(&cg_img, target_w as usize, target_h as usize)?;
                     last_good = Some(frame.clone());
-                    Ok(frame)
+                    frame
                 }
-                Err(_) if last_good.is_some() => Ok(last_good.clone().unwrap()),
-                Err(e) => Err(format!(
-                    "Failed decoding video frame {idx}: {}",
-                    e.localizedDescription()
-                )),
-            }
+                Err(_) if last_good.is_some() => last_good.clone().unwrap(),
+                Err(e) => {
+                    return Err(format!(
+                        "Failed decoding video frame {idx}: {}",
+                        e.localizedDescription()
+                    ));
+                }
+            };
+            let p = 50 + (((idx + 1) * 910) / total_frames.max(1)) as u32;
+            set_progress_permille(progress, p);
+            Ok(decoded)
         },
-    )
+    );
+    if res.is_ok() {
+        set_progress_permille(progress, 975);
+    }
+    res
 }
 
 fn run_export_session(
@@ -240,6 +253,7 @@ fn run_export_session(
     end: f64,
     resize_to: Option<(u32, u32)>,
     passthrough: bool,
+    progress: Option<&SharedExportProgress>,
 ) -> Result<(), String> {
     let asset = open_restricted_asset(&req.input)?;
     let out_url = file_url(&req.output)?;
@@ -299,8 +313,21 @@ fn run_export_session(
         session.exportAsynchronouslyWithCompletionHandler(&block);
     }
 
-    rx.recv_timeout(Duration::from_secs(120))
-        .map_err(|_| "Timed out waiting for hardware video export".to_string())?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        match rx.recv_timeout(Duration::from_millis(35)) {
+            Ok(()) => break,
+            Err(RecvTimeoutError::Timeout) => {
+                if Instant::now() >= deadline {
+                    return Err("Timed out waiting for hardware video export".to_string());
+                }
+                let frac = unsafe { session.progress() }.clamp(0.0, 1.0);
+                set_progress_permille(progress, 50 + (frac * 910.0) as u32);
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    set_progress_permille(progress, 975);
 
     let status = unsafe { session.status() };
     if status == AVAssetExportSessionStatus::Completed {
@@ -334,7 +361,6 @@ fn build_video_composition(
             return None;
         }
 
-        // Normalize `preferredTransform` (rotation/mirroring) so top-left sits at (0,0), then scale
         let pref = track.preferredTransform();
         let corners = [
             (0.0, 0.0),
@@ -404,150 +430,13 @@ fn build_video_composition(
     }
 }
 
-pub fn extract_rgba_frame(
-    path: &Path,
-    time_sec: f64,
-    max_width: Option<u32>,
-) -> Result<RgbaFrame, String> {
-    let meta = probe_video_metadata(path)?;
-    let capped_max = Some(max_width.unwrap_or(3840).min(3840));
-    let (target_w, target_h) = scaled_even_dimensions(meta.width, meta.height, capped_max);
-    let asset = open_restricted_asset(path)?;
-    let generator = unsafe { AVAssetImageGenerator::assetImageGeneratorWithAsset(&asset) };
-
-    let zero_tol = secs_to_cmtime(0.01);
-    unsafe {
-        generator.setAppliesPreferredTrackTransform(true);
-        generator.setMaximumSize(CGSize::new(
-            f64::from(target_w),
-            f64::from(meta.height.max(target_h)),
-        ));
-        generator.setRequestedTimeToleranceBefore(zero_tol);
-        generator.setRequestedTimeToleranceAfter(zero_tol);
-    }
-
-    let req_time = secs_to_cmtime(time_sec.clamp(0.0, meta.duration_sec));
-    #[allow(deprecated)]
-    let cg_img = unsafe {
-        generator
-            .copyCGImageAtTime_actualTime_error(req_time, ptr::null_mut())
-            .map_err(|e| format!("Frame decode error: {}", e.localizedDescription()))?
-    };
-
-    cgimage_to_rgba_sized(&cg_img, target_w as usize, target_h as usize)
-}
-
-pub fn stream_rgba_sequence<F>(
-    path: &Path,
-    start_sec: f64,
-    end_sec: f64,
-    fps: u32,
-    max_width: Option<u32>,
-    mut on_frame: F,
-) -> Result<(u32, u32, usize), String>
-where
-    F: FnMut(usize, usize, RgbaFrame) -> Result<(), String>,
-{
-    let meta = probe_video_metadata(path)?;
-    let capped_max = Some(max_width.unwrap_or(1920).min(1920));
-    let (target_w, target_h) = scaled_even_dimensions(meta.width, meta.height, capped_max);
-    let clamped_fps = fps.clamp(1, 60);
-    let frame_step = 1.0 / f64::from(clamped_fps);
-    let duration = (end_sec - start_sec).max(frame_step);
-    let requested_count = ((duration * f64::from(clamped_fps)).round() as usize).max(1);
-
-    if requested_count > MAX_ANIMATED_FRAMES {
-        return Err(format!(
-            "Clip has {requested_count} frames at {clamped_fps} fps (maximum is {MAX_ANIMATED_FRAMES} frames). Trim a shorter clip, lower FPS, or export as MP4/HEVC."
-        ));
-    }
-
-    let asset = open_restricted_asset(path)?;
-    let generator = unsafe { AVAssetImageGenerator::assetImageGeneratorWithAsset(&asset) };
-
-    let tol = secs_to_cmtime((frame_step * 0.45).max(0.005));
-    unsafe {
-        generator.setAppliesPreferredTrackTransform(true);
-        generator.setMaximumSize(CGSize::new(
-            f64::from(target_w),
-            f64::from(meta.height.max(target_h)),
-        ));
-        generator.setRequestedTimeToleranceBefore(tol);
-        generator.setRequestedTimeToleranceAfter(tol);
-    }
-
-    let mut last_good: Option<RgbaFrame> = None;
-    for idx in 0..requested_count {
-        let t = (start_sec + (idx as f64) * frame_step).min(meta.duration_sec);
-        let req_time = secs_to_cmtime(t);
-        #[allow(deprecated)]
-        let cg_res =
-            unsafe { generator.copyCGImageAtTime_actualTime_error(req_time, ptr::null_mut()) };
-        let frame = match cg_res {
-            Ok(cg_img) => {
-                let decoded = cgimage_to_rgba_sized(&cg_img, target_w as usize, target_h as usize)?;
-                last_good = Some(decoded.clone());
-                decoded
-            }
-            Err(_) if last_good.is_some() => last_good.clone().unwrap(),
-            Err(e) => {
-                return Err(format!(
-                    "Failed to decode initial video frame: {}",
-                    e.localizedDescription()
-                ));
-            }
-        };
-        on_frame(idx, requested_count, frame)?;
-    }
-    Ok((target_w, target_h, requested_count))
-}
-
-fn cgimage_to_rgba_sized(image: &CGImage, w: usize, h: usize) -> Result<RgbaFrame, String> {
-    if w == 0 || h == 0 || CGImage::width(Some(image)) == 0 || CGImage::height(Some(image)) == 0 {
-        return Err("Decoded CGImage has zero dimensions".to_string());
-    }
-
-    let color_space = CGColorSpace::new_device_rgb().ok_or("Failed to allocate RGB color space")?;
-    let bytes_per_row = w * 4;
-    let bitmap_info = CGImageAlphaInfo::PremultipliedLast.0;
-
-    let ctx = unsafe {
-        CGBitmapContextCreate(
-            ptr::null_mut(),
-            w,
-            h,
-            8,
-            bytes_per_row,
-            Some(&color_space),
-            bitmap_info,
-        )
-    }
-    .ok_or("Failed to create CGBitmapContext")?;
-
-    let rect = CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(w as f64, h as f64));
-    CGContext::draw_image(Some(&ctx), rect, Some(image));
-
-    let data_ptr = CGBitmapContextGetData(Some(&ctx)) as *const u8;
-    if data_ptr.is_null() {
-        return Err("CGBitmapContext returned null pixel buffer".to_string());
-    }
-    let len = bytes_per_row * h;
-    let pixels = unsafe { std::slice::from_raw_parts(data_ptr, len).to_vec() };
-
-    Ok(RgbaFrame {
-        width: w as u32,
-        height: h as u32,
-        pixels,
-    })
-}
-
 fn file_url(path: &Path) -> Result<Retained<NSURL>, String> {
     let s = path.to_str().ok_or("File path is not valid UTF-8")?;
     let ns = NSString::from_str(s);
     Ok(NSURL::fileURLWithPath(&ns))
 }
 
-fn secs_to_cmtime(secs: f64) -> CMTime {
+pub(crate) fn secs_to_cmtime(secs: f64) -> CMTime {
     let timescale = 6000_i32;
     let value = (secs.max(0.0) * f64::from(timescale)).round() as i64;
     CMTime {

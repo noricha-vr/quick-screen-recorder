@@ -5,6 +5,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-21
+
+### Added
+
+- Click-to-select window picking with live hover preview and window title badge in **Window** capture mode (including click-cycling for overlapping windows).
+- Dual-bracket `IN` / `OUT` video trim timeline (`QSRTrimTimelineView`) with time-ruler ticks, dimmed cut zones, live frame playhead scrubbing, and `IN` / `Selected` / `OUT` duration readouts.
+- Pre-selected export destination folder workflow defaulting to `~/Desktop`, with a `Folder...` picker persisted in preferences and one-click collision-free `Save` (`Recording-YYYY-MM-DD-HHMMSS.<ext>`).
+- Real-time export progress bar and percentage readout across MP4, HEVC, GIF, APNG, WebM, and AV1 exports.
+
+### Fixed
+
+- Fixed interior click-through on macOS borderless transparent overlay windows so **Area** selections can be grabbed anywhere inside the selection box and dragged smoothly across the screen while preserving Retina pixel dimensions.
+- Filtered macOS system shell layers (`Dock`, `WindowManager`, `ControlCenter`, `NotificationCenter`) from window hit-testing and clipped off-screen window overhangs accurately.
+- Stripped ancillary PNG chunks (`iCCP`, `pHYs`, `cHRM`) when capturing window screenshots so display profile metadata is never embedded.
+
 ## [0.1.0] - 2026-11-21
 
 ### Added

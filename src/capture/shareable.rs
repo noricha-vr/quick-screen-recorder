@@ -3,7 +3,10 @@ use std::time::Duration;
 
 use block2::RcBlock;
 use objc2::rc::Retained;
-use objc2_foundation::NSError;
+use objc2::runtime::AnyObject;
+use objc2_core_foundation::CFRetained;
+use objc2_core_graphics::{CGWindowListCopyWindowInfo, CGWindowListOption};
+use objc2_foundation::{NSArray, NSDictionary, NSError, NSNumber, NSString};
 use objc2_screen_capture_kit::{SCDisplay, SCShareableContent, SCWindow};
 
 use crate::geometry::Rect;
@@ -113,6 +116,18 @@ pub fn query_shareable_content() -> Result<ShareableSnapshot, String> {
             if app.processID() == current_pid {
                 continue;
             }
+            let bundle_id = app.bundleIdentifier().to_string();
+            if matches!(
+                bundle_id.as_str(),
+                "com.apple.dock"
+                    | "com.apple.WindowManager"
+                    | "com.apple.controlcenter"
+                    | "com.apple.notificationcenterui"
+                    | "com.apple.systemuiserver"
+                    | "com.apple.wallpaper.agent"
+            ) {
+                continue;
+            }
             let app_name = app.applicationName().to_string();
             if app_name.trim().is_empty() {
                 continue;
@@ -127,9 +142,39 @@ pub fn query_shareable_content() -> Result<ShareableSnapshot, String> {
         }
     }
 
+    let z_order = query_window_z_order();
+    if !z_order.is_empty() {
+        windows.sort_by_key(|w| {
+            z_order
+                .iter()
+                .position(|&id| id == w.window_id)
+                .unwrap_or(usize::MAX)
+        });
+    }
+
     Ok(ShareableSnapshot {
         content,
         displays,
         windows,
     })
+}
+
+/// Queries CoreGraphics WindowServer for explicit front-to-back on-screen window Z-order.
+fn query_window_z_order() -> Vec<u32> {
+    let opts = CGWindowListOption::OptionOnScreenOnly | CGWindowListOption::ExcludeDesktopElements;
+    let Some(cf_arr) = CGWindowListCopyWindowInfo(opts, 0) else {
+        return Vec::new();
+    };
+    let ns_arr: &NSArray<NSDictionary<NSString, AnyObject>> =
+        unsafe { &*(CFRetained::as_ptr(&cf_arr).as_ptr() as *const _) };
+    let key = NSString::from_str("kCGWindowNumber");
+    let mut ids = Vec::with_capacity(ns_arr.count());
+    for i in 0..ns_arr.count() {
+        let dict = ns_arr.objectAtIndex(i);
+        if let Some(val) = dict.objectForKey(&key) {
+            let num: &NSNumber = unsafe { &*(Retained::as_ptr(&val) as *const NSNumber) };
+            ids.push(num.unsignedIntValue());
+        }
+    }
+    ids
 }

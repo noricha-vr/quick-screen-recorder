@@ -90,7 +90,114 @@ pub fn capture_window_view_to_png(window: &NSWindow, output_path: &Path) -> Resu
         unsafe { rep.representationUsingType_properties(NSBitmapImageFileType::PNG, &empty_props) }
             .ok_or("Failed to encode window bitmap as PNG")?;
 
-    let bytes = png_data.to_vec();
+    let bytes = strip_ancillary_png_chunks(&png_data.to_vec())?;
     crate::fs_safety::atomic_write_private(output_path, &bytes)
         .map_err(|e| format!("Failed writing PNG screenshot: {e}"))
+}
+
+/// Retains only `IHDR`, `IDAT`, and `IEND` PNG chunks so display ICC color profile names never leak.
+/// Validates PNG signature, `IHDR` first (`len == 13`), CRC-32 of every chunk, and `IEND` last (`len == 0`).
+pub fn strip_ancillary_png_chunks(png: &[u8]) -> Result<Vec<u8>, String> {
+    const SIG: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if png.len() < 33 || &png[..8] != SIG {
+        return Err("Invalid PNG signature".to_string());
+    }
+    let mut out = Vec::with_capacity(png.len());
+    out.extend_from_slice(SIG);
+    let mut pos = 8_usize;
+    let mut saw_ihdr = false;
+    let mut saw_idat = false;
+    let mut saw_iend = false;
+
+    while pos < png.len() {
+        if pos + 12 > png.len() {
+            return Err("Truncated PNG chunk header".to_string());
+        }
+        let len = u32::from_be_bytes([png[pos], png[pos + 1], png[pos + 2], png[pos + 3]]) as usize;
+        let chunk_end = pos
+            .checked_add(12)
+            .and_then(|n| n.checked_add(len))
+            .ok_or("PNG chunk length overflow")?;
+        if chunk_end > png.len() {
+            return Err("Truncated PNG chunk payload".to_string());
+        }
+        let tag = &png[pos + 4..pos + 8];
+        let crc_pos = pos + 8 + len;
+        let expected_crc = u32::from_be_bytes([
+            png[crc_pos],
+            png[crc_pos + 1],
+            png[crc_pos + 2],
+            png[crc_pos + 3],
+        ]);
+        if png_crc32(&png[pos + 4..crc_pos]) != expected_crc {
+            return Err("PNG chunk CRC mismatch".to_string());
+        }
+        if !saw_ihdr && tag != b"IHDR" {
+            return Err("First PNG chunk must be IHDR".to_string());
+        }
+        match tag {
+            b"IHDR" => {
+                if saw_ihdr || len != 13 {
+                    return Err("Invalid or duplicate PNG IHDR chunk".to_string());
+                }
+                let color_type = png[pos + 8 + 9];
+                if !matches!(color_type, 0 | 2 | 4 | 6) {
+                    return Err("Unsupported indexed or non-standard PNG color type".to_string());
+                }
+                saw_ihdr = true;
+                out.extend_from_slice(&png[pos..chunk_end]);
+            }
+            b"IDAT" => {
+                if len == 0 {
+                    return Err("Empty PNG IDAT chunk".to_string());
+                }
+                saw_idat = true;
+                out.extend_from_slice(&png[pos..chunk_end]);
+            }
+            b"IEND" => {
+                if len != 0 || chunk_end != png.len() {
+                    return Err("Invalid non-empty or non-terminal PNG IEND chunk".to_string());
+                }
+                saw_iend = true;
+                out.extend_from_slice(&png[pos..chunk_end]);
+                break;
+            }
+            _ => {}
+        }
+        pos = chunk_end;
+    }
+    if !saw_ihdr || !saw_idat || !saw_iend {
+        return Err("PNG missing required IHDR/IDAT/IEND chunks".to_string());
+    }
+    Ok(out)
+}
+
+fn png_crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFF_u32;
+    for &b in bytes {
+        crc ^= u32::from(b);
+        for _ in 0..8 {
+            crc = if (crc & 1) != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn png_chunk_stripper_fails_closed_on_corrupt_input() {
+        assert!(strip_ancillary_png_chunks(b"not-a-png").is_err());
+        let mut corrupt = b"\x89PNG\r\n\x1a\n".to_vec();
+        corrupt.extend_from_slice(&[0x7F, 0xFF, 0xFF, 0xFF]);
+        corrupt.extend_from_slice(b"iCCP");
+        corrupt.extend_from_slice(b"leak");
+        assert!(strip_ancillary_png_chunks(&corrupt).is_err());
+    }
 }

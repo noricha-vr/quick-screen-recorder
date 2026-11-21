@@ -6,17 +6,21 @@ use color_quant::NeuQuant;
 use gif::{DisposalMethod, Encoder as GifEncoder, Frame as GifFrame, Repeat};
 use rayon::prelude::*;
 
-use crate::export::ExportRequest;
 use crate::export::avfoundation::{
     MAX_ANIMATED_FRAMES, RgbaFrame, VideoMetadata, extract_rgba_frame, stream_rgba_sequence,
 };
+use crate::export::{ExportRequest, SharedExportProgress, set_progress_permille};
 use crate::geometry::scaled_even_dimensions;
 
 const TRANSPARENT_INDEX: u8 = 255;
 
 /// Streams GIF export with O(1 frame) memory: samples up to 12 keyframes for a global NeuQuant palette,
 /// then quantizes and delta-encodes one frame at a time while explicitly checking trailer flush + fsync.
-pub fn export_gif(req: &ExportRequest, meta: &VideoMetadata) -> Result<(), String> {
+pub fn export_gif(
+    req: &ExportRequest,
+    meta: &VideoMetadata,
+    progress: Option<&SharedExportProgress>,
+) -> Result<(), String> {
     let fps = req.fps.clamp(1, 50);
     let start = req.start_sec.unwrap_or(0.0);
     let end = req.end_sec.unwrap_or(meta.duration_sec);
@@ -44,6 +48,8 @@ pub fn export_gif(req: &ExportRequest, meta: &VideoMetadata) -> Result<(), Strin
         if let Ok(frame) = extract_rgba_frame(&req.input, t, capped_max) {
             append_subsampled_pixels(&frame, &mut sample_rgba, 5_500);
         }
+        let sp = 50 + (((s + 1) * 110) / sample_count.max(1)) as u32;
+        set_progress_permille(progress, sp);
     }
     if sample_rgba.is_empty() {
         sample_rgba.extend_from_slice(&[0, 0, 0, 255]);
@@ -51,6 +57,7 @@ pub fn export_gif(req: &ExportRequest, meta: &VideoMetadata) -> Result<(), Strin
 
     let nq = NeuQuant::new(10, 255, &sample_rgba);
     drop(sample_rgba);
+    set_progress_permille(progress, 180);
 
     let mut palette_rgb = vec![0_u8; 256 * 3];
     let cmap = nq.color_map_rgb();
@@ -75,7 +82,7 @@ pub fn export_gif(req: &ExportRequest, meta: &VideoMetadata) -> Result<(), Strin
         end,
         fps,
         capped_max,
-        |idx, _total, frame| {
+        |idx, total, frame| {
             let curr_indexed: Vec<u8> = frame
                 .pixels
                 .par_chunks_exact(4)
@@ -102,15 +109,22 @@ pub fn export_gif(req: &ExportRequest, meta: &VideoMetadata) -> Result<(), Strin
                 .write_frame(&gif_frame)
                 .map_err(|e| format!("Failed writing GIF frame {idx}: {e}"))?;
             prev_indexed = Some(curr_indexed);
+            let fp = 180 + (((idx + 1) * 780) / total.max(1)) as u32;
+            set_progress_permille(progress, fp);
             Ok(())
         },
     )?;
 
+    set_progress_permille(progress, 975);
     finalize_gif_encoder(encoder)
 }
 
 /// Streams APNG export one frame at a time with O(1 frame) memory and explicit flush + fsync verification.
-pub fn export_apng(req: &ExportRequest, meta: &VideoMetadata) -> Result<(), String> {
+pub fn export_apng(
+    req: &ExportRequest,
+    meta: &VideoMetadata,
+    progress: Option<&SharedExportProgress>,
+) -> Result<(), String> {
     let fps = req.fps.clamp(1, 60);
     let start = req.start_sec.unwrap_or(0.0);
     let end = req.end_sec.unwrap_or(meta.duration_sec);
@@ -149,13 +163,17 @@ pub fn export_apng(req: &ExportRequest, meta: &VideoMetadata) -> Result<(), Stri
         end,
         fps,
         capped_max,
-        |idx, _total, frame| {
+        |idx, total, frame| {
             png_writer
                 .write_image_data(&frame.pixels)
-                .map_err(|e| format!("Failed writing APNG frame {idx}: {e}"))
+                .map_err(|e| format!("Failed writing APNG frame {idx}: {e}"))?;
+            let fp = 50 + (((idx + 1) * 910) / total.max(1)) as u32;
+            set_progress_permille(progress, fp);
+            Ok(())
         },
     )?;
 
+    set_progress_permille(progress, 975);
     png_writer
         .finish()
         .map_err(|e| format!("Failed finalizing APNG stream: {e}"))?;

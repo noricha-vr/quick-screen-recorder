@@ -1,16 +1,9 @@
-use std::ffi::CString;
 use std::fs;
-use std::io::Read;
-use std::os::fd::FromRawFd;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::ptr;
-use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use crate::export::{ExportFormat, ExportRequest};
-use crate::fs_safety::sanitize_terminal_text;
+use crate::export::ffmpeg_spawn::{spawn_disclaimed_with_timeout, verify_trusted_binary};
+use crate::export::{ExportFormat, ExportRequest, SharedExportProgress};
 
 const ALLOWLISTED_FFMPEG_PATHS: [&str; 3] = [
     "/opt/homebrew/bin/ffmpeg",
@@ -19,17 +12,6 @@ const ALLOWLISTED_FFMPEG_PATHS: [&str; 3] = [
 ];
 
 const FFMPEG_TIMEOUT: Duration = Duration::from_secs(180);
-
-unsafe extern "C" {
-    fn responsibility_spawnattrs_setdisclaim(
-        attrs: *mut libc::posix_spawnattr_t,
-        disclaim: libc::c_int,
-    ) -> libc::c_int;
-    fn posix_spawn_file_actions_addchdir_np(
-        file_actions: *mut libc::posix_spawn_file_actions_t,
-        path: *const libc::c_char,
-    ) -> libc::c_int;
-}
 
 pub fn detect_ffmpeg_binary() -> Option<PathBuf> {
     let euid = unsafe { libc::geteuid() };
@@ -41,7 +23,11 @@ pub fn detect_ffmpeg_binary() -> Option<PathBuf> {
     None
 }
 
-pub fn export_with_ffmpeg(req: &ExportRequest) -> Result<(), String> {
+pub fn export_with_ffmpeg(
+    req: &ExportRequest,
+    clip_duration_sec: f64,
+    progress: Option<&SharedExportProgress>,
+) -> Result<(), String> {
     let ffmpeg = detect_ffmpeg_binary().ok_or_else(|| {
         format!(
             "{} export requires a trusted 'ffmpeg' binary at /opt/homebrew/bin/ffmpeg or /usr/local/bin/ffmpeg. MP4, HEVC, GIF, and APNG work natively without ffmpeg.",
@@ -75,6 +61,8 @@ pub fn export_with_ffmpeg(req: &ExportRequest) -> Result<(), String> {
                 "libopus",
             ],
             "webm",
+            clip_duration_sec,
+            progress,
         ),
         ExportFormat::Av1 => {
             let svt = run_ffmpeg_encode(
@@ -95,6 +83,8 @@ pub fn export_with_ffmpeg(req: &ExportRequest) -> Result<(), String> {
                     "aac",
                 ],
                 "mp4",
+                clip_duration_sec,
+                progress,
             );
             if svt.is_ok() {
                 return Ok(());
@@ -119,6 +109,8 @@ pub fn export_with_ffmpeg(req: &ExportRequest) -> Result<(), String> {
                     "aac",
                 ],
                 "mp4",
+                clip_duration_sec,
+                progress,
             )
         }
         other => Err(format!(
@@ -128,6 +120,7 @@ pub fn export_with_ffmpeg(req: &ExportRequest) -> Result<(), String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_ffmpeg_encode(
     ffmpeg_bin: &Path,
     input_file_url: &str,
@@ -135,12 +128,17 @@ fn run_ffmpeg_encode(
     req: &ExportRequest,
     codec_args: &[&str],
     container: &str,
+    clip_duration_sec: f64,
+    progress: Option<&SharedExportProgress>,
 ) -> Result<(), String> {
     let mut args: Vec<String> = vec![
         "-nostdin".into(),
         "-hide_banner".into(),
         "-loglevel".into(),
         "error".into(),
+        "-nostats".into(),
+        "-progress".into(),
+        "pipe:1".into(),
         "-y".into(),
         "-protocol_whitelist".into(),
         "file".into(),
@@ -201,138 +199,13 @@ fn run_ffmpeg_encode(
         output_file_url.into(),
     ]);
 
-    spawn_disclaimed_with_timeout(ffmpeg_bin, &args, FFMPEG_TIMEOUT)
-}
-
-/// Spawns `bin` with `responsibility_spawnattrs_setdisclaim` so the child process does NOT inherit
-/// our app's Screen Recording / Microphone TCC permissions, with a clean environment, `/` cwd, and hard timeout.
-fn spawn_disclaimed_with_timeout(
-    bin: &Path,
-    args: &[String],
-    timeout: Duration,
-) -> Result<(), String> {
-    let prog_c = CString::new(bin.as_os_str().as_bytes())
-        .map_err(|_| "Executable path contains NUL byte")?;
-    let mut argv_c: Vec<CString> = Vec::with_capacity(args.len() + 1);
-    argv_c.push(prog_c.clone());
-    for a in args {
-        argv_c.push(CString::new(a.as_bytes()).map_err(|_| "Argument contains NUL byte")?);
-    }
-    let mut argv_ptrs: Vec<*mut libc::c_char> =
-        argv_c.iter().map(|s| s.as_ptr().cast_mut()).collect();
-    argv_ptrs.push(ptr::null_mut());
-
-    let env_c = [
-        CString::new("PATH=/usr/bin:/bin").unwrap(),
-        CString::new("LANG=C").unwrap(),
-    ];
-    let mut env_ptrs: Vec<*mut libc::c_char> =
-        env_c.iter().map(|s| s.as_ptr().cast_mut()).collect();
-    env_ptrs.push(ptr::null_mut());
-
-    let mut pipe_fds = [0_i32; 2];
-    if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
-        return Err("Failed creating stderr pipe for ffmpeg".to_string());
-    }
-    let (read_fd, write_fd) = (pipe_fds[0], pipe_fds[1]);
-
-    let mut file_actions: libc::posix_spawn_file_actions_t = ptr::null_mut();
-    let mut attrs: libc::posix_spawnattr_t = ptr::null_mut();
-    let root_c = CString::new("/").unwrap();
-    let devnull_c = CString::new("/dev/null").unwrap();
-
-    unsafe {
-        libc::posix_spawn_file_actions_init(&mut file_actions);
-        posix_spawn_file_actions_addchdir_np(&mut file_actions, root_c.as_ptr());
-        libc::posix_spawn_file_actions_addopen(
-            &mut file_actions,
-            libc::STDIN_FILENO,
-            devnull_c.as_ptr(),
-            libc::O_RDONLY,
-            0,
-        );
-        libc::posix_spawn_file_actions_addopen(
-            &mut file_actions,
-            libc::STDOUT_FILENO,
-            devnull_c.as_ptr(),
-            libc::O_WRONLY,
-            0,
-        );
-        libc::posix_spawn_file_actions_adddup2(&mut file_actions, write_fd, libc::STDERR_FILENO);
-        libc::posix_spawn_file_actions_addclose(&mut file_actions, read_fd);
-        libc::posix_spawn_file_actions_addclose(&mut file_actions, write_fd);
-
-        libc::posix_spawnattr_init(&mut attrs);
-        let _ = responsibility_spawnattrs_setdisclaim(&mut attrs, 1);
-    }
-
-    let mut child_pid: libc::pid_t = 0;
-    let spawn_rc = unsafe {
-        libc::posix_spawn(
-            &mut child_pid,
-            prog_c.as_ptr(),
-            &file_actions,
-            &attrs,
-            argv_ptrs.as_ptr(),
-            env_ptrs.as_ptr(),
-        )
-    };
-
-    unsafe {
-        libc::posix_spawn_file_actions_destroy(&mut file_actions);
-        libc::posix_spawnattr_destroy(&mut attrs);
-        libc::close(write_fd);
-    }
-
-    if spawn_rc != 0 {
-        unsafe { libc::close(read_fd) };
-        return Err(format!("posix_spawn failed for ffmpeg: errno {spawn_rc}"));
-    }
-
-    let stderr_handle = thread::spawn(move || {
-        let mut reader = unsafe { fs::File::from_raw_fd(read_fd) };
-        let mut buf = Vec::new();
-        let _ = (&mut reader).take(8192).read_to_end(&mut buf);
-        buf
-    });
-
-    let start = Instant::now();
-    let mut status: libc::c_int = 0;
-    loop {
-        let w = unsafe { libc::waitpid(child_pid, &mut status, libc::WNOHANG) };
-        if w == child_pid {
-            break;
-        }
-        if w < 0 {
-            return Err("waitpid error waiting for ffmpeg".to_string());
-        }
-        if start.elapsed() > timeout {
-            unsafe {
-                libc::kill(child_pid, libc::SIGKILL);
-                libc::waitpid(child_pid, &mut status, 0);
-            }
-            return Err("Timed out running ffmpeg export".to_string());
-        }
-        thread::sleep(Duration::from_millis(15));
-    }
-
-    let stderr_bytes = stderr_handle.join().unwrap_or_default();
-    if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 {
-        Ok(())
-    } else {
-        let code = if libc::WIFEXITED(status) {
-            libc::WEXITSTATUS(status)
-        } else {
-            -1
-        };
-        let brief: String = String::from_utf8_lossy(&stderr_bytes)
-            .lines()
-            .take(4)
-            .map(|l| sanitize_terminal_text(l, false))
-            .collect::<Vec<_>>()
-            .join(" | ");
-        Err(format!("ffmpeg exited with code {code}: {brief}"))
-    }
+    spawn_disclaimed_with_timeout(
+        ffmpeg_bin,
+        &args,
+        FFMPEG_TIMEOUT,
+        clip_duration_sec,
+        progress.cloned(),
+    )
 }
 
 pub fn verified_local_file_arg(path: &Path, must_exist: bool) -> Result<String, String> {
@@ -356,60 +229,6 @@ pub fn verified_local_file_arg(path: &Path, must_exist: bool) -> Result<String, 
     }
     let s = resolved.to_str().ok_or("Path is not valid UTF-8")?;
     Ok(format!("file:{s}"))
-}
-
-/// Validates both the candidate entry/ancestors BEFORE symlink resolution and the canonical target/ancestors AFTER.
-/// Only `wheel` (0) and macOS `admin` (80) are accepted for group-writable directories (never shared `staff`=20).
-fn verify_trusted_binary(candidate: &Path, euid: u32) -> Option<PathBuf> {
-    let lstat = fs::symlink_metadata(candidate).ok()?;
-    if lstat.uid() != 0 && lstat.uid() != euid {
-        return None;
-    }
-    verify_ancestor_chain(candidate.parent(), euid)?;
-
-    let canon = fs::canonicalize(candidate).ok()?;
-    let meta = fs::metadata(&canon).ok()?;
-    if !meta.is_file() {
-        return None;
-    }
-    let mode = meta.permissions().mode();
-    if (mode & 0o111 == 0) || (mode & 0o002 != 0) {
-        return None;
-    }
-    if (mode & 0o020 != 0) && !is_trusted_admin_group(meta.gid()) {
-        return None;
-    }
-    if meta.uid() != 0 && meta.uid() != euid {
-        return None;
-    }
-
-    verify_ancestor_chain(canon.parent(), euid)?;
-    Some(canon)
-}
-
-fn verify_ancestor_chain(mut cur: Option<&Path>, euid: u32) -> Option<()> {
-    while let Some(dir) = cur {
-        if dir.as_os_str().is_empty() {
-            break;
-        }
-        let dm = fs::metadata(dir).ok()?;
-        let dmode = dm.permissions().mode();
-        if (dmode & 0o002 != 0) && (dmode & 0o1000 == 0) {
-            return None;
-        }
-        if (dmode & 0o020 != 0) && !is_trusted_admin_group(dm.gid()) {
-            return None;
-        }
-        if dm.uid() != 0 && dm.uid() != euid {
-            return None;
-        }
-        cur = dir.parent();
-    }
-    Some(())
-}
-
-const fn is_trusted_admin_group(gid: u32) -> bool {
-    gid == 0 || gid == 80
 }
 
 #[cfg(test)]

@@ -3,19 +3,23 @@ use std::rc::Rc;
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
+use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
-    NSAppearance, NSAppearanceCustomization, NSAppearanceNameDarkAqua, NSBackingStoreType,
-    NSBezierPath, NSColor, NSEvent, NSFloatingWindowLevel, NSPopUpButton, NSScreen,
-    NSStatusWindowLevel, NSTextField, NSView, NSWindow, NSWindowStyleMask,
+    NSAppearance, NSAppearanceCustomization, NSAppearanceNameDarkAqua, NSBackingStoreType, NSColor,
+    NSFloatingWindowLevel, NSFont, NSPopUpButton, NSScreen, NSStatusWindowLevel, NSTextField,
+    NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{NSNumber, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
 use crate::capture::shareable::{DisplayInfo, WindowInfo};
 use crate::capture::{AudioCaptureMode, CaptureConfig};
 use crate::config::Preferences;
-use crate::geometry::{AspectRatio, DragMode, Rect, apply_drag, hit_test_selection};
+use crate::fs_safety::sanitize_terminal_text;
+use crate::geometry::{
+    AspectRatio, DragMode, Rect, hit_test_window_frames, window_frame_to_overlay_rect,
+};
 use crate::ui::overlay_actions::build_toolbar_actions;
+use crate::ui::overlay_canvas::{CanvasIvars, OverlayCanvasView};
 use crate::ui::overlay_toolbar::{OverlayToolbarActions, populate_toolbar_controls};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,11 +31,11 @@ pub enum SelectionMode {
 
 pub type StartCaptureCallback = Rc<dyn Fn(Result<(CaptureConfig, Preferences), String>)>;
 
-struct ActiveDrag {
-    mode: DragMode,
-    start_x: f64,
-    start_y: f64,
-    initial_rect: Rect,
+pub struct ActiveDrag {
+    pub mode: DragMode,
+    pub start_x: f64,
+    pub start_y: f64,
+    pub initial_rect: Rect,
 }
 
 pub struct OverlayState {
@@ -48,10 +52,73 @@ pub struct OverlayState {
     pub audio_mode: AudioCaptureMode,
     pub windows: Vec<WindowInfo>,
     pub selected_window_idx: usize,
+    pub hovered_window_idx: Option<usize>,
     pub displays: Vec<DisplayInfo>,
     pub selected_display_idx: usize,
     pub demo_backdrop: bool,
-    drag: Option<ActiveDrag>,
+    pub drag: Option<ActiveDrag>,
+}
+
+impl OverlayState {
+    pub fn display_origin(&self) -> (f64, f64) {
+        self.displays
+            .iter()
+            .find(|d| d.display_id == self.overlay_display_id)
+            .map(|d| (d.frame.x, d.frame.y))
+            .unwrap_or((0.0, 0.0))
+    }
+
+    pub fn window_overlay_rect(&self, idx: usize) -> Option<Rect> {
+        let wf = self.windows.get(idx)?.frame;
+        window_frame_to_overlay_rect(wf, self.display_origin(), self.bounds)
+    }
+
+    pub fn display_for_window(&self, idx: usize) -> Option<u32> {
+        let wf = self.windows.get(idx)?.frame;
+        let cx = wf.x + wf.width * 0.5;
+        let cy = wf.y + wf.height * 0.5;
+        if let Some(d) = self.displays.iter().find(|d| d.frame.contains(cx, cy)) {
+            return Some(d.display_id);
+        }
+        self.displays
+            .iter()
+            .find(|d| {
+                let ix0 = wf.x.max(d.frame.x);
+                let iy0 = wf.y.max(d.frame.y);
+                let ix1 = wf.right().min(d.frame.right());
+                let iy1 = wf.top_y_up().min(d.frame.top_y_up());
+                ix1 > ix0 && iy1 > iy0
+            })
+            .map(|d| d.display_id)
+    }
+
+    pub fn hit_test_window_at(
+        &self,
+        local_x: f64,
+        local_y: f64,
+        cycle_selected: bool,
+    ) -> Option<usize> {
+        let frames: Vec<Rect> = self.windows.iter().map(|w| w.frame).collect();
+        let cur = cycle_selected.then_some(self.selected_window_idx);
+        hit_test_window_frames(
+            &frames,
+            self.display_origin(),
+            self.bounds.height,
+            local_x,
+            local_y,
+            cur,
+        )
+    }
+
+    pub fn select_window(&mut self, idx: usize) -> bool {
+        if let Some(proj) = self.window_overlay_rect(idx) {
+            self.selected_window_idx = idx;
+            self.selection = proj;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 define_class!(
@@ -89,185 +156,6 @@ impl KeyableOverlayWindow {
         Retained::into_super(win)
     }
 }
-
-struct CanvasIvars {
-    state: Rc<RefCell<OverlayState>>,
-    on_selection_changed: Rc<dyn Fn()>,
-}
-
-define_class!(
-    #[unsafe(super(NSView))]
-    #[thread_kind = MainThreadOnly]
-    #[name = "QSROverlayCanvasView"]
-    #[ivars = CanvasIvars]
-    struct OverlayCanvasView;
-
-    unsafe impl NSObjectProtocol for OverlayCanvasView {}
-
-    impl OverlayCanvasView {
-        #[unsafe(method(acceptsFirstMouse:))]
-        fn accepts_first_mouse(&self, _event: Option<&NSEvent>) -> bool {
-            true
-        }
-
-        #[unsafe(method(drawRect:))]
-        fn draw_rect(&self, _dirty: NSRect) {
-            let st = self.ivars().state.borrow();
-            let view_bounds = self.bounds();
-
-            if st.demo_backdrop {
-                let bg = NSColor::colorWithSRGBRed_green_blue_alpha(0.11, 0.14, 0.20, 1.0);
-                bg.setFill();
-                NSBezierPath::fillRect(view_bounds);
-
-                let card = NSRect::new(
-                    NSPoint::new(
-                        view_bounds.size.width * 0.16,
-                        view_bounds.size.height * 0.22,
-                    ),
-                    NSSize::new(
-                        view_bounds.size.width * 0.68,
-                        view_bounds.size.height * 0.58,
-                    ),
-                );
-                let card_bg = NSColor::colorWithSRGBRed_green_blue_alpha(0.16, 0.21, 0.30, 1.0);
-                card_bg.setFill();
-                NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(card, 14.0, 14.0).fill();
-            }
-
-            let sel = st.selection;
-            let dim = NSColor::colorWithSRGBRed_green_blue_alpha(0.04, 0.05, 0.08, 0.56);
-            dim.setFill();
-
-            let bw = view_bounds.size.width;
-            let bh = view_bounds.size.height;
-            let top_y = sel.top_y_up();
-            if top_y < bh {
-                NSBezierPath::fillRect(NSRect::new(
-                    NSPoint::new(0.0, top_y),
-                    NSSize::new(bw, bh - top_y),
-                ));
-            }
-            if sel.y > 0.0 {
-                NSBezierPath::fillRect(NSRect::new(
-                    NSPoint::new(0.0, 0.0),
-                    NSSize::new(bw, sel.y),
-                ));
-            }
-            if sel.x > 0.0 {
-                NSBezierPath::fillRect(NSRect::new(
-                    NSPoint::new(0.0, sel.y),
-                    NSSize::new(sel.x, sel.height),
-                ));
-            }
-            if sel.right() < bw {
-                NSBezierPath::fillRect(NSRect::new(
-                    NSPoint::new(sel.right(), sel.y),
-                    NSSize::new(bw - sel.right(), sel.height),
-                ));
-            }
-
-            let sel_rect = NSRect::new(
-                NSPoint::new(sel.x, sel.y),
-                NSSize::new(sel.width, sel.height),
-            );
-            let border_color = NSColor::colorWithSRGBRed_green_blue_alpha(0.98, 0.99, 1.0, 0.95);
-            border_color.setStroke();
-            let border = NSBezierPath::bezierPathWithRect(sel_rect);
-            border.setLineWidth(1.5);
-            border.stroke();
-
-            let grid_color = NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 0.18);
-            grid_color.setStroke();
-            for step in [1.0 / 3.0, 2.0 / 3.0] {
-                let gx = sel.x + sel.width * step;
-                let gy = sel.y + sel.height * step;
-                let vline = NSBezierPath::bezierPath();
-                vline.moveToPoint(NSPoint::new(gx, sel.y));
-                vline.lineToPoint(NSPoint::new(gx, sel.top_y_up()));
-                vline.setLineWidth(1.0);
-                vline.stroke();
-
-                let hline = NSBezierPath::bezierPath();
-                hline.moveToPoint(NSPoint::new(sel.x, gy));
-                hline.lineToPoint(NSPoint::new(sel.right(), gy));
-                hline.setLineWidth(1.0);
-                hline.stroke();
-            }
-
-            if st.mode == SelectionMode::Area {
-                border_color.setFill();
-                let pts = [
-                    (sel.x, sel.y),
-                    (sel.x + sel.width * 0.5, sel.y),
-                    (sel.right(), sel.y),
-                    (sel.right(), sel.y + sel.height * 0.5),
-                    (sel.right(), sel.top_y_up()),
-                    (sel.x + sel.width * 0.5, sel.top_y_up()),
-                    (sel.x, sel.top_y_up()),
-                    (sel.x, sel.y + sel.height * 0.5),
-                ];
-                for (hx, hy) in pts {
-                    let hrect =
-                        NSRect::new(NSPoint::new(hx - 4.5, hy - 4.5), NSSize::new(9.0, 9.0));
-                    NSBezierPath::bezierPathWithOvalInRect(hrect).fill();
-                }
-            }
-        }
-
-        #[unsafe(method(mouseDown:))]
-        fn mouse_down(&self, event: &NSEvent) {
-            let loc = event.locationInWindow();
-            let mut st = self.ivars().state.borrow_mut();
-            if st.mode != SelectionMode::Area {
-                return;
-            }
-            let mode =
-                hit_test_selection(st.selection, loc.x, loc.y, 10.0).unwrap_or(DragMode::Create);
-            let initial_rect = st.selection;
-            st.drag = Some(ActiveDrag {
-                mode,
-                start_x: loc.x,
-                start_y: loc.y,
-                initial_rect,
-            });
-        }
-
-        #[unsafe(method(mouseDragged:))]
-        fn mouse_dragged(&self, event: &NSEvent) {
-            let loc = event.locationInWindow();
-            let changed = {
-                let mut st = self.ivars().state.borrow_mut();
-                if st.mode != SelectionMode::Area {
-                    false
-                } else if let Some(drag) = st.drag.as_ref() {
-                    st.selection = apply_drag(
-                        drag.initial_rect,
-                        drag.mode,
-                        drag.start_x,
-                        drag.start_y,
-                        loc.x,
-                        loc.y,
-                        st.aspect,
-                        st.bounds,
-                    );
-                    true
-                } else {
-                    false
-                }
-            };
-            if changed {
-                self.setNeedsDisplay(true);
-                (self.ivars().on_selection_changed)();
-            }
-        }
-
-        #[unsafe(method(mouseUp:))]
-        fn mouse_up(&self, _event: &NSEvent) {
-            self.ivars().state.borrow_mut().drag = None;
-        }
-    }
-);
 
 pub struct SelectorOverlay {
     pub canvas_window: Retained<NSWindow>,
@@ -341,8 +229,9 @@ impl SelectorOverlay {
             audio_mode: prefs.audio_mode,
             windows,
             selected_window_idx: 0,
+            hovered_window_idx: None,
             displays,
-            selected_display_idx: matched_display_idx(matched_idx),
+            selected_display_idx: matched_idx,
             demo_backdrop,
             drag: None,
         }));
@@ -354,6 +243,10 @@ impl SelectorOverlay {
         }
         canvas_window.setOpaque(demo_backdrop);
         canvas_window.setBackgroundColor(Some(&NSColor::clearColor()));
+        canvas_window.setIgnoresMouseEvents(false);
+        canvas_window.setMovable(false);
+        canvas_window.setMovableByWindowBackground(false);
+        canvas_window.setAcceptsMouseMovedEvents(true);
         canvas_window.setLevel(NSFloatingWindowLevel);
 
         let scale_for_px = scale_factor.max(1.0);
@@ -380,8 +273,18 @@ impl SelectorOverlay {
         let target_popup = NSPopUpButton::new(mtm);
         target_popup.setHidden(true);
 
+        let window_badge = NSTextField::labelWithString(&NSString::from_str(""), mtm);
+        window_badge.setFont(Some(&NSFont::boldSystemFontOfSize(12.0)));
+        window_badge.setTextColor(Some(&NSColor::whiteColor()));
+        window_badge.setDrawsBackground(true);
+        window_badge.setBackgroundColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
+            0.08, 0.11, 0.18, 0.88,
+        )));
+        window_badge.setHidden(true);
+
         let w_sync = w_field.clone();
         let h_sync = h_field.clone();
+        let badge_sync = window_badge.clone();
         let state_sync = Rc::clone(&state);
         let sync_fields: Rc<dyn Fn()> = Rc::new(move || {
             let st = state_sync.borrow();
@@ -394,18 +297,38 @@ impl SelectorOverlay {
                 "{}",
                 (st.selection.height * sf).round() as u32
             )));
+            if st.mode == SelectionMode::Window && !st.demo_backdrop {
+                if let Some(win) = st.windows.get(st.selected_window_idx) {
+                    let clean = sanitize_terminal_text(&win.display_label(), false);
+                    let label = format!("  {}  ", clean.chars().take(52).collect::<String>());
+                    badge_sync.setStringValue(&NSString::from_str(&label));
+                    badge_sync.sizeToFit();
+                    let bsize = badge_sync.frame().size;
+                    let bw = bsize.width.min((st.selection.width - 16.0).max(40.0));
+                    let bx = st.selection.x + 8.0;
+                    let by = (st.selection.top_y_up() - 28.0).max(st.selection.y + 4.0);
+                    badge_sync.setFrame(NSRect::new(NSPoint::new(bx, by), NSSize::new(bw, 22.0)));
+                    badge_sync.setHidden(false);
+                } else {
+                    badge_sync.setHidden(true);
+                }
+            } else {
+                badge_sync.setHidden(true);
+            }
         });
 
-        let canvas_view: Retained<OverlayCanvasView> = {
-            let this = OverlayCanvasView::alloc(mtm).set_ivars(CanvasIvars {
+        let canvas_view = OverlayCanvasView::new(
+            mtm,
+            NSRect::new(NSPoint::new(0.0, 0.0), win_frame.size),
+            CanvasIvars {
                 state: Rc::clone(&state),
+                target_popup: target_popup.clone(),
                 on_selection_changed: Rc::clone(&sync_fields),
-            });
-            unsafe {
-                msg_send![super(this), initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), win_frame.size)]
-            }
-        };
+            },
+        );
+        canvas_view.addSubview(&window_badge);
         canvas_window.setContentView(Some(&canvas_view));
+        let _ = canvas_window.makeFirstResponder(Some(&canvas_view));
 
         let (bar_w, bar_h) = (840.0, 52.0);
         let bar_rect = NSRect::new(
@@ -466,13 +389,15 @@ impl SelectorOverlay {
         } else {
             toolbar_window.setOpaque(false);
             toolbar_window.setBackgroundColor(Some(&NSColor::clearColor()));
+            toolbar_window.setMovable(false);
+            toolbar_window.setMovableByWindowBackground(false);
             toolbar_window.setLevel(NSStatusWindowLevel);
             toolbar_window.setContentView(Some(&bar_container));
         }
 
         canvas_window.makeKeyAndOrderFront(None);
         if !demo_backdrop {
-            toolbar_window.makeKeyAndOrderFront(None);
+            toolbar_window.orderFrontRegardless();
         }
 
         Ok(Self {
@@ -497,8 +422,4 @@ pub fn extract_nsscreen_display_id(screen: &NSScreen) -> Option<u32> {
     let obj = val?;
     let num: &NSNumber = unsafe { &*(Retained::as_ptr(&obj) as *const NSNumber) };
     Some(num.unsignedIntValue())
-}
-
-const fn matched_display_idx(idx: usize) -> usize {
-    idx
 }
