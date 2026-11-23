@@ -27,12 +27,22 @@ pub struct ExclusiveStagingDir {
 
 impl ExclusiveStagingDir {
     pub fn create_for_target(target: &Path, ext: &str) -> Result<Self, String> {
+        Self::create_for_target_with_policy(target, ext, false)
+    }
+
+    pub fn create_for_target_with_policy(
+        target: &Path,
+        ext: &str,
+        prevent_overwrite: bool,
+    ) -> Result<Self, String> {
         let file_name = target
             .file_name()
             .ok_or("Target path is missing a file name")?;
-        if let Ok(sym) = fs::symlink_metadata(target) {
-            if sym.file_type().is_symlink() {
-                return Err("Refusing to overwrite a symlink target path".to_string());
+        if !prevent_overwrite {
+            if let Ok(sym) = fs::symlink_metadata(target) {
+                if sym.file_type().is_symlink() {
+                    return Err("Refusing to overwrite a symlink target path".to_string());
+                }
             }
         }
         let parent = match target.parent() {
@@ -71,12 +81,17 @@ impl ExclusiveStagingDir {
         let dest_dir_fd = OwnedFd::from(dest_dir_file);
 
         let canon_dest = canon_parent.join(file_name);
-        if let Ok(existing) = fs::symlink_metadata(&canon_dest) {
-            if existing.file_type().is_symlink() || !existing.is_file() || existing.uid() != euid {
-                return Err(
-                    "Refusing to overwrite symlink, special file, or file owned by another user"
-                        .to_string(),
-                );
+        if !prevent_overwrite {
+            if let Ok(existing) = fs::symlink_metadata(&canon_dest) {
+                if existing.file_type().is_symlink()
+                    || !existing.is_file()
+                    || existing.uid() != euid
+                {
+                    return Err(
+                        "Refusing to overwrite symlink, special file, or file owned by another user"
+                            .to_string(),
+                    );
+                }
             }
         }
 
@@ -231,16 +246,15 @@ impl ExclusiveStagingDir {
             .canon_dest
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("Recording");
-        let base_stem = strip_numeric_collision_suffix(raw_stem);
+            .unwrap_or("Quick-Screen-Recorder");
 
         for suffix in 2..=9999_u32 {
-            let candidate = format!("{base_stem}-{suffix}.{ext}");
+            let candidate = format!("{raw_stem}-{suffix}.{ext}");
             if self.try_publish_excl(&candidate, &mut xdev_guard)? {
                 return Ok(candidate);
             }
         }
-        let fallback = format!("{base_stem}-{}.{ext}", random_hex_token());
+        let fallback = format!("{raw_stem}-{}.{ext}", random_hex_token());
         if self.try_publish_excl(&fallback, &mut xdev_guard)? {
             Ok(fallback)
         } else {
@@ -275,7 +289,7 @@ impl ExclusiveStagingDir {
         }
         let err = io::Error::last_os_error();
         match err.raw_os_error() {
-            Some(libc::EEXIST) => Ok(false),
+            Some(libc::EEXIST | libc::EISDIR | libc::ENOTEMPTY) => Ok(false),
             Some(libc::EXDEV) => {
                 let tmp_c =
                     stage_once_on_dest_volume(&self.staged_file, self.dest_dir_fd.as_raw_fd())?;
@@ -299,19 +313,6 @@ impl Drop for ExclusiveStagingDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.stage_dir_path);
     }
-}
-
-fn strip_numeric_collision_suffix(stem: &str) -> &str {
-    if let Some((prefix, tail)) = stem.rsplit_once('-') {
-        if (1..=4).contains(&tail.len()) && tail.chars().all(|c| c.is_ascii_digit()) {
-            let looks_like_date =
-                prefix.len() >= 7 && prefix.as_bytes()[prefix.len() - 3] == b'-' && tail.len() == 2;
-            if !looks_like_date {
-                return prefix;
-            }
-        }
-    }
-    stem
 }
 
 fn fstatat_overwrite_mode(dir_fd: libc::c_int, name_c: &CString, euid: u32) -> Result<u32, String> {
@@ -398,7 +399,10 @@ fn rename_excl_within_dir(
         return Ok(true);
     }
     let err = io::Error::last_os_error();
-    if err.raw_os_error() == Some(libc::EEXIST) {
+    if matches!(
+        err.raw_os_error(),
+        Some(libc::EEXIST | libc::EISDIR | libc::ENOTEMPTY)
+    ) {
         Ok(false)
     } else {
         Err(format!("Failed publishing cross-volume output file: {err}"))

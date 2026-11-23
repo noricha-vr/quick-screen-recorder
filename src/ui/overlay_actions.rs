@@ -219,13 +219,16 @@ pub fn build_toolbar_actions(
             }),
             on_record: Box::new(move || {
                 let st = st_rec.borrow();
-                let target = match st.mode {
-                    SelectionMode::Area => CaptureTarget::Region {
-                        // Always record on the exact display where the selection rectangle is drawn
-                        display_id: st.overlay_display_id,
-                        rect_points: st.selection.appkit_to_top_left(st.bounds.height),
-                        scale_factor: st.scale_factor,
-                    },
+                let (target, source_app_name) = match st.mode {
+                    SelectionMode::Area => (
+                        CaptureTarget::Region {
+                            // Always record on the exact display where the selection rectangle is drawn
+                            display_id: st.overlay_display_id,
+                            rect_points: st.selection.appkit_to_top_left(st.bounds.height),
+                            scale_factor: st.scale_factor,
+                        },
+                        None,
+                    ),
                     SelectionMode::Window => {
                         let Some(win) = st.windows.get(st.selected_window_idx) else {
                             let err = "No shareable window available to record".to_string();
@@ -233,14 +236,20 @@ pub fn build_toolbar_actions(
                             on_start(Err(err));
                             return;
                         };
-                        CaptureTarget::Window {
-                            window_id: win.window_id,
-                        }
+                        (
+                            CaptureTarget::Window {
+                                window_id: win.window_id,
+                            },
+                            Some(win.app_name.clone()),
+                        )
                     }
-                    SelectionMode::Screen => CaptureTarget::Display {
-                        display_id: st.screen_display_id,
-                        scale_factor: st.scale_factor,
-                    },
+                    SelectionMode::Screen => (
+                        CaptureTarget::Display {
+                            display_id: st.screen_display_id,
+                            scale_factor: st.scale_factor,
+                        },
+                        None,
+                    ),
                 };
                 let mut updated = base_prefs.clone();
                 updated.fps = st.fps;
@@ -259,6 +268,7 @@ pub fn build_toolbar_actions(
                     highlight_clicks: st.highlight_clicks,
                     audio_mode: st.audio_mode,
                     excluded_window_ids: vec![cwin_num, twin_num],
+                    source_app_name,
                 };
                 drop(st);
                 on_start(Ok((cfg, updated)));

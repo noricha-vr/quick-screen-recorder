@@ -117,6 +117,7 @@ fn execute(command: Command) -> Result<(), String> {
                 highlight_clicks,
                 audio_mode: audio,
                 excluded_window_ids: Vec::new(),
+                source_app_name: None,
             };
             let session = RecordingSession::start(&cfg, &output)?;
             thread::sleep(Duration::from_secs_f64(duration_sec));

@@ -144,16 +144,22 @@ pub fn run_export_with_options(
     if !req.input.exists() {
         return Err("Input recording file does not exist".to_string());
     }
-    ensure_distinct_files(&req.input, &req.output)?;
-    if let Ok(sym) = fs::symlink_metadata(&req.output) {
-        if sym.file_type().is_symlink() {
-            return Err("Refusing to overwrite symlink output path".to_string());
+    if !prevent_overwrite {
+        ensure_distinct_files(&req.input, &req.output)?;
+        if let Ok(sym) = fs::symlink_metadata(&req.output) {
+            if sym.file_type().is_symlink() {
+                return Err("Refusing to overwrite symlink output path".to_string());
+            }
         }
     }
 
     let canon_input = fs::canonicalize(&req.input)
         .map_err(|e| format!("Failed resolving input file path: {e}"))?;
-    let stage = ExclusiveStagingDir::create_for_target(&req.output, req.format.extension())?;
+    let stage = ExclusiveStagingDir::create_for_target_with_policy(
+        &req.output,
+        req.format.extension(),
+        prevent_overwrite,
+    )?;
     set_progress_permille(progress, 30);
 
     let meta = avfoundation::probe_video_metadata(&canon_input)?;

@@ -110,3 +110,81 @@ where
         }
     }
 }
+
+/// Registers a local AppKit keyDown monitor that intercepts Escape (keyCode 53) when `on_escape` returns `true`.
+pub fn register_local_escape_monitor<F>(on_escape: F)
+where
+    F: Fn() -> bool + 'static,
+{
+    use block2::RcBlock;
+    use objc2_app_kit::{NSEvent, NSEventMask};
+    use std::ptr::NonNull;
+
+    let block = RcBlock::new(move |ev: NonNull<NSEvent>| -> *mut NSEvent {
+        let event = unsafe { ev.as_ref() };
+        if event.keyCode() == 53 && on_escape() {
+            return ptr::null_mut();
+        }
+        ev.as_ptr()
+    });
+    unsafe {
+        let _ = NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &block);
+    }
+}
+
+/// Installs a standard AppKit Edit menu on `NSApplication` so Command-key editing shortcuts
+/// (`⌘A`, `⌘C`, `⌘V`, `⌘X`, `⌘Z`, `⇧⌘Z`) work reliably inside `NSTextField` controls even when
+/// running under `NSApplicationActivationPolicy::Accessory`.
+pub fn install_standard_edit_menu(mtm: MainThreadMarker) {
+    use objc2::{MainThreadOnly, sel};
+    use objc2_app_kit::{NSApplication, NSEventModifierFlags, NSMenu, NSMenuItem};
+    use objc2_foundation::NSString;
+
+    let app = NSApplication::sharedApplication(mtm);
+    let main_menu = NSMenu::new(mtm);
+
+    // Index 0 is reserved by AppKit for the application menu.
+    let app_item = NSMenuItem::new(mtm);
+    let app_submenu = NSMenu::new(mtm);
+    app_item.setSubmenu(Some(&app_submenu));
+    main_menu.addItem(&app_item);
+
+    let edit_item = NSMenuItem::new(mtm);
+    let edit_menu = NSMenu::initWithTitle(NSMenu::alloc(mtm), &NSString::from_str("Edit"));
+    let specs = [
+        ("Undo", sel!(undo:), "z", NSEventModifierFlags::Command),
+        (
+            "Redo",
+            sel!(redo:),
+            "z",
+            NSEventModifierFlags::Command | NSEventModifierFlags::Shift,
+        ),
+        ("Cut", sel!(cut:), "x", NSEventModifierFlags::Command),
+        ("Copy", sel!(copy:), "c", NSEventModifierFlags::Command),
+        ("Paste", sel!(paste:), "v", NSEventModifierFlags::Command),
+        (
+            "Select All",
+            sel!(selectAll:),
+            "a",
+            NSEventModifierFlags::Command,
+        ),
+    ];
+    for (idx, (title, action, key, mask)) in specs.into_iter().enumerate() {
+        if idx == 2 {
+            edit_menu.addItem(&NSMenuItem::separatorItem(mtm));
+        }
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(title),
+                Some(action),
+                &NSString::from_str(key),
+            )
+        };
+        item.setKeyEquivalentModifierMask(mask);
+        edit_menu.addItem(&item);
+    }
+    edit_item.setSubmenu(Some(&edit_menu));
+    main_menu.addItem(&edit_item);
+    app.setMainMenu(Some(&main_menu));
+}

@@ -1,6 +1,6 @@
 [package]
 name = "quick-screen-recorder"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Fast, lightweight native screen recorder for macOS built with Rust and ScreenCaptureKit"
@@ -20,6 +20,7 @@ objc2-app-kit = { version = "=0.3.2", features = [
   "NSAlert",
   "NSAppearance",
   "NSApplication",
+  "NSAttributedString",
   "NSBezierPath",
   "NSBitmapImageRep",
   "NSBox",
@@ -49,10 +50,12 @@ objc2-app-kit = { version = "=0.3.2", features = [
   "NSStatusBar",
   "NSStatusBarButton",
   "NSStatusItem",
+  "NSStringDrawing",
   "NSText",
   "NSTextField",
   "NSView",
   "NSWindow",
+  "NSWorkspace",
 ] }
 objc2-av-foundation = { version = "=0.3.2", features = [
   "AVAsset",
@@ -94,6 +97,7 @@ objc2-core-video = { version = "=0.3.2", features = [
   "CVReturn",
 ] }
 objc2-foundation = { version = "=0.3.2", features = [
+  "NSAppleEventDescriptor",
   "NSArray",
   "NSAttributedString",
   "NSBundle",
@@ -101,6 +105,7 @@ objc2-foundation = { version = "=0.3.2", features = [
   "NSDate",
   "NSDictionary",
   "NSError",
+  "NSFileManager",
   "NSGeometry",
   "NSObject",
   "NSPathUtilities",

@@ -12,12 +12,13 @@ Unlike Electron-based recorders that keep a full Chromium runtime resident in me
 
 ## Screenshots
 
-| Region / Window / Screen Selector | Trim & Multi-Format Export Editor |
-|---|---|
-| ![Selection Overlay](docs/images/overlay.png) | ![Trim and Export Editor](docs/images/editor.png) |
+| Quick Start & Permission Guide | Region / Window / Screen Selector | Trim & Multi-Format Export Editor |
+|---|---|---|
+| ![Quick Start Onboarding](docs/images/onboarding.png) | ![Selection Overlay](docs/images/overlay.png) | ![Trim and Export Editor](docs/images/editor.png) |
 
 ## Highlights
 
+- **Guided First-Run Onboarding & Interactive Tutorial** — Opens automatically on first launch with a live Screen Recording permission indicator (amber -> green after macOS **Quit & Reopen**), one-click deep link to **System Settings > Privacy & Security > Screen & System Audio Recording**, and an animated top-right menu bar walkthrough from your first capture to saved export (reopen anytime via **`◉ Rec` → `Quick Start Guide...`**).
 - **Zero Electron / Zero WebView** — Pure Rust + native AppKit status-bar app and borderless overlay. Instant startup and minimal idle memory.
 - **Hardware-Direct Recording (`SCRecordingOutput`)** — Streams selected regions, individual windows, or full displays directly to hardware H.264 / HEVC MP4 with near-zero CPU overhead.
 - **Flexible Capture Selector**
@@ -29,7 +30,7 @@ Unlike Electron-based recorders that keep a full Chromium runtime resident in me
   - **Dual-bracket `IN` / `OUT` timeline**: Drag rectangular start/end trim brackets or scrub the playhead with live hardware-decoded frame preview.
   - **Zero-dependency native exports**: **MP4 (H.264)**, **MP4 (HEVC)**, **GIF** (multithreaded NeuQuant global palette + frame-delta bounding-box optimization), and **APNG**.
   - **Optional FFmpeg exports**: Automatically unlocks **WebM (VP9)** and **MP4 (AV1)** when `ffmpeg` is installed on your Mac.
-  - **Selectable Export Folder & Real-Time Progress**: Defaults to `~/Desktop` and lets you switch destinations anytime via the **`Save to`** dropdown in the editor or **`Save Folder`** in the `◉ Rec` menu bar (`~/Desktop`, `~/Movies`, `~/Downloads`, `~/Documents`, or **`Choose Folder...`** with New Folder creation). Clicking **`Save`** writes a non-colliding timestamped file immediately with a live progress bar—or click **`Copy`** to place the file directly on the macOS Pasteboard.
+  - **Smart Export Folder, Naming & Real-Time Progress**: Defaults to **`~/Movies/Quick Screen Recorder`** (auto-created) and lets you switch destinations anytime via the **`Save to`** dropdown in the editor or **`Save Folder`** in the `◉ Rec` menu bar (`~/Movies/Quick Screen Recorder`, `~/Movies`, `~/Desktop`, `~/Downloads`, `~/Documents`, or **`Choose Folder...`** with New Folder creation). Auto-names files chronologically for Finder sorting & Spotlight search (`YYYY-MM-DD_HH-MM-SS_Quick-Screen-Recorder`, plus target app name on Window captures) while letting you freely edit the **`Name`** field before clicking **`Save`** (atomic non-overwriting write + live progress bar) or **`Copy`**.
 - **Privacy by Design**
   - 100% local execution with **zero network access** and **zero external telemetry**.
   - Container metadata is stripped automatically on export (`setMetadata(None)` / `-map_metadata -1`).
@@ -57,17 +58,17 @@ open dist/QuickScreenRecorder.app
 cp -R dist/QuickScreenRecorder.app /Applications/
 ```
 
-On first capture, macOS will prompt for **Screen & System Audio Recording** permission under **System Settings > Privacy & Security**.
+On first launch, the **Quick Start** window checks **Screen & System Audio Recording** permission, opens **System Settings** in one click, turns green after macOS **Quit & Reopen**, and guides you through your first recording and export.
 
 ## Usage
 
 ### Menu Bar & Shortcut (GUI)
 
-1. Launch `QuickScreenRecorder.app` (or run `cargo run --release`). Look for **`◉ Rec`** in the macOS menu bar.
+1. Launch `QuickScreenRecorder.app` (or run `cargo run --release`). On first launch, follow the **Quick Start** window (or reopen it anytime from **`◉ Rec` → `Quick Start Guide...`**).
 2. Click **`◉ Rec` → `New Recording...`** or press **`Cmd + Shift + 6`** anywhere to open the selection overlay (`Esc` cancels).
 3. Choose **Area**, **Window**, or **Screen**, adjust aspect ratio / dimensions / FPS (`30` or `60`) / audio / cursor / click highlights, and click **`● Record`**.
 4. During recording, the menu bar displays elapsed time (`● 00:08`). Click **`Stop Recording`** in the menu bar or press **`Cmd + Shift + 6`** again to finish.
-5. In the **Trim & Export** window, drag the **`IN` / `OUT`** trim brackets if needed, pick your format (**MP4**, **HEVC**, **GIF**, **APNG**, **WebM**, **AV1**), resolution preset, and **`Save to`** destination folder (defaults to `~/Desktop`, persisted across launches and also configurable from **`◉ Rec` → `Save Folder`**), then click **`Copy`** or **`Save`**.
+5. In the **Trim & Export** window, drag the **`IN` / `OUT`** trim brackets if needed, pick your format (**MP4**, **HEVC**, **GIF**, **APNG**, **WebM**, **AV1**), resolution preset, **`Save to`** folder (defaults to `~/Movies/Quick Screen Recorder`, also configurable from **`◉ Rec` → `Save Folder`**), and optionally customize the **`Name`** field (pre-filled with `YYYY-MM-DD_HH-MM-SS_Quick-Screen-Recorder` + window app name when capturing a window), then click **`Copy`** or **`Save`**.
 
 ### Command-Line Interface (CLI)
 

@@ -293,7 +293,7 @@ fn end_to_end_native_exports_codec_resize_metadata_and_telemetry() {
 
         let out_webm = work.join("out.webm");
         let webm_res = run_export(&ExportRequest {
-            input: src_mp4,
+            input: src_mp4.clone(),
             output: out_webm,
             format: ExportFormat::Webm,
             fps: 24,
@@ -305,6 +305,28 @@ fn end_to_end_native_exports_codec_resize_metadata_and_telemetry() {
         assert!(webm_res.output_bytes > 500);
         expected_events += 1;
     }
+
+    let out_webm_or_same_in_src = src_mp4.clone();
+    let same_path_res = quick_screen_recorder::export::run_export_with_options(
+        &ExportRequest {
+            input: src_mp4.clone(),
+            output: out_webm_or_same_in_src,
+            format: ExportFormat::Mp4,
+            fps: 24,
+            start_sec: Some(0.0),
+            end_sec: Some(0.6),
+            max_width: None,
+        },
+        None,
+        true,
+    )
+    .expect("prevent_overwrite export colliding with input path should write -2");
+    assert_eq!(
+        same_path_res.output_path.file_name().unwrap(),
+        "source-2.mp4"
+    );
+    assert!(src_mp4.exists());
+    expected_events += 1;
 
     let raw_log = fs::read_to_string(&perf_log).expect("read perf.jsonl");
     assert!(!raw_log.contains("source.mp4"));

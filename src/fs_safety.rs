@@ -7,9 +7,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use crate::config::APP_SUPPORT_DIR_NAME;
+use crate::export_name::default_export_stem;
 pub(crate) use crate::fs_acl::{clear_fd_extended_acl, verify_pre_canonical_target_parent};
 pub use crate::fs_acl::{
-    default_desktop_export_dir, has_only_safe_acls, is_usable_export_dir, valid_home_dir,
+    default_export_dir_in_home, default_movies_export_dir, has_only_safe_acls,
+    is_usable_export_dir, valid_home_dir,
 };
 use crate::observe::now_unix_secs;
 pub use crate::staging::ExclusiveStagingDir;
@@ -57,11 +59,11 @@ pub fn format_tilde_path(path: &Path) -> String {
     sanitize_terminal_text(&path.display().to_string(), false)
 }
 
-/// Generates a local-timestamped output path `Recording-YYYY-MM-DD-HHMMSS.<ext>` inside `dir`
-/// without overwriting any existing file or symlink.
+/// Generates a local-timestamped output path `YYYY-MM-DD_HH-MM-SS_Quick-Screen-Recorder.<ext>`
+/// inside `dir` without overwriting any existing file or symlink.
 pub fn next_recording_output_path(dir: &Path, ext: &str) -> PathBuf {
     let clean_ext = ext.trim_start_matches('.');
-    let stem = local_recording_stem(now_unix_secs());
+    let stem = default_export_stem(now_unix_secs(), None);
     next_non_colliding_path(dir, &stem, clean_ext)
 }
 
@@ -78,25 +80,6 @@ pub fn next_non_colliding_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
         }
     }
     dir.join(format!("{stem}-{}.{ext}", random_hex_token()))
-}
-
-fn local_recording_stem(unix_secs: u64) -> String {
-    let ts = unix_secs as libc::time_t;
-    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    let ok = unsafe { !libc::localtime_r(&ts, &mut tm).is_null() };
-    if ok {
-        format!(
-            "Recording-{:04}-{:02}-{:02}-{:02}{:02}{:02}",
-            tm.tm_year + 1900,
-            tm.tm_mon + 1,
-            tm.tm_mday,
-            tm.tm_hour,
-            tm.tm_min,
-            tm.tm_sec
-        )
-    } else {
-        format!("Recording-{unix_secs}")
-    }
 }
 
 pub fn ensure_distinct_files(input: &Path, output: &Path) -> Result<(), String> {
@@ -185,6 +168,24 @@ pub fn unique_private_file_path(prefix: &str, ext: &str) -> Result<PathBuf, Stri
     Ok(dir.join(format!("{prefix}-{}.{ext}", random_hex_token())))
 }
 
+/// Creates a fresh 0700 subdirectory inside our private cache dir so clipboard exports can carry
+/// the user's chosen display filename while staying isolated from other local users.
+pub fn unique_private_clipboard_dir() -> Result<PathBuf, String> {
+    let root = private_cache_dir()?;
+    let clip_dir = root.join(format!("qsr-clip-{}", random_hex_token()));
+    DirBuilder::new()
+        .mode(0o700)
+        .create(&clip_dir)
+        .map_err(|e| format!("Failed creating clipboard staging directory: {e}"))?;
+    let dfd = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&clip_dir)
+        .map_err(|e| format!("Failed opening clipboard directory: {e}"))?;
+    clear_fd_extended_acl(dfd.as_raw_fd())?;
+    Ok(clip_dir)
+}
+
 pub fn atomic_write_private(target: &Path, bytes: &[u8]) -> io::Result<()> {
     let euid = unsafe { libc::geteuid() };
     if let Ok(meta) = fs::symlink_metadata(target) {
@@ -260,20 +261,22 @@ pub fn prune_stale_cache_files(max_age: Duration) {
         }
         if meta.is_file() {
             let _ = fs::remove_file(entry.path());
-        } else if meta.is_dir()
-            && entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".qsr-work-")
-        {
-            if let Ok(dfd) = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(entry.path())
-            {
-                if unsafe { libc::flock(dfd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                    let _ = fs::remove_dir_all(entry.path());
+        } else if meta.is_dir() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with(".qsr-work-") {
+                if let Ok(dfd) = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(entry.path())
+                {
+                    if unsafe { libc::flock(dfd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                        let _ = fs::remove_dir_all(entry.path());
+                    }
                 }
+            } else if name_str.starts_with("qsr-clip-") && meta.uid() == unsafe { libc::geteuid() }
+            {
+                let _ = fs::remove_dir_all(entry.path());
             }
         }
     }
@@ -431,5 +434,51 @@ mod tests {
         ));
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_export_dir_creates_movies_app_folder_and_preserves_custom_numeric_stems() {
+        let mock_home = std::env::temp_dir().join(format!("qsr-mock-home-{}", random_hex_token()));
+        let movies = mock_home.join("Movies");
+        fs::create_dir_all(&movies).expect("mkdir mock movies");
+        fs::set_permissions(&mock_home, fs::Permissions::from_mode(0o700)).expect("chmod home");
+        fs::set_permissions(&movies, fs::Permissions::from_mode(0o700)).expect("chmod movies");
+
+        let resolved = default_export_dir_in_home(&mock_home).expect("default movies app dir");
+        assert_eq!(resolved, movies.join("Quick Screen Recorder"));
+        assert!(resolved.is_dir());
+
+        // Numeric custom stems like `demo-2026` must become `demo-2026-2` on collision, not `demo-2`
+        let target = resolved.join("demo-2026.mp4");
+        let s1 = ExclusiveStagingDir::create_for_target(&target, "mp4").expect("stage1");
+        fs::write(s1.staged_file(), b"first").expect("write s1");
+        let (p1, _) = s1.commit_with_policy(true).expect("commit s1");
+        assert_eq!(p1.file_name().unwrap(), "demo-2026.mp4");
+
+        let s2 = ExclusiveStagingDir::create_for_target_with_policy(&target, "mp4", true)
+            .expect("stage2");
+        fs::write(s2.staged_file(), b"second").expect("write s2");
+        let (p2, _) = s2.commit_with_policy(true).expect("commit s2");
+        assert_eq!(p2.file_name().unwrap(), "demo-2026-2.mp4");
+
+        // Existing directory and symlink collisions must also advance safely without failing or modifying them
+        let colliding = resolved.join("collide.mp4");
+        fs::create_dir(&colliding).expect("mkdir colliding dir");
+        let link2 = resolved.join("collide-2.mp4");
+        std::os::unix::fs::symlink(resolved.join("missing.mp4"), &link2).expect("dangling link");
+        let s3 = ExclusiveStagingDir::create_for_target_with_policy(&colliding, "mp4", true)
+            .expect("stage3");
+        fs::write(s3.staged_file(), b"third").expect("write s3");
+        let (p3, _) = s3.commit_with_policy(true).expect("commit s3");
+        assert_eq!(p3.file_name().unwrap(), "collide-3.mp4");
+        assert!(colliding.is_dir());
+        assert!(
+            fs::symlink_metadata(&link2)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        let _ = fs::remove_dir_all(&mock_home);
     }
 }
