@@ -97,8 +97,12 @@ fn clean_single_component_stem(raw: &str, strip_ext: Option<&str>) -> String {
         }
     }
 
-    // Strip duplicate active extension after removing control/bidi chars so `demo.mp4\u{202E}` becomes `demo`.
-    let mut normalized = cleaned.trim().to_string();
+    // Collapse traversal remnants like "..-..-etc", strip trailing dots/spaces, then strip duplicate active extension.
+    let mut normalized = cleaned.replace("..", "");
+    while normalized.contains("--") {
+        normalized = normalized.replace("--", "-");
+    }
+    normalized = normalized.trim_end_matches([' ', '.']).to_string();
     if let Some(clean_ext) = strip_ext.filter(|e| !e.is_empty()) {
         let dot_ext = format!(".{clean_ext}");
         if normalized.len() >= dot_ext.len() {
@@ -109,12 +113,6 @@ fn clean_single_component_stem(raw: &str, strip_ext: Option<&str>) -> String {
                 normalized.truncate(split_at);
             }
         }
-    }
-
-    // Collapse traversal remnants like "..-..-etc" and strip leading dots/dashes/spaces
-    normalized = normalized.replace("..", "");
-    while normalized.contains("--") {
-        normalized = normalized.replace("--", "-");
     }
     let trimmed = normalized
         .trim_start_matches([' ', '.', '-'])
@@ -240,6 +238,7 @@ mod tests {
             "my-demo"
         );
         assert_eq!(sanitize_export_stem("demo.mp4\u{202E}", "mp4", fb), "demo");
+        assert_eq!(sanitize_export_stem("demo.mp4.", "mp4", fb), "demo");
         assert_eq!(
             sanitize_export_stem("../../../etc/passwd", "mp4", fb),
             "etc-passwd"
