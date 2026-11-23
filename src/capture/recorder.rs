@@ -12,10 +12,10 @@ use objc2_core_media::{CMTime, CMTimeFlags};
 use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol, NSURL};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCDisplay, SCRecordingOutput, SCRecordingOutputConfiguration,
-    SCRecordingOutputDelegate, SCStream, SCStreamConfiguration, SCWindow,
+    SCRecordingOutputDelegate, SCRunningApplication, SCStream, SCStreamConfiguration, SCWindow,
 };
 
-use crate::capture::shareable::query_shareable_content;
+use crate::capture::shareable::query_shareable_content_for_capture;
 use crate::capture::{CaptureConfig, CaptureTarget, RecordingCodec};
 use crate::fs_safety::ExclusiveStagingDir;
 use crate::observe::{PerfEvent, PerfKind, now_unix_secs, record_perf_event};
@@ -95,7 +95,7 @@ impl RecordingSession {
     pub fn start(config: &CaptureConfig, output_path: &Path) -> Result<Self, String> {
         let staging = ExclusiveStagingDir::create_for_target(output_path, "mp4")?;
 
-        let snapshot = query_shareable_content()?;
+        let snapshot = query_shareable_content_for_capture()?;
         let (filter, pixel_w, pixel_h, source_rect_opt) =
             build_filter_and_dimensions(&snapshot.content, config)?;
 
@@ -344,14 +344,7 @@ fn build_filter_and_dimensions(
             scale_factor,
         } => {
             let display = find_display(content, *display_id)?;
-            let excluded = collect_excluded_windows(content, &config.excluded_window_ids);
-            let filter = unsafe {
-                SCContentFilter::initWithDisplay_excludingWindows(
-                    SCContentFilter::alloc(),
-                    &display,
-                    &excluded,
-                )
-            };
+            let filter = build_display_filter(content, &display, &config.excluded_window_ids);
             let scale = if *scale_factor > 0.5 {
                 *scale_factor
             } else {
@@ -369,14 +362,7 @@ fn build_filter_and_dimensions(
             scale_factor,
         } => {
             let display = find_display(content, *display_id)?;
-            let excluded = collect_excluded_windows(content, &config.excluded_window_ids);
-            let filter = unsafe {
-                SCContentFilter::initWithDisplay_excludingWindows(
-                    SCContentFilter::alloc(),
-                    &display,
-                    &excluded,
-                )
-            };
+            let filter = build_display_filter(content, &display, &config.excluded_window_ids);
             let scale = if *scale_factor > 0.5 {
                 *scale_factor
             } else {
@@ -417,6 +403,44 @@ fn find_display(
     Err(format!(
         "Selected display (ID {display_id}) is no longer connected"
     ))
+}
+
+fn build_display_filter(
+    content: &objc2_screen_capture_kit::SCShareableContent,
+    display: &SCDisplay,
+    extra_window_ids: &[u32],
+) -> Retained<SCContentFilter> {
+    let current_pid = std::process::id() as i32;
+    let apps = unsafe { content.applications() };
+    let mut own_apps: Vec<Retained<SCRunningApplication>> = Vec::new();
+    for i in 0..apps.count() {
+        let app = apps.objectAtIndex(i);
+        if unsafe { app.processID() } == current_pid {
+            own_apps.push(app);
+            break;
+        }
+    }
+    if !own_apps.is_empty() {
+        let excluded_apps = NSArray::from_retained_slice(&own_apps);
+        let empty_except: Retained<NSArray<SCWindow>> = NSArray::from_retained_slice(&[]);
+        return unsafe {
+            SCContentFilter::initWithDisplay_excludingApplications_exceptingWindows(
+                SCContentFilter::alloc(),
+                display,
+                &excluded_apps,
+                &empty_except,
+            )
+        };
+    }
+
+    let excluded = collect_excluded_windows(content, extra_window_ids);
+    unsafe {
+        SCContentFilter::initWithDisplay_excludingWindows(
+            SCContentFilter::alloc(),
+            display,
+            &excluded,
+        )
+    }
 }
 
 fn collect_excluded_windows(

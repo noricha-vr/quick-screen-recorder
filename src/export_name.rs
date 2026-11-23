@@ -26,12 +26,57 @@ pub fn default_export_stem_now(captured_app_name: Option<&str>) -> String {
 
 /// Sanitizes a user-edited export file stem so it cannot traverse directories, create hidden
 /// dotfiles, inject terminal/bidi control characters, duplicate the active extension, or exceed
-/// filesystem byte limits. Falls back to `fallback_stem` when the cleaned name is empty.
+/// filesystem byte limits. Falls back to a sanitized `fallback_stem` (or `Quick-Screen-Recorder`)
+/// when the cleaned name is empty.
 pub fn sanitize_export_stem(raw: &str, ext: &str, fallback_stem: &str) -> String {
-    let clean_ext = ext.trim().trim_start_matches('.');
+    let clean_ext = sanitize_export_extension(ext);
+    let cleaned = clean_single_component_stem(raw, Some(&clean_ext));
+    if !cleaned.is_empty() {
+        return cleaned;
+    }
+    let cleaned_fb = clean_single_component_stem(fallback_stem, Some(&clean_ext));
+    if !cleaned_fb.is_empty() {
+        cleaned_fb
+    } else {
+        DEFAULT_APP_FILE_TAG.to_string()
+    }
+}
+
+/// Sanitizes an export file extension to ASCII alphanumerics only (defaults to `"mp4"`).
+pub fn sanitize_export_extension(ext: &str) -> String {
+    let clean: String = ext
+        .trim()
+        .trim_start_matches('.')
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(12)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if clean.is_empty() {
+        "mp4".to_string()
+    } else {
+        clean
+    }
+}
+
+/// Builds a guaranteed single-component destination path inside `dir` for a user-editable filename
+/// stem and format extension. Atomic non-overwrite numbering (`-2`, `-3`, ...) is performed later
+/// by `ExclusiveStagingDir::commit_with_policy(true)`.
+pub fn build_export_output_path(
+    dir: &Path,
+    user_input: &str,
+    ext: &str,
+    fallback_stem: &str,
+) -> PathBuf {
+    let clean_ext = sanitize_export_extension(ext);
+    let stem = sanitize_export_stem(user_input, &clean_ext, fallback_stem);
+    dir.join(format!("{stem}.{clean_ext}"))
+}
+
+fn clean_single_component_stem(raw: &str, strip_ext: Option<&str>) -> String {
     let mut text = raw.trim();
 
-    if !clean_ext.is_empty() {
+    if let Some(clean_ext) = strip_ext.filter(|e| !e.is_empty()) {
         let dot_ext = format!(".{clean_ext}");
         if text.len() >= dot_ext.len() {
             let split_at = text.len() - dot_ext.len();
@@ -76,28 +121,10 @@ pub fn sanitize_export_stem(raw: &str, ext: &str, fallback_stem: &str) -> String
         .trim_end_matches([' ', '.']);
 
     if bounded.is_empty() || bounded == "." || bounded == ".." {
-        let safe_fb = fallback_stem.trim().trim_matches([' ', '.']);
-        if safe_fb.is_empty() {
-            DEFAULT_APP_FILE_TAG.to_string()
-        } else {
-            truncate_utf8_bytes(safe_fb, MAX_EXPORT_STEM_BYTES).to_string()
-        }
+        String::new()
     } else {
         bounded.to_string()
     }
-}
-
-/// Builds the full destination path inside `dir` for a user-editable filename stem and format extension.
-/// Atomic non-overwrite numbering (`-2`, `-3`, ...) is performed later by `ExclusiveStagingDir::commit_with_policy(true)`.
-pub fn build_export_output_path(
-    dir: &Path,
-    user_input: &str,
-    ext: &str,
-    fallback_stem: &str,
-) -> PathBuf {
-    let clean_ext = ext.trim().trim_start_matches('.');
-    let stem = sanitize_export_stem(user_input, clean_ext, fallback_stem);
-    dir.join(format!("{stem}.{clean_ext}"))
 }
 
 fn sanitize_app_tag(raw: &str) -> Option<String> {
@@ -229,5 +256,19 @@ mod tests {
         let cut = sanitize_export_stem(&huge, "mp4", fb);
         assert!(cut.len() <= MAX_EXPORT_STEM_BYTES);
         assert!(!cut.is_empty());
+
+        // Fallback and extension must also never escape `dir` or retain control/bidi chars
+        let base_dir = Path::new("/tmp/safe-exports");
+        let safe_out = build_export_output_path(
+            base_dir,
+            "   ",
+            "../evil/mp4\u{202E}",
+            "/outside/clip\n\u{202E}",
+        );
+        assert_eq!(safe_out.parent(), Some(base_dir));
+        assert_eq!(
+            safe_out.file_name().unwrap().to_str().unwrap(),
+            "outside-clip.evilmp4"
+        );
     }
 }

@@ -15,7 +15,7 @@ use crate::config::Preferences;
 use crate::export::avfoundation::{extract_rgba_frame, probe_video_metadata};
 use crate::export::{ExportFormat, ExportRequest};
 use crate::export_name::{build_export_output_path, default_export_stem_now};
-use crate::fs_safety::{format_tilde_path, is_usable_export_dir, unique_private_file_path};
+use crate::fs_safety::{format_tilde_path, is_usable_export_dir, unique_private_clipboard_dir};
 use crate::ui::clipboard::rgba_to_nsimage;
 use crate::ui::editor_controls::build_editor_controls;
 use crate::ui::editor_worker::{
@@ -229,6 +229,7 @@ impl EditorWindow {
         let save_c = controls.save_btn.clone();
         let folder_c = controls.folder_popup.clone();
         let name_c = controls.name_field.clone();
+        let win_c = window.clone();
 
         let st_save = Rc::clone(&state);
         let status_save = controls.status_label.clone();
@@ -279,20 +280,26 @@ impl EditorWindow {
                     }
                 }),
                 on_copy: Box::new(move || {
+                    let _ = win_c.makeFirstResponder(None);
+                    let raw_name = name_c.stringValue().to_string();
                     let req = {
                         let mut st = st_copy.borrow_mut();
                         if st.busy {
                             return;
                         }
-                        let Ok(out) =
-                            unique_private_file_path("ClipboardRecording", st.format.extension())
-                        else {
+                        let Ok(clip_dir) = unique_private_clipboard_dir() else {
                             status_copy.setTextColor(Some(&NSColor::systemRedColor()));
                             status_copy.setStringValue(&NSString::from_str(
-                                "Failed creating private cache file",
+                                "Failed creating private cache directory",
                             ));
                             return;
                         };
+                        let out = build_export_output_path(
+                            &clip_dir,
+                            &raw_name,
+                            st.format.extension(),
+                            &st.default_stem,
+                        );
                         st.busy = true;
                         ExportRequest {
                             input: st.input_path.clone(),

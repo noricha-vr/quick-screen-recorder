@@ -7,7 +7,7 @@ use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
-use objc2_app_kit::{NSApplication, NSWindow};
+use objc2_app_kit::{NSApplication, NSWindow, NSWindowSharingType};
 use objc2_foundation::{NSObject, NSObjectProtocol, NSTimer};
 
 use crate::permissions::{
@@ -79,6 +79,10 @@ impl OnboardingWindow {
     ) -> Self {
         let ui = Rc::new(build_onboarding_ui(mtm, initial_step));
         let window = ui.window.clone();
+        if demo_freeze_phase.is_none() {
+            // Prevent ScreenCaptureKit / WindowServer capture streams from ever recording the tutorial window.
+            window.setSharingType(NSWindowSharingType::None);
+        }
         let state = Rc::new(RefCell::new(OnboardingState {
             step: initial_step,
             permission_granted,

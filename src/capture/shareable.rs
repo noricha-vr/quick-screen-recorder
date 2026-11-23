@@ -45,6 +45,18 @@ pub struct ShareableSnapshot {
 }
 
 pub fn query_shareable_content() -> Result<ShareableSnapshot, String> {
+    query_shareable_content_with_options(true)
+}
+
+/// Queries all displays, running applications, and windows (including temporarily hidden
+/// windows belonging to our own app) so capture filters exclude them reliably.
+pub fn query_shareable_content_for_capture() -> Result<ShareableSnapshot, String> {
+    query_shareable_content_with_options(false)
+}
+
+fn query_shareable_content_with_options(
+    on_screen_windows_only: bool,
+) -> Result<ShareableSnapshot, String> {
     let (tx, rx) = mpsc::sync_channel::<Result<Retained<SCShareableContent>, String>>(1);
 
     let handler = RcBlock::new(
@@ -68,7 +80,7 @@ pub fn query_shareable_content() -> Result<ShareableSnapshot, String> {
     unsafe {
         SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
             true,
-            true,
+            on_screen_windows_only,
             &handler,
         );
     }

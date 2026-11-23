@@ -168,6 +168,24 @@ pub fn unique_private_file_path(prefix: &str, ext: &str) -> Result<PathBuf, Stri
     Ok(dir.join(format!("{prefix}-{}.{ext}", random_hex_token())))
 }
 
+/// Creates a fresh 0700 subdirectory inside our private cache dir so clipboard exports can carry
+/// the user's chosen display filename while staying isolated from other local users.
+pub fn unique_private_clipboard_dir() -> Result<PathBuf, String> {
+    let root = private_cache_dir()?;
+    let clip_dir = root.join(format!("qsr-clip-{}", random_hex_token()));
+    DirBuilder::new()
+        .mode(0o700)
+        .create(&clip_dir)
+        .map_err(|e| format!("Failed creating clipboard staging directory: {e}"))?;
+    let dfd = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&clip_dir)
+        .map_err(|e| format!("Failed opening clipboard directory: {e}"))?;
+    clear_fd_extended_acl(dfd.as_raw_fd())?;
+    Ok(clip_dir)
+}
+
 pub fn atomic_write_private(target: &Path, bytes: &[u8]) -> io::Result<()> {
     let euid = unsafe { libc::geteuid() };
     if let Ok(meta) = fs::symlink_metadata(target) {
@@ -243,20 +261,22 @@ pub fn prune_stale_cache_files(max_age: Duration) {
         }
         if meta.is_file() {
             let _ = fs::remove_file(entry.path());
-        } else if meta.is_dir()
-            && entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".qsr-work-")
-        {
-            if let Ok(dfd) = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(entry.path())
-            {
-                if unsafe { libc::flock(dfd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                    let _ = fs::remove_dir_all(entry.path());
+        } else if meta.is_dir() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with(".qsr-work-") {
+                if let Ok(dfd) = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(entry.path())
+                {
+                    if unsafe { libc::flock(dfd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                        let _ = fs::remove_dir_all(entry.path());
+                    }
                 }
+            } else if name_str.starts_with("qsr-clip-") && meta.uid() == unsafe { libc::geteuid() }
+            {
+                let _ = fs::remove_dir_all(entry.path());
             }
         }
     }
@@ -435,10 +455,29 @@ mod tests {
         let (p1, _) = s1.commit_with_policy(true).expect("commit s1");
         assert_eq!(p1.file_name().unwrap(), "demo-2026.mp4");
 
-        let s2 = ExclusiveStagingDir::create_for_target(&target, "mp4").expect("stage2");
+        let s2 = ExclusiveStagingDir::create_for_target_with_policy(&target, "mp4", true)
+            .expect("stage2");
         fs::write(s2.staged_file(), b"second").expect("write s2");
         let (p2, _) = s2.commit_with_policy(true).expect("commit s2");
         assert_eq!(p2.file_name().unwrap(), "demo-2026-2.mp4");
+
+        // Existing directory and symlink collisions must also advance safely without failing or modifying them
+        let colliding = resolved.join("collide.mp4");
+        fs::create_dir(&colliding).expect("mkdir colliding dir");
+        let link2 = resolved.join("collide-2.mp4");
+        std::os::unix::fs::symlink(resolved.join("missing.mp4"), &link2).expect("dangling link");
+        let s3 = ExclusiveStagingDir::create_for_target_with_policy(&colliding, "mp4", true)
+            .expect("stage3");
+        fs::write(s3.staged_file(), b"third").expect("write s3");
+        let (p3, _) = s3.commit_with_policy(true).expect("commit s3");
+        assert_eq!(p3.file_name().unwrap(), "collide-3.mp4");
+        assert!(colliding.is_dir());
+        assert!(
+            fs::symlink_metadata(&link2)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
 
         let _ = fs::remove_dir_all(&mock_home);
     }
