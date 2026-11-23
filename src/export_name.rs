@@ -74,18 +74,7 @@ pub fn build_export_output_path(
 }
 
 fn clean_single_component_stem(raw: &str, strip_ext: Option<&str>) -> String {
-    let mut text = raw.trim();
-
-    if let Some(clean_ext) = strip_ext.filter(|e| !e.is_empty()) {
-        let dot_ext = format!(".{clean_ext}");
-        if text.len() >= dot_ext.len() {
-            let split_at = text.len() - dot_ext.len();
-            if text.is_char_boundary(split_at) && text[split_at..].eq_ignore_ascii_case(&dot_ext) {
-                text = &text[..split_at];
-            }
-        }
-    }
-
+    let text = raw.trim();
     let mut cleaned = String::with_capacity(text.len());
     let mut prev_space = false;
     for ch in text.chars() {
@@ -108,8 +97,22 @@ fn clean_single_component_stem(raw: &str, strip_ext: Option<&str>) -> String {
         }
     }
 
+    // Strip duplicate active extension after removing control/bidi chars so `demo.mp4\u{202E}` becomes `demo`.
+    let mut normalized = cleaned.trim().to_string();
+    if let Some(clean_ext) = strip_ext.filter(|e| !e.is_empty()) {
+        let dot_ext = format!(".{clean_ext}");
+        if normalized.len() >= dot_ext.len() {
+            let split_at = normalized.len() - dot_ext.len();
+            if normalized.is_char_boundary(split_at)
+                && normalized[split_at..].eq_ignore_ascii_case(&dot_ext)
+            {
+                normalized.truncate(split_at);
+            }
+        }
+    }
+
     // Collapse traversal remnants like "..-..-etc" and strip leading dots/dashes/spaces
-    let mut normalized = cleaned.replace("..", "");
+    normalized = normalized.replace("..", "");
     while normalized.contains("--") {
         normalized = normalized.replace("--", "-");
     }
@@ -236,6 +239,7 @@ mod tests {
             sanitize_export_stem("  my-demo.MP4  ", "mp4", fb),
             "my-demo"
         );
+        assert_eq!(sanitize_export_stem("demo.mp4\u{202E}", "mp4", fb), "demo");
         assert_eq!(
             sanitize_export_stem("../../../etc/passwd", "mp4", fb),
             "etc-passwd"

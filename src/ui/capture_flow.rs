@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::rc::Rc;
 
@@ -79,13 +79,21 @@ pub(crate) fn show_selector(mtm: MainThreadMarker, runtime: &Rc<RefCell<AppRunti
     }
 }
 
+pub(crate) fn should_complete_tutorial_on_save(
+    active_tutorial_gen: Option<u64>,
+    editor_tutorial_gen: Option<u64>,
+    recording_active: bool,
+) -> bool {
+    !recording_active && active_tutorial_gen.is_some() && active_tutorial_gen == editor_tutorial_gen
+}
+
 pub(crate) fn cancel_overlay(runtime: &Rc<RefCell<AppRuntime>>) {
     let resume_tutorial = {
         let mut rt = runtime.borrow_mut();
         if let Some(ov) = rt.overlay.take() {
             ov.close();
         }
-        rt.tutorial_in_progress && has_screen_capture_permission()
+        rt.tutorial_generation.is_some() && has_screen_capture_permission()
     };
     if resume_tutorial {
         if let Some(m) = MainThreadMarker::new() {
@@ -117,7 +125,7 @@ fn start_recording_from_overlay(
         if let Some(ov) = rt.overlay.take() {
             ov.close();
         }
-        rt.tutorial_in_progress
+        rt.tutorial_generation.is_some()
     };
     let raw_out = match crate::fs_safety::unique_private_file_path("capture", "mp4") {
         Ok(p) => p,
@@ -166,7 +174,7 @@ fn start_recording_from_overlay(
 }
 
 pub(crate) fn stop_active_recording(mtm: MainThreadMarker, runtime: &Rc<RefCell<AppRuntime>>) {
-    let (session, captured_app, tutorial_hint) = {
+    let (session, captured_app, tutorial_gen) = {
         let mut rt = runtime.borrow_mut();
         if let Some(timer) = rt.rec_timer.take() {
             timer.invalidate();
@@ -180,7 +188,7 @@ pub(crate) fn stop_active_recording(mtm: MainThreadMarker, runtime: &Rc<RefCell<
         (
             rt.session.take(),
             rt.active_capture_app.take(),
-            rt.tutorial_in_progress,
+            rt.tutorial_generation,
         )
     };
     let Some(sess) = session else {
@@ -189,7 +197,7 @@ pub(crate) fn stop_active_recording(mtm: MainThreadMarker, runtime: &Rc<RefCell<
     match sess.stop() {
         Ok(saved_path) => {
             if let Err(err) =
-                open_editor_for_file(mtm, runtime, &saved_path, captured_app, tutorial_hint)
+                open_editor_for_file(mtm, runtime, &saved_path, captured_app, tutorial_gen)
             {
                 show_error_alert(mtm, "Failed Opening Editor", &err);
             }
@@ -203,10 +211,42 @@ pub(crate) fn open_editor_for_file(
     runtime: &Rc<RefCell<AppRuntime>>,
     video_path: &Path,
     captured_app_name: Option<String>,
-    tutorial_hint: bool,
+    tutorial_gen: Option<u64>,
 ) -> Result<(), String> {
     let prefs = runtime.borrow().prefs.clone();
     let (rt_dir, rt_saved) = (Rc::clone(runtime), Rc::clone(runtime));
+    let on_export_saved: Rc<dyn Fn(PathBuf)> = if let Some(editor_gen) = tutorial_gen {
+        Rc::new(move |saved_path| {
+            let celebrate = {
+                let mut rt = rt_saved.borrow_mut();
+                if should_complete_tutorial_on_save(
+                    rt.tutorial_generation,
+                    Some(editor_gen),
+                    rt.session.is_some(),
+                ) {
+                    rt.prefs.onboarding_completed = true;
+                    let _ = rt.prefs.save();
+                    rt.tutorial_generation = None;
+                    true
+                } else {
+                    false
+                }
+            };
+            if celebrate {
+                if let Some(m) = MainThreadMarker::new() {
+                    open_onboarding(
+                        m,
+                        &rt_saved,
+                        Some(OnboardingStep::Completed),
+                        Some(saved_path),
+                        false,
+                    );
+                }
+            }
+        })
+    } else {
+        Rc::new(|_| {})
+    };
     let editor = EditorWindow::open(
         mtm,
         video_path,
@@ -214,36 +254,13 @@ pub(crate) fn open_editor_for_file(
         EditorOpenOptions {
             captured_app_name,
             demo_showcase: false,
-            tutorial_hint,
+            tutorial_hint: tutorial_gen.is_some(),
             on_export_dir_change: Rc::new(move |new_dir| {
                 if let Some(m) = MainThreadMarker::new() {
                     apply_export_dir_change(m, &rt_dir, new_dir);
                 }
             }),
-            on_export_saved: Rc::new(move |saved_path| {
-                let celebrate = {
-                    let mut rt = rt_saved.borrow_mut();
-                    if rt.tutorial_in_progress {
-                        rt.prefs.onboarding_completed = true;
-                        let _ = rt.prefs.save();
-                        rt.tutorial_in_progress = false;
-                        true
-                    } else {
-                        false
-                    }
-                };
-                if celebrate {
-                    if let Some(m) = MainThreadMarker::new() {
-                        open_onboarding(
-                            m,
-                            &rt_saved,
-                            Some(OnboardingStep::Completed),
-                            Some(saved_path),
-                            false,
-                        );
-                    }
-                }
-            }),
+            on_export_saved,
         },
     )?;
     let app = NSApplication::sharedApplication(mtm);
@@ -251,4 +268,24 @@ pub(crate) fn open_editor_for_file(
     app.activateIgnoringOtherApps(true);
     runtime.borrow_mut().editors.push(editor);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unrelated_or_stale_editor_save_never_completes_tutorial() {
+        // Non-tutorial editor opened earlier must not complete an active tutorial (even mid-recording)
+        assert!(!should_complete_tutorial_on_save(Some(1), None, false));
+        assert!(!should_complete_tutorial_on_save(Some(1), None, true));
+        // Previous tutorial generation editor must not complete a restarted tutorial
+        assert!(!should_complete_tutorial_on_save(Some(2), Some(1), false));
+        // Even a matching editor must not complete while another recording is actively running
+        assert!(!should_complete_tutorial_on_save(Some(2), Some(2), true));
+        // Matching tutorial editor after recording stopped completes cleanly
+        assert!(should_complete_tutorial_on_save(Some(2), Some(2), false));
+        // No active tutorial -> never completes
+        assert!(!should_complete_tutorial_on_save(None, Some(2), false));
+    }
 }

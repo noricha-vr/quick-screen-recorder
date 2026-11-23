@@ -49,7 +49,8 @@ pub(crate) struct AppRuntime {
     pub(crate) prefs: Preferences,
     pub(crate) status_bar: Option<StatusBarController>,
     pub(crate) onboarding: Option<OnboardingWindow>,
-    pub(crate) tutorial_in_progress: bool,
+    pub(crate) tutorial_generation: Option<u64>,
+    pub(crate) next_tutorial_gen: u64,
     pub(crate) overlay: Option<SelectorOverlay>,
     pub(crate) session: Option<RecordingSession>,
     pub(crate) active_capture_app: Option<String>,
@@ -85,7 +86,8 @@ pub fn run_gui(
         prefs,
         status_bar: None,
         onboarding: None,
-        tutorial_in_progress: false,
+        tutorial_generation: None,
+        next_tutorial_gen: 1,
         overlay: None,
         session: None,
         active_capture_app: None,
@@ -104,7 +106,7 @@ pub fn run_gui(
     install_shortcut_monitors(&runtime);
 
     if let Some(video_path) = open_editor {
-        open_editor_for_file(mtm, &runtime, &video_path, None, false)?;
+        open_editor_for_file(mtm, &runtime, &video_path, None, None)?;
     } else if open_selector {
         show_selector(mtm, &runtime);
     } else if show_first_run {
@@ -129,7 +131,7 @@ fn build_status_bar_callbacks(runtime: &Rc<RefCell<AppRuntime>>) -> StatusBarCal
         on_primary_click: Box::new(move |m| toggle_select_or_stop(m, &rt_p)),
         on_open_video: Box::new(move |m| {
             if let Some(path) = choose_video_file(m) {
-                if let Err(err) = open_editor_for_file(m, &rt_o, &path, None, false) {
+                if let Err(err) = open_editor_for_file(m, &rt_o, &path, None, None) {
                     show_error_alert(m, "Cannot Open Video", &err);
                 }
             }
@@ -170,7 +172,15 @@ fn build_status_bar_callbacks(runtime: &Rc<RefCell<AppRuntime>>) -> StatusBarCal
             }
         }),
         on_open_guide: Box::new(move |m| {
-            let is_rec = rt_g.borrow().session.is_some();
+            let is_rec = {
+                let mut rt = rt_g.borrow_mut();
+                let rec = rt.session.is_some();
+                if !rec {
+                    // Start a fresh tutorial generation so any previously open editor cannot complete it.
+                    rt.tutorial_generation = None;
+                }
+                rec
+            };
             let step = is_rec.then_some(OnboardingStep::RecordingInProgress);
             open_onboarding(m, &rt_g, step, None, is_rec);
         }),
@@ -190,7 +200,13 @@ pub(crate) fn open_onboarding(
     let perm_display = granted || step == OnboardingStep::Completed;
     {
         let mut rt = runtime.borrow_mut();
-        rt.tutorial_in_progress = !matches!(step, OnboardingStep::Completed);
+        if matches!(step, OnboardingStep::Completed) {
+            rt.tutorial_generation = None;
+        } else if rt.tutorial_generation.is_none() {
+            let gen_id = rt.next_tutorial_gen;
+            rt.next_tutorial_gen = rt.next_tutorial_gen.wrapping_add(1).max(1);
+            rt.tutorial_generation = Some(gen_id);
+        }
         if let Some(ob) = &rt.onboarding {
             ob.show_step(mtm, step, perm_display, saved_path, dock_top_right);
             return;
@@ -225,7 +241,7 @@ fn complete_and_close_onboarding(runtime: &Rc<RefCell<AppRuntime>>) {
     let mut rt = runtime.borrow_mut();
     rt.prefs.onboarding_completed = true;
     let _ = rt.prefs.save();
-    rt.tutorial_in_progress = false;
+    rt.tutorial_generation = None;
     if let Some(ob) = &rt.onboarding {
         ob.close();
     }
