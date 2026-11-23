@@ -110,3 +110,24 @@ where
         }
     }
 }
+
+/// Registers a local AppKit keyDown monitor that intercepts Escape (keyCode 53) when `on_escape` returns `true`.
+pub fn register_local_escape_monitor<F>(on_escape: F)
+where
+    F: Fn() -> bool + 'static,
+{
+    use block2::RcBlock;
+    use objc2_app_kit::{NSEvent, NSEventMask};
+    use std::ptr::NonNull;
+
+    let block = RcBlock::new(move |ev: NonNull<NSEvent>| -> *mut NSEvent {
+        let event = unsafe { ev.as_ref() };
+        if event.keyCode() == 53 && on_escape() {
+            return ptr::null_mut();
+        }
+        ev.as_ptr()
+    });
+    unsafe {
+        let _ = NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &block);
+    }
+}

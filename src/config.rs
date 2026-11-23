@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::capture::{AudioCaptureMode, RecordingCodec};
 use crate::export::ExportFormat;
 use crate::fs_safety::{
-    atomic_write_private, default_desktop_export_dir, ensure_private_dir, is_usable_export_dir,
+    atomic_write_private, default_movies_export_dir, ensure_private_dir, is_usable_export_dir,
     valid_home_dir,
 };
 use crate::geometry::{AspectRatio, Rect};
@@ -29,6 +29,8 @@ pub struct Preferences {
     pub export_max_width: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub export_dir: Option<PathBuf>,
+    #[serde(default)]
+    pub onboarding_completed: bool,
 }
 
 impl Default for Preferences {
@@ -44,19 +46,20 @@ impl Default for Preferences {
             default_export_format: ExportFormat::Mp4,
             export_max_width: None,
             export_dir: None,
+            onboarding_completed: false,
         }
     }
 }
 
 impl Preferences {
-    /// Resolves the pre-selected persistent export destination directory, defaulting to `~/Desktop`.
+    /// Resolves the pre-selected persistent export destination directory, defaulting to `~/Movies/Quick Screen Recorder`.
     pub fn resolved_export_dir(&self) -> Option<PathBuf> {
         if let Some(dir) = &self.export_dir {
             if is_usable_export_dir(dir) {
                 return Some(dir.clone());
             }
         }
-        default_desktop_export_dir()
+        default_movies_export_dir()
     }
     pub fn default_path() -> Option<PathBuf> {
         let home = valid_home_dir()?;
@@ -163,13 +166,14 @@ mod tests {
             default_export_format: ExportFormat::Gif,
             export_max_width: Some(800),
             export_dir: None,
+            onboarding_completed: true,
         };
         prefs.save_to(&tmp).expect("save preferences");
         let raw = std::fs::read_to_string(&tmp).expect("read raw json");
         assert!(!raw.contains("/Users/"));
         let loaded = Preferences::load_from(&tmp).expect("load preferences");
         assert_eq!(loaded, prefs);
-        assert_eq!(loaded.resolved_export_dir(), default_desktop_export_dir());
+        assert_eq!(loaded.resolved_export_dir(), default_movies_export_dir());
 
         let custom_dir = dir.join("exports");
         std::fs::create_dir_all(&custom_dir).expect("mkdir exports");
@@ -192,23 +196,26 @@ mod tests {
         std::os::unix::fs::symlink(&tmp, &link).expect("symlink");
         assert!(Preferences::load_from(&link).is_err());
 
-        // Overlay snapshot merge must preserve concurrent export_dir and recording_codec updates
+        // Overlay snapshot merge must preserve concurrent export_dir, recording_codec, and onboarding_completed updates
         let stale_overlay_snapshot = Preferences {
             fps: 30,
             export_dir: None,
             recording_codec: RecordingCodec::H264,
+            onboarding_completed: false,
             ..Preferences::default()
         };
         let mut live = Preferences {
             fps: 60,
             export_dir: Some(PathBuf::from("/tmp/preserved-dir")),
             recording_codec: RecordingCodec::Hevc,
+            onboarding_completed: true,
             ..Preferences::default()
         };
         live.merge_capture_selection(&stale_overlay_snapshot);
         assert_eq!(live.fps, 30);
         assert_eq!(live.export_dir, Some(PathBuf::from("/tmp/preserved-dir")));
         assert_eq!(live.recording_codec, RecordingCodec::Hevc);
+        assert!(live.onboarding_completed);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

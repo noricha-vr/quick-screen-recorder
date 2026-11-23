@@ -5,6 +5,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-24
+
+### Added
+
+- **First-run Screen Recording onboarding & interactive tutorial** (`OnboardingWindow` + `QSRTutorialVisualView`):
+  - Opens automatically on first launch (and anytime via **`◉ Rec` → `Quick Start Guide...`** or when attempting to record without permission).
+  - Live permission status card (amber **Not Enabled** -> vivid green **Enabled** with live polling and instant update after macOS **Quit & Reopen**) plus a one-click **`Open Screen Recording Settings`** button linking directly to **System Settings > Privacy & Security > Screen & System Audio Recording**.
+  - Animated CoreGraphics walkthrough illustrating the top-right `◉ Rec` menu bar dropdown -> `New Recording...` (`⇧⌘6`) -> `Stop Recording` -> export flow, concluding with a green completion card and **`Show in Finder`** action.
+- **Editable `Name` field & live extension badge** in the Trim & Export editor, pre-filled with chronological, Spotlight-friendly names (`YYYY-MM-DD_HH-MM-SS_Quick-Screen-Recorder`, plus sanitized target app name on Window captures) with path-traversal, dotfile, bidi, duplicate-extension, and UTF-8 byte-length sanitization.
+
+### Changed
+
+- Changed the default export directory from `~/Desktop` to **`~/Movies/Quick Screen Recorder`** (auto-created privately if absent) and placed it first in both the editor `Save to` dropdown and the menu bar `Save Folder` submenu.
+- Preserved numeric suffixes in custom export filenames during atomic collision numbering (e.g., `demo-2026.mp4` collides to `demo-2026-2.mp4` instead of stripping `-2026`).
+
 ## [0.2.1] - 2026-11-21
 
 ### Added

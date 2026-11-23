@@ -1,12 +1,13 @@
 use std::ffi::{CStr, CString};
-use std::fs;
+use std::fs::{self, DirBuilder};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::ptr;
 
 use crate::config::APP_SUPPORT_DIR_NAME;
+use crate::export_name::APP_DISPLAY_NAME;
 use crate::fs_safety::ensure_private_dir;
 
 const ACL_TYPE_EXTENDED: libc::c_int = 0x0000_0100;
@@ -58,17 +59,37 @@ fn pwuid_home_dir() -> Option<PathBuf> {
     p.is_absolute().then_some(p)
 }
 
-/// Returns `~/Desktop` when available as a verified writable persistent directory owned by the current user,
-/// falling back to `HOME` or `~/Library/Application Support/QuickScreenRecorder/Exports`.
+/// Returns `~/Movies/Quick Screen Recorder` (creating it privately if needed) when available as a
+/// verified writable persistent directory owned by the current user, falling back safely to
+/// `~/Movies`, `~/Desktop`, `HOME`, or `~/Library/Application Support/QuickScreenRecorder/Exports`.
 /// Never falls back to `/tmp` or auto-pruned cache directories (`None` prompts user to pick a folder).
-pub fn default_desktop_export_dir() -> Option<PathBuf> {
+pub fn default_movies_export_dir() -> Option<PathBuf> {
     let home = valid_home_dir()?;
+    default_export_dir_in_home(&home)
+}
+
+pub fn default_export_dir_in_home(home: &Path) -> Option<PathBuf> {
+    let movies = home.join("Movies");
+    if is_usable_export_dir(&movies) {
+        let app_dir = movies.join(APP_DISPLAY_NAME);
+        match fs::symlink_metadata(&app_dir) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let _ = DirBuilder::new().mode(0o700).create(&app_dir);
+            }
+            Err(_) => {}
+        }
+        if is_usable_export_dir(&app_dir) {
+            return Some(app_dir);
+        }
+        return Some(movies);
+    }
     let desktop = home.join("Desktop");
     if is_usable_export_dir(&desktop) {
         return Some(desktop);
     }
-    if is_usable_export_dir(&home) {
-        return Some(home);
+    if is_usable_export_dir(home) {
+        return Some(home.to_path_buf());
     }
     let app_exports = home
         .join("Library")

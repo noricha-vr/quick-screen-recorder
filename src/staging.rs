@@ -231,16 +231,15 @@ impl ExclusiveStagingDir {
             .canon_dest
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("Recording");
-        let base_stem = strip_numeric_collision_suffix(raw_stem);
+            .unwrap_or("Quick-Screen-Recorder");
 
         for suffix in 2..=9999_u32 {
-            let candidate = format!("{base_stem}-{suffix}.{ext}");
+            let candidate = format!("{raw_stem}-{suffix}.{ext}");
             if self.try_publish_excl(&candidate, &mut xdev_guard)? {
                 return Ok(candidate);
             }
         }
-        let fallback = format!("{base_stem}-{}.{ext}", random_hex_token());
+        let fallback = format!("{raw_stem}-{}.{ext}", random_hex_token());
         if self.try_publish_excl(&fallback, &mut xdev_guard)? {
             Ok(fallback)
         } else {
@@ -299,19 +298,6 @@ impl Drop for ExclusiveStagingDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.stage_dir_path);
     }
-}
-
-fn strip_numeric_collision_suffix(stem: &str) -> &str {
-    if let Some((prefix, tail)) = stem.rsplit_once('-') {
-        if (1..=4).contains(&tail.len()) && tail.chars().all(|c| c.is_ascii_digit()) {
-            let looks_like_date =
-                prefix.len() >= 7 && prefix.as_bytes()[prefix.len() - 3] == b'-' && tail.len() == 2;
-            if !looks_like_date {
-                return prefix;
-            }
-        }
-    }
-    stem
 }
 
 fn fstatat_overwrite_mode(dir_fd: libc::c_int, name_c: &CString, euid: u32) -> Result<u32, String> {

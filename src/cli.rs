@@ -45,6 +45,11 @@ pub enum DemoMode {
         input: PathBuf,
         screenshot_out: Option<PathBuf>,
     },
+    Onboarding {
+        granted: bool,
+        completed: bool,
+        screenshot_out: Option<PathBuf>,
+    },
 }
 
 pub fn parse_args<I, S>(args: I) -> Result<Command, String>
@@ -118,6 +123,19 @@ fn parse_gui_flags(args: &[String]) -> Result<Command, String> {
                 }
                 demo_mode = Some(DemoMode::Editor {
                     input: PathBuf::from(input),
+                    screenshot_out: shot,
+                });
+            }
+            "--demo-onboarding" | "--demo-onboarding-ready" | "--demo-onboarding-done" => {
+                let flag = args[i].as_str();
+                let mut shot = None;
+                if args.get(i + 1).is_some_and(|s| !s.starts_with("--")) {
+                    i += 1;
+                    shot = Some(PathBuf::from(&args[i]));
+                }
+                demo_mode = Some(DemoMode::Onboarding {
+                    granted: flag != "--demo-onboarding",
+                    completed: flag == "--demo-onboarding-done",
                     screenshot_out: shot,
                 });
             }

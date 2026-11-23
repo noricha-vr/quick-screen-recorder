@@ -20,6 +20,7 @@ pub struct StatusBarCallbacks {
     pub on_select_export_dir: Box<dyn Fn(MainThreadMarker, PathBuf)>,
     pub on_choose_export_folder: Box<dyn Fn(MainThreadMarker)>,
     pub on_toggle_codec: Box<dyn Fn(MainThreadMarker)>,
+    pub on_open_guide: Box<dyn Fn(MainThreadMarker)>,
     pub on_quit: Box<dyn Fn(MainThreadMarker)>,
 }
 
@@ -68,6 +69,11 @@ define_class!(
         #[unsafe(method(onToggleCodecAction:))]
         fn on_toggle_codec_action(&self, _sender: Option<&AnyObject>) {
             (self.ivars().callbacks.on_toggle_codec)(self.mtm());
+        }
+
+        #[unsafe(method(onOpenGuideAction:))]
+        fn on_open_guide_action(&self, _sender: Option<&AnyObject>) {
+            (self.ivars().callbacks.on_open_guide)(self.mtm());
         }
 
         #[unsafe(method(onQuitAction:))]
@@ -167,6 +173,19 @@ impl StatusBarController {
         }
         menu.addItem(&codec_item);
 
+        let guide_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str("Quick Start Guide..."),
+                Some(sel!(onOpenGuideAction:)),
+                &NSString::from_str(""),
+            )
+        };
+        unsafe {
+            guide_item.setTarget(Some(&handler));
+        }
+        menu.addItem(&guide_item);
+
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 
         let quit_item = unsafe {
@@ -223,7 +242,7 @@ impl StatusBarController {
 
     pub fn set_export_dir(&self, mtm: MainThreadMarker, current: Option<&Path>) {
         let header = match current.filter(|d| is_usable_export_dir(d)) {
-            Some(dir) => format!("Save Folder: {}", compact_tilde_folder(dir, 24)),
+            Some(dir) => format!("Save Folder: {}", compact_tilde_folder(dir, 32)),
             None => "Save Folder: Choose...".to_string(),
         };
         self.folder_item.setTitle(&NSString::from_str(&header));

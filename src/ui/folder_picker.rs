@@ -4,11 +4,14 @@ use std::path::{Path, PathBuf};
 
 use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSColor, NSMenuItem, NSModalResponseOK, NSOpenPanel, NSPopUpButton, NSTextField,
+    NSAlert, NSApplication, NSColor, NSMenuItem, NSModalResponseOK, NSOpenPanel, NSPopUpButton,
+    NSTextField,
 };
 use objc2_foundation::{NSString, NSURL};
 
-use crate::fs_safety::{format_tilde_path, is_usable_export_dir, valid_home_dir};
+use crate::fs_safety::{
+    default_movies_export_dir, format_tilde_path, is_usable_export_dir, valid_home_dir,
+};
 use crate::ui::editor_worker::EditorState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,13 +26,20 @@ pub enum FolderMenuItem {
     ChooseCustom,
 }
 
-/// Returns verified, canonicalized standard macOS export folders owned by the current user.
+/// Returns verified, canonicalized standard macOS export folders owned by the current user,
+/// starting with `~/Movies/Quick Screen Recorder`.
 pub fn preset_export_dirs() -> Vec<PathBuf> {
+    let mut out = Vec::with_capacity(5);
+    if let Some(app_movies) = default_movies_export_dir() {
+        let canon = fs::canonicalize(&app_movies).unwrap_or(app_movies);
+        if is_usable_export_dir(&canon) && !out.contains(&canon) {
+            out.push(canon);
+        }
+    }
     let Some(home) = valid_home_dir() else {
-        return Vec::new();
+        return out;
     };
-    let mut out = Vec::with_capacity(4);
-    for sub in ["Desktop", "Movies", "Downloads", "Documents"] {
+    for sub in ["Movies", "Desktop", "Downloads", "Documents"] {
         let cand = home.join(sub);
         if is_usable_export_dir(&cand) {
             let canon = fs::canonicalize(&cand).unwrap_or(cand);
@@ -132,8 +142,8 @@ pub fn live_folder_menu_model(
         return (
             vec![
                 FolderMenuItem::Dir {
-                    path: PathBuf::from("~/Desktop"),
-                    label: "~/Desktop".to_string(),
+                    path: PathBuf::from("~/Movies/Quick Screen Recorder"),
+                    label: "~/Movies/Quick Screen Recorder".to_string(),
                     selected: true,
                 },
                 FolderMenuItem::Separator,
@@ -153,7 +163,7 @@ pub fn populate_folder_popup(
     demo_showcase: bool,
 ) -> Vec<FolderMenuItem> {
     popup.removeAllItems();
-    let (items, selected_idx) = live_folder_menu_model(current, demo_showcase, 28);
+    let (items, selected_idx) = live_folder_menu_model(current, demo_showcase, 34);
 
     if let Some(menu) = popup.menu() {
         menu.setAutoenablesItems(false);
@@ -269,6 +279,30 @@ pub fn choose_export_directory(
     } else {
         Some(Err("Selected destination is not a valid folder"))
     }
+}
+
+pub fn choose_video_file(mtm: MainThreadMarker) -> Option<PathBuf> {
+    let app = NSApplication::sharedApplication(mtm);
+    #[allow(deprecated)]
+    app.activateIgnoringOtherApps(true);
+    let panel = NSOpenPanel::openPanel(mtm);
+    panel.setCanChooseFiles(true);
+    panel.setCanChooseDirectories(false);
+    panel.setAllowsMultipleSelection(false);
+    if panel.runModal() != NSModalResponseOK {
+        return None;
+    }
+    panel
+        .URL()
+        .and_then(|u| u.path())
+        .map(|p| PathBuf::from(p.to_string()))
+}
+
+pub fn show_error_alert(mtm: MainThreadMarker, title: &str, message: &str) {
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str(title));
+    alert.setInformativeText(&NSString::from_str(message));
+    alert.runModal();
 }
 
 #[allow(clippy::too_many_arguments)]

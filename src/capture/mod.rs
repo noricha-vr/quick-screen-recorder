@@ -84,4 +84,5 @@ pub struct CaptureConfig {
     pub highlight_clicks: bool,
     pub audio_mode: AudioCaptureMode,
     pub excluded_window_ids: Vec<u32>,
+    pub source_app_name: Option<String>,
 }
