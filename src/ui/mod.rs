@@ -39,7 +39,9 @@ use crate::ui::capture_flow::{
 use crate::ui::demo::run_demo_flow;
 use crate::ui::editor::EditorWindow;
 use crate::ui::folder_picker::{choose_export_directory, choose_video_file, show_error_alert};
-use crate::ui::hotkey::{register_global_cmd_shift_6, register_local_escape_monitor};
+use crate::ui::hotkey::{
+    install_standard_edit_menu, register_global_cmd_shift_6, register_local_escape_monitor,
+};
 use crate::ui::onboarding::{OnboardingCallbacks, OnboardingWindow};
 use crate::ui::onboarding_visual::OnboardingStep;
 use crate::ui::overlay::SelectorOverlay;
@@ -72,6 +74,7 @@ pub fn run_gui(
         NSApplicationActivationPolicy::Accessory
     };
     app.setActivationPolicy(policy);
+    install_standard_edit_menu(mtm);
     crate::fs_safety::prune_stale_cache_files(std::time::Duration::from_secs(24 * 3600));
 
     if let Some(demo) = demo_mode {
