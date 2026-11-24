@@ -255,13 +255,21 @@ fn launch_recording_session(
                     let Some(m) = MainThreadMarker::new() else {
                         return;
                     };
-                    let r = rt_tick.borrow();
-                    if let (Some(sess), Some(sb)) = (&r.session, &r.status_bar) {
-                        sb.set_recording_elapsed(
-                            m,
-                            sess.elapsed().as_secs(),
-                            sess.timelapse_frames(),
-                        );
+                    let worker_aborted = {
+                        let r = rt_tick.borrow();
+                        if let (Some(sess), Some(sb)) = (&r.session, &r.status_bar) {
+                            sb.set_recording_elapsed(
+                                m,
+                                sess.elapsed().as_secs(),
+                                sess.timelapse_frames(),
+                            );
+                            sess.has_ended_unexpectedly()
+                        } else {
+                            false
+                        }
+                    };
+                    if worker_aborted {
+                        stop_active_recording(m, &rt_tick);
                     }
                 });
                 rt.rec_timer = Some(unsafe {

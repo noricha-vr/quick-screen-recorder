@@ -23,6 +23,9 @@ use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString, NSURL};
 use crate::capture::RecordingCodec;
 use crate::export::avfoundation::RgbaFrame;
 
+/// Maximum time [`StreamingMp4Writer::finish`] waits for `AVAssetWriter` container finalization.
+pub const WRITER_FINISH_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Incremental hardware H.264 / HEVC `.mp4` writer backed by `AVAssetWriter`.
 /// Keeps memory bounded to a single frame even across multi-hour timelapses or 4K transcodes.
 pub struct StreamingMp4Writer {
@@ -185,7 +188,7 @@ impl StreamingMp4Writer {
             self.writer.endSessionAtSourceTime(end_pts);
             self.writer.finishWritingWithCompletionHandler(&block);
         }
-        rx.recv_timeout(Duration::from_secs(60))
+        rx.recv_timeout(WRITER_FINISH_TIMEOUT)
             .map_err(|_| "Timed out finalizing MP4 with AVAssetWriter".to_string())?;
 
         let status = unsafe { self.writer.status() };

@@ -172,6 +172,13 @@ impl ActiveRecording {
         }
     }
 
+    pub fn has_ended_unexpectedly(&self) -> bool {
+        match self {
+            Self::RealTime(_) => false,
+            Self::Timelapse(s) => s.has_worker_exited(),
+        }
+    }
+
     pub fn begin_stop(self) -> PendingStop {
         match self {
             Self::RealTime(s) => PendingStop::RealTime(s.begin_stop()),

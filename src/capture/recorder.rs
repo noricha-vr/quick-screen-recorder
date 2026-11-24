@@ -234,8 +234,14 @@ impl RecordingSession {
             stream.startCaptureWithCompletionHandler(Some(&start_block));
         }
 
-        rx.recv_timeout(Duration::from_secs(8))
-            .map_err(|_| "Timed out starting ScreenCaptureKit stream".to_string())??;
+        match rx.recv_timeout(Duration::from_secs(8)) {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                unsafe { stream.stopCaptureWithCompletionHandler(None) };
+                return Err("Timed out starting ScreenCaptureKit stream".to_string());
+            }
+        }
 
         {
             let (lock, cvar) = &*signal;
