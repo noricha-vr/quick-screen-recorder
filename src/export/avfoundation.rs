@@ -240,7 +240,7 @@ fn stream_video_only_transcode(
     Ok(())
 }
 
-fn transcode_frame_count(duration_sec: f64, fps: u32) -> usize {
+pub(crate) fn transcode_frame_count(duration_sec: f64, fps: u32) -> usize {
     let exact = duration_sec.max(0.02) * f64::from(fps.max(1));
     // Include every frame slot whose PTS `i / fps` falls inside `[0, duration_sec)`,
     // guarding against floating-point overshoot on exact multiples like `1.0 * 30`.

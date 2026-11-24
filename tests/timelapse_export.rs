@@ -1,4 +1,5 @@
-use std::fs;
+use std::fs::{self, File};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use quick_screen_recorder::capture::{RecordingCodec, TIMELAPSE_PLAYBACK_FPS};
@@ -178,5 +179,91 @@ fn streaming_timelapse_and_low_fps_exports_preserve_duration_and_cadence() {
         five_meta.nominal_fps
     );
 
+    // 3. Low-FPS GIF & APNG exports preserve non-integer trimmed durations (1.5s & 0.7s @ 1 fps)
+    for (label, start, end, expected_frames, expected_secs) in [
+        ("1_5s", 0.0_f64, 1.5_f64, 2_usize, 1.5_f64),
+        ("0_7s", 0.2_f64, 0.9_f64, 1_usize, 0.7_f64),
+    ] {
+        let gif_out = work.join(format!("low_fps_{label}.gif"));
+        run_export(&ExportRequest {
+            input: src_mp4.clone(),
+            output: gif_out.clone(),
+            format: ExportFormat::Gif,
+            fps: 1,
+            start_sec: Some(start),
+            end_sec: Some(end),
+            max_width: Some(160),
+            mute_audio: false,
+        })
+        .expect("export low-fps gif");
+        let (gif_frames, gif_secs) = read_gif_frame_count_and_duration(&gif_out);
+        assert_eq!(gif_frames, expected_frames, "GIF {label} frame count");
+        assert!(
+            (gif_secs - expected_secs).abs() <= 0.02,
+            "GIF {label} @ 1 fps should play for {expected_secs}s, got {gif_secs}s"
+        );
+
+        let apng_out = work.join(format!("low_fps_{label}.apng"));
+        run_export(&ExportRequest {
+            input: src_mp4.clone(),
+            output: apng_out.clone(),
+            format: ExportFormat::Apng,
+            fps: 1,
+            start_sec: Some(start),
+            end_sec: Some(end),
+            max_width: Some(160),
+            mute_audio: false,
+        })
+        .expect("export low-fps apng");
+        let (apng_frames, apng_secs) = read_apng_frame_count_and_duration(&apng_out);
+        assert_eq!(apng_frames, expected_frames, "APNG {label} frame count");
+        assert!(
+            (apng_secs - expected_secs).abs() <= 0.01,
+            "APNG {label} @ 1 fps should play for {expected_secs}s, got {apng_secs}s"
+        );
+    }
+
     let _ = fs::remove_dir_all(&work);
+}
+
+fn read_gif_frame_count_and_duration(path: &Path) -> (usize, f64) {
+    let file = File::open(path).expect("open gif");
+    let mut decoder = gif::DecodeOptions::new()
+        .read_info(BufReader::new(file))
+        .expect("decode gif header");
+    let mut count = 0_usize;
+    let mut total_cs = 0_u64;
+    while let Some(frame) = decoder.read_next_frame().expect("read gif frame") {
+        count += 1;
+        total_cs += u64::from(frame.delay);
+    }
+    (count, (total_cs as f64) / 100.0)
+}
+
+fn read_apng_frame_count_and_duration(path: &Path) -> (usize, f64) {
+    let bytes = fs::read(path).expect("read apng bytes");
+    assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+    let mut pos = 8_usize;
+    let mut count = 0_usize;
+    let mut total_secs = 0.0_f64;
+    while pos + 12 <= bytes.len() {
+        let len = u32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        let chunk_type = &bytes[pos + 4..pos + 8];
+        let data_start = pos + 8;
+        let data_end = data_start + len;
+        if data_end + 4 > bytes.len() {
+            break;
+        }
+        if chunk_type == b"fcTL" && len >= 26 {
+            let num =
+                u16::from_be_bytes(bytes[data_start + 20..data_start + 22].try_into().unwrap());
+            let raw_den =
+                u16::from_be_bytes(bytes[data_start + 22..data_start + 24].try_into().unwrap());
+            let den = if raw_den == 0 { 100_u16 } else { raw_den };
+            count += 1;
+            total_secs += f64::from(num) / f64::from(den);
+        }
+        pos = data_end + 4;
+    }
+    (count, total_secs)
 }

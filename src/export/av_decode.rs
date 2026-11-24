@@ -10,6 +10,7 @@ use objc2_core_graphics::{
 
 use crate::export::avfoundation::{
     MAX_ANIMATED_FRAMES, open_restricted_asset, probe_video_metadata, secs_to_cmtime,
+    transcode_frame_count,
 };
 use crate::geometry::scaled_even_dimensions;
 
@@ -69,8 +70,8 @@ where
     let (target_w, target_h) = scaled_even_dimensions(meta.width, meta.height, capped_max);
     let clamped_fps = fps.clamp(1, 60);
     let frame_step = 1.0 / f64::from(clamped_fps);
-    let duration = (end_sec - start_sec).max(frame_step);
-    let requested_count = ((duration * f64::from(clamped_fps)).round() as usize).max(1);
+    let duration = (end_sec - start_sec).max(0.02);
+    let requested_count = transcode_frame_count(duration, clamped_fps);
 
     if requested_count > MAX_ANIMATED_FRAMES {
         return Err(format!(
