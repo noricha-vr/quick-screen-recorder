@@ -1,9 +1,18 @@
 pub mod audio_devices;
+pub mod cadence;
 mod filter;
 pub mod recorder;
 pub mod shareable;
+pub mod timelapse;
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+pub use cadence::{CaptureCadence, TIMELAPSE_PLAYBACK_FPS};
+use recorder::{PendingRecordingStop, RecordingSession, StopPollState};
+use timelapse::{PendingTimelapseStop, TimelapseSession};
 
 use crate::geometry::Rect;
 
@@ -114,7 +123,7 @@ pub enum CaptureTarget {
 #[derive(Debug, Clone)]
 pub struct CaptureConfig {
     pub target: CaptureTarget,
-    pub fps: u32,
+    pub cadence: CaptureCadence,
     pub codec: RecordingCodec,
     pub show_cursor: bool,
     pub highlight_clicks: bool,
@@ -122,4 +131,74 @@ pub struct CaptureConfig {
     pub microphone_device_id: Option<String>,
     pub excluded_window_ids: Vec<u32>,
     pub source_app_name: Option<String>,
+}
+
+/// Unified handle for either real-time (`SCRecordingOutput`) or interval timelapse capture.
+pub enum ActiveRecording {
+    RealTime(RecordingSession),
+    Timelapse(TimelapseSession),
+}
+
+pub enum PendingStop {
+    RealTime(PendingRecordingStop),
+    Timelapse(PendingTimelapseStop),
+}
+
+impl ActiveRecording {
+    pub fn start(config: &CaptureConfig, output_path: &Path) -> Result<Self, String> {
+        match config.cadence.normalized() {
+            CaptureCadence::RealTime { .. } => Ok(Self::RealTime(RecordingSession::start(
+                config,
+                output_path,
+            )?)),
+            CaptureCadence::Timelapse { .. } => Ok(Self::Timelapse(TimelapseSession::start(
+                config,
+                output_path,
+            )?)),
+        }
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        match self {
+            Self::RealTime(s) => s.elapsed(),
+            Self::Timelapse(s) => s.elapsed(),
+        }
+    }
+
+    pub fn timelapse_frames(&self) -> Option<u64> {
+        match self {
+            Self::RealTime(_) => None,
+            Self::Timelapse(s) => Some(s.captured_frames()),
+        }
+    }
+
+    pub fn begin_stop(self) -> PendingStop {
+        match self {
+            Self::RealTime(s) => PendingStop::RealTime(s.begin_stop()),
+            Self::Timelapse(s) => PendingStop::Timelapse(s.begin_stop()),
+        }
+    }
+
+    pub fn stop(self) -> Result<PathBuf, String> {
+        match self {
+            Self::RealTime(s) => s.stop(),
+            Self::Timelapse(s) => s.stop(),
+        }
+    }
+}
+
+impl PendingStop {
+    pub fn poll(&mut self) -> StopPollState {
+        match self {
+            Self::RealTime(p) => p.poll(),
+            Self::Timelapse(p) => p.poll(),
+        }
+    }
+
+    pub fn finish(self) -> Result<PathBuf, String> {
+        match self {
+            Self::RealTime(p) => p.finish(),
+            Self::Timelapse(p) => p.finish(),
+        }
+    }
 }

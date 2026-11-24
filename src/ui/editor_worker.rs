@@ -27,7 +27,7 @@ pub const SIZE_PRESETS: [(&str, Option<u32>); 5] = [
     ("Max 640 px", Some(640)),
 ];
 
-pub const FPS_PRESETS: [u32; 3] = [15, 30, 60];
+pub const FPS_PRESETS: [u32; 5] = crate::capture::cadence::EDITOR_FPS_PRESETS;
 
 pub struct EditorState {
     pub input_path: PathBuf,

@@ -14,6 +14,7 @@ pub mod overlay;
 pub mod overlay_actions;
 pub mod overlay_canvas;
 pub mod overlay_toolbar;
+pub mod overlay_window;
 pub mod status_bar;
 pub mod trim_math;
 pub mod trim_view;
@@ -27,8 +28,7 @@ use objc2::rc::Retained;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_foundation::NSTimer;
 
-use crate::capture::RecordingCodec;
-use crate::capture::recorder::{PendingRecordingStop, RecordingSession};
+use crate::capture::{ActiveRecording, PendingStop, RecordingCodec};
 use crate::cli::DemoMode;
 use crate::config::Preferences;
 use crate::permissions::has_screen_capture_permission;
@@ -54,8 +54,8 @@ pub(crate) struct AppRuntime {
     pub(crate) tutorial_generation: Option<u64>,
     pub(crate) next_tutorial_gen: u64,
     pub(crate) overlay: Option<SelectorOverlay>,
-    pub(crate) session: Option<RecordingSession>,
-    pub(crate) pending_stop: Option<PendingRecordingStop>,
+    pub(crate) session: Option<ActiveRecording>,
+    pub(crate) pending_stop: Option<PendingStop>,
     pub(crate) active_capture_app: Option<String>,
     pub(crate) rec_timer: Option<Retained<NSTimer>>,
     pub(crate) stop_poll_timer: Option<Retained<NSTimer>>,

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::capture::{AudioCaptureMode, MicInputPreference, RecordingCodec};
+use crate::capture::{AudioCaptureMode, CaptureCadence, MicInputPreference, RecordingCodec};
 use crate::export::ExportFormat;
 use crate::fs_safety::{
     atomic_write_private, default_movies_export_dir, ensure_private_dir, is_usable_export_dir,
@@ -19,6 +19,7 @@ const MAX_PREFS_BYTES: u64 = 65_536;
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Preferences {
     pub fps: u32,
+    pub capture_cadence: CaptureCadence,
     pub show_cursor: bool,
     pub highlight_clicks: bool,
     pub audio_mode: AudioCaptureMode,
@@ -37,6 +38,8 @@ pub struct Preferences {
 #[derive(Debug, Deserialize)]
 struct RawPreferences {
     fps: u32,
+    #[serde(default)]
+    capture_cadence: Option<CaptureCadence>,
     show_cursor: bool,
     highlight_clicks: bool,
     audio_mode: AudioCaptureMode,
@@ -59,6 +62,7 @@ impl Default for Preferences {
     fn default() -> Self {
         Self {
             fps: 60,
+            capture_cadence: CaptureCadence::RealTime { fps: 60 },
             show_cursor: true,
             highlight_clicks: true,
             audio_mode: AudioCaptureMode::Both,
@@ -160,14 +164,20 @@ impl Preferences {
             }
         });
         let audio_mode = AudioCaptureMode::from_split(capture_system_audio, mic_input.is_enabled());
-        let fps = match parsed.fps {
-            15 | 24 | 30 | 60 | 120 => parsed.fps,
-            _ => 60,
+        let fps = if (1..=120).contains(&parsed.fps) {
+            parsed.fps
+        } else {
+            60
         };
+        let capture_cadence = parsed
+            .capture_cadence
+            .map(CaptureCadence::normalized)
+            .unwrap_or(CaptureCadence::RealTime { fps });
         let export_dir = parsed.export_dir.filter(|dir| is_usable_export_dir(dir));
 
         Ok(Self {
             fps,
+            capture_cadence,
             show_cursor: parsed.show_cursor,
             highlight_clicks: parsed.highlight_clicks,
             audio_mode,
@@ -206,6 +216,7 @@ impl Preferences {
     /// Applies only capture-overlay fields so concurrent Menu Bar / Editor updates (such as `export_dir` or `recording_codec`) are preserved.
     pub fn merge_capture_selection(&mut self, overlay_prefs: &Self) {
         self.fps = overlay_prefs.fps;
+        self.capture_cadence = overlay_prefs.capture_cadence.normalized();
         self.show_cursor = overlay_prefs.show_cursor;
         self.highlight_clicks = overlay_prefs.highlight_clicks;
         self.capture_system_audio = overlay_prefs.capture_system_audio;
@@ -246,6 +257,7 @@ mod tests {
         let tmp = dir.join("prefs.json");
         let prefs = Preferences {
             fps: 30,
+            capture_cadence: CaptureCadence::Timelapse { interval_secs: 60 },
             show_cursor: false,
             highlight_clicks: true,
             audio_mode: AudioCaptureMode::SystemAudio,
@@ -353,6 +365,7 @@ mod tests {
             let p = dir.join(format!("legacy-{mode_str}.json"));
             atomic_write_private(&p, legacy_json_with_audio(mode_str).as_bytes()).expect("write");
             let loaded = Preferences::load_from(&p).expect("load legacy");
+            assert_eq!(loaded.capture_cadence, CaptureCadence::RealTime { fps: 60 });
             assert_eq!(loaded.capture_system_audio, exp_sys, "mode={mode_str}");
             assert_eq!(loaded.mic_input, exp_mic, "mode={mode_str}");
             assert_eq!(loaded.audio_mode, exp_mode, "mode={mode_str}");

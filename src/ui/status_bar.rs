@@ -225,11 +225,20 @@ impl StatusBarController {
         self.record_item.setEnabled(true);
     }
 
-    pub fn set_recording_elapsed(&self, mtm: MainThreadMarker, secs: u64) {
+    pub fn set_recording_elapsed(
+        &self,
+        mtm: MainThreadMarker,
+        secs: u64,
+        timelapse_frames: Option<u64>,
+    ) {
         let mins = secs / 60;
         let rem = secs % 60;
+        let title = match timelapse_frames {
+            Some(frames) => format!("● TL {mins:02}:{rem:02} · {frames}f"),
+            None => format!("● {mins:02}:{rem:02}"),
+        };
         if let Some(btn) = self.status_item.button(mtm) {
-            btn.setTitle(&NSString::from_str(&format!("● {mins:02}:{rem:02}")));
+            btn.setTitle(&NSString::from_str(&title));
         }
         self.record_item
             .setTitle(&NSString::from_str("Stop Recording"));

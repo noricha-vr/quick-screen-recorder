@@ -152,7 +152,8 @@ pub fn export_mp4_or_hevc(
         _ => false,
     };
     let size_matches = target_w == (meta.width & !1) && target_h == (meta.height & !1);
-    let fps_matches = (f64::from(clamped_fps) - f64::from(meta.nominal_fps)).abs() <= 1.5;
+    let fps_tol = (f64::from(meta.nominal_fps) * 0.08).clamp(0.25, 1.5);
+    let fps_matches = (f64::from(clamped_fps) - f64::from(meta.nominal_fps)).abs() <= fps_tol;
 
     let needs_mute = req.mute_audio && meta.has_audio;
     if codec_matches && size_matches && fps_matches && !meta.has_extra_tracks && !needs_mute {

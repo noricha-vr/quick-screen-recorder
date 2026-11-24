@@ -12,9 +12,9 @@ use objc2_foundation::{NSRunLoop, NSRunLoopCommonModes, NSString, NSTimer};
 use crate::capture::audio_devices::{
     MicPermissionStatus, microphone_permission_status, request_microphone_permission_channel,
 };
-use crate::capture::recorder::{RecordingSession, StopPollState};
+use crate::capture::recorder::StopPollState;
 use crate::capture::shareable::query_shareable_content;
-use crate::capture::{AudioCaptureMode, CaptureConfig};
+use crate::capture::{ActiveRecording, AudioCaptureMode, CaptureConfig};
 use crate::config::Preferences;
 use crate::permissions::{has_screen_capture_permission, open_microphone_settings};
 use crate::ui::editor::{EditorOpenOptions, EditorWindow};
@@ -239,14 +239,15 @@ fn launch_recording_session(
         }
     };
     let source_app = cfg.source_app_name.clone();
-    match RecordingSession::start(&cfg, &raw_out) {
+    match ActiveRecording::start(&cfg, &raw_out) {
         Ok(session) => {
             {
                 let mut rt = runtime.borrow_mut();
                 rt.temp_files.push(raw_out);
                 rt.active_capture_app = source_app;
+                let init_tl_frames = session.timelapse_frames();
                 if let Some(sb) = &rt.status_bar {
-                    sb.set_recording_elapsed(mtm, 0);
+                    sb.set_recording_elapsed(mtm, 0, init_tl_frames);
                 }
                 rt.session = Some(session);
                 let rt_tick = Rc::clone(runtime);
@@ -256,7 +257,11 @@ fn launch_recording_session(
                     };
                     let r = rt_tick.borrow();
                     if let (Some(sess), Some(sb)) = (&r.session, &r.status_bar) {
-                        sb.set_recording_elapsed(m, sess.elapsed().as_secs());
+                        sb.set_recording_elapsed(
+                            m,
+                            sess.elapsed().as_secs(),
+                            sess.timelapse_frames(),
+                        );
                     }
                 });
                 rt.rec_timer = Some(unsafe {

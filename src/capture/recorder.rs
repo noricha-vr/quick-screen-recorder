@@ -129,7 +129,8 @@ impl RecordingSession {
             build_filter_and_dimensions(&snapshot.content, config)?;
 
         let stream_cfg = unsafe { SCStreamConfiguration::new() };
-        let fps = config.fps.clamp(1, 120);
+        let fps = config.cadence.realtime_fps().unwrap_or(60).clamp(1, 120);
+        let effective_audio = config.cadence.effective_audio_mode(config.audio_mode);
         let frame_interval = CMTime {
             value: 1,
             timescale: fps as i32,
@@ -145,10 +146,10 @@ impl RecordingSession {
             stream_cfg.setQueueDepth(6);
             stream_cfg.setShowsCursor(config.show_cursor);
             stream_cfg.setShowMouseClicks(config.highlight_clicks);
-            stream_cfg.setCapturesAudio(config.audio_mode.captures_system());
+            stream_cfg.setCapturesAudio(effective_audio.captures_system());
             stream_cfg.setExcludesCurrentProcessAudio(true);
-            stream_cfg.setCaptureMicrophone(config.audio_mode.captures_mic());
-            if config.audio_mode.captures_mic() {
+            stream_cfg.setCaptureMicrophone(effective_audio.captures_mic());
+            if effective_audio.captures_mic() {
                 if let Some(dev_id) = config.microphone_device_id.as_deref() {
                     if !dev_id.is_empty() {
                         stream_cfg.setMicrophoneCaptureDeviceID(Some(&NSString::from_str(dev_id)));

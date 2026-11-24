@@ -3,16 +3,17 @@ use objc2::runtime::AnyObject;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSBox, NSBoxType, NSButton, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSFont,
-    NSPopUpButton, NSSegmentSwitchTracking, NSSegmentedControl, NSTextAlignment, NSTextField,
-    NSView,
+    NSMenuItem, NSPopUpButton, NSSegmentSwitchTracking, NSSegmentedControl, NSTextAlignment,
+    NSTextField, NSView,
 };
 use objc2_foundation::{NSArray, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
 use crate::capture::audio_devices::MicMenuItem;
+use crate::capture::cadence::CadenceMenuItem;
 use crate::config::Preferences;
-use crate::fs_safety::{next_unique_token, sanitize_terminal_text};
+pub use crate::ui::overlay_window::append_tagged_popup_item;
 
-pub const TOOLBAR_W: f64 = 600.0;
+pub const TOOLBAR_W: f64 = 628.0;
 pub const TOOLBAR_H: f64 = 88.0;
 
 pub struct ToolbarActionIvars {
@@ -61,7 +62,11 @@ define_class!(
         }
         #[unsafe(method(fpsChanged:))]
         fn fps_changed(&self, sender: &NSPopUpButton) {
-            (self.ivars().on_fps)(sender.indexOfSelectedItem());
+            let tag = sender
+                .selectedItem()
+                .map(|mi| mi.tag())
+                .unwrap_or_else(|| sender.indexOfSelectedItem());
+            (self.ivars().on_fps)(tag);
         }
         #[unsafe(method(sysAudioToggled:))]
         fn sys_audio_toggled(&self, sender: &NSButton) {
@@ -111,8 +116,12 @@ pub fn populate_toolbar_controls(
     x_lbl: &NSTextField,
     h_field: &NSTextField,
     target_popup: &NSPopUpButton,
+    sys_audio_chk: &NSButton,
+    mic_popup: &NSPopUpButton,
     mic_items: &[MicMenuItem],
     selected_mic_idx: usize,
+    cadence_items: &[CadenceMenuItem],
+    selected_cadence_idx: usize,
     prefs: &Preferences,
 ) {
     build_elevated_shell(mtm, bar);
@@ -126,7 +135,18 @@ pub fn populate_toolbar_controls(
         h_field,
         target_popup,
     );
-    build_row_two(mtm, bar, actions, mic_items, selected_mic_idx, prefs);
+    build_row_two(
+        mtm,
+        bar,
+        actions,
+        sys_audio_chk,
+        mic_popup,
+        mic_items,
+        selected_mic_idx,
+        cadence_items,
+        selected_cadence_idx,
+        prefs,
+    );
 }
 
 fn build_elevated_shell(mtm: MainThreadMarker, bar: &NSView) {
@@ -252,7 +272,7 @@ fn build_row_one(
 
     target_popup.setFrame(NSRect::new(
         NSPoint::new(198.0, 49.0),
-        NSSize::new(214.0, 28.0),
+        NSSize::new(236.0, 28.0),
     ));
     unsafe {
         target_popup.setTarget(Some(actions));
@@ -270,7 +290,7 @@ fn build_row_one(
     };
     cancel_btn.setKeyEquivalent(&NSString::from_str("\u{1b}"));
     cancel_btn.setFrame(NSRect::new(
-        NSPoint::new(430.0, 49.0),
+        NSPoint::new(458.0, 49.0),
         NSSize::new(66.0, 28.0),
     ));
     bar.addSubview(&cancel_btn);
@@ -287,44 +307,47 @@ fn build_row_one(
     rec_btn.setFont(Some(&NSFont::boldSystemFontOfSize(12.5)));
     rec_btn.setKeyEquivalent(&NSString::from_str("\r"));
     rec_btn.setFrame(NSRect::new(
-        NSPoint::new(502.0, 49.0),
+        NSPoint::new(530.0, 49.0),
         NSSize::new(86.0, 28.0),
     ));
     bar.addSubview(&rec_btn);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_row_two(
     mtm: MainThreadMarker,
     bar: &NSView,
     actions: &OverlayToolbarActions,
+    sys_audio_chk: &NSButton,
+    mic_popup: &NSPopUpButton,
     mic_items: &[MicMenuItem],
     selected_mic_idx: usize,
+    cadence_items: &[CadenceMenuItem],
+    selected_cadence_idx: usize,
     prefs: &Preferences,
 ) {
-    let sys_audio_chk = unsafe {
-        NSButton::checkboxWithTitle_target_action(
-            &NSString::from_str("System Audio"),
-            Some(actions),
-            Some(sel!(sysAudioToggled:)),
-            mtm,
-        )
-    };
+    let audio_allowed = !prefs.capture_cadence.is_timelapse();
     sys_audio_chk.setFont(Some(&NSFont::systemFontOfSize_weight(12.0, 0.15)));
     sys_audio_chk.setState(if prefs.capture_system_audio {
         NSControlStateValueOn
     } else {
         NSControlStateValueOff
     });
+    sys_audio_chk.setEnabled(audio_allowed);
     sys_audio_chk.setToolTip(Some(&NSString::from_str(
-        "Record macOS system audio output (you can mute it later when exporting)",
+        "Record macOS system audio output (automatically disabled in timelapse mode)",
     )));
     sys_audio_chk.setFrame(NSRect::new(
         NSPoint::new(14.0, 14.0),
-        NSSize::new(112.0, 20.0),
+        NSSize::new(110.0, 20.0),
     ));
-    bar.addSubview(&sys_audio_chk);
+    unsafe {
+        sys_audio_chk.setTarget(Some(actions));
+        sys_audio_chk.setAction(Some(sel!(sysAudioToggled:)));
+    }
+    bar.addSubview(sys_audio_chk);
 
-    add_v_sep(mtm, bar, 132.0);
+    add_v_sep(mtm, bar, 130.0);
 
     let mic_lbl = NSTextField::labelWithString(&NSString::from_str("Mic"), mtm);
     mic_lbl.setFont(Some(&NSFont::systemFontOfSize_weight(11.5, 0.2)));
@@ -332,40 +355,55 @@ fn build_row_two(
         0.76, 0.82, 0.92, 1.0,
     )));
     mic_lbl.setFrame(NSRect::new(
-        NSPoint::new(140.0, 14.0),
+        NSPoint::new(138.0, 14.0),
         NSSize::new(26.0, 18.0),
     ));
     bar.addSubview(&mic_lbl);
 
-    let mic_popup = NSPopUpButton::new(mtm);
     for (idx, item) in mic_items.iter().enumerate() {
-        append_tagged_popup_item(&mic_popup, &item.menu_title(), idx as isize);
+        append_tagged_popup_item(mic_popup, &item.menu_title(), idx as isize);
     }
     if !mic_items.is_empty() {
         mic_popup.selectItemAtIndex(selected_mic_idx.min(mic_items.len() - 1) as isize);
     }
+    mic_popup.setEnabled(audio_allowed);
     mic_popup.setToolTip(Some(&NSString::from_str(
-        "Select microphone input device (defaults to System default mic)",
+        "Select microphone input device (automatically disabled in timelapse mode)",
     )));
     mic_popup.setFrame(NSRect::new(
-        NSPoint::new(168.0, 10.0),
-        NSSize::new(178.0, 28.0),
+        NSPoint::new(166.0, 10.0),
+        NSSize::new(174.0, 28.0),
     ));
     unsafe {
         mic_popup.setTarget(Some(actions));
         mic_popup.setAction(Some(sel!(micChanged:)));
     }
-    bar.addSubview(&mic_popup);
+    bar.addSubview(mic_popup);
 
-    add_v_sep(mtm, bar, 354.0);
+    add_v_sep(mtm, bar, 348.0);
 
     let fps_popup = NSPopUpButton::new(mtm);
-    fps_popup.addItemWithTitle(&NSString::from_str("30 fps"));
-    fps_popup.addItemWithTitle(&NSString::from_str("60 fps"));
-    fps_popup.selectItemAtIndex(if prefs.fps >= 60 { 1 } else { 0 });
+    for (idx, item) in cadence_items.iter().enumerate() {
+        match item {
+            CadenceMenuItem::Option { label, .. } => {
+                append_tagged_popup_item(&fps_popup, label, idx as isize);
+            }
+            CadenceMenuItem::Separator => {
+                if let Some(menu) = fps_popup.menu() {
+                    menu.addItem(&NSMenuItem::separatorItem(mtm));
+                }
+            }
+        }
+    }
+    if !cadence_items.is_empty() {
+        fps_popup.selectItemAtIndex(selected_cadence_idx.min(cadence_items.len() - 1) as isize);
+    }
+    fps_popup.setToolTip(Some(&NSString::from_str(
+        "Frame rate: 1–60 fps real-time, or interval timelapse (30 fps playback, audio muted)",
+    )));
     fps_popup.setFrame(NSRect::new(
-        NSPoint::new(362.0, 10.0),
-        NSSize::new(78.0, 28.0),
+        NSPoint::new(356.0, 10.0),
+        NSSize::new(108.0, 28.0),
     ));
     unsafe {
         fps_popup.setTarget(Some(actions));
@@ -388,8 +426,8 @@ fn build_row_two(
         NSControlStateValueOff
     });
     cursor_chk.setFrame(NSRect::new(
-        NSPoint::new(452.0, 14.0),
-        NSSize::new(64.0, 20.0),
+        NSPoint::new(474.0, 14.0),
+        NSSize::new(66.0, 20.0),
     ));
     bar.addSubview(&cursor_chk);
 
@@ -408,34 +446,10 @@ fn build_row_two(
         NSControlStateValueOff
     });
     clicks_chk.setFrame(NSRect::new(
-        NSPoint::new(524.0, 14.0),
-        NSSize::new(64.0, 20.0),
+        NSPoint::new(548.0, 14.0),
+        NSSize::new(68.0, 20.0),
     ));
     bar.addSubview(&clicks_chk);
-}
-
-/// Appends an item via AppKit's standard `addItemWithTitle:` using a control-character-prefixed,
-/// per-call unique placeholder title, then immediately renames `lastItem()` to a control-free
-/// sanitized display title and sets its `tag`. Because `sanitize_terminal_text` strips all ASCII
-/// control characters (`< 0x20`), no external window/device title can ever collide with a future
-/// placeholder or trigger `addItemWithTitle:` deduplication.
-pub fn append_tagged_popup_item(popup: &NSPopUpButton, title: &str, tag: isize) {
-    let safe_title = sanitize_popup_title(title);
-    let placeholder = unique_popup_placeholder(popup.numberOfItems(), tag);
-    popup.addItemWithTitle(&NSString::from_str(&placeholder));
-    if let Some(item) = popup.lastItem() {
-        item.setTitle(&NSString::from_str(&safe_title));
-        item.setTag(tag);
-        item.setEnabled(true);
-    }
-}
-
-pub(crate) fn sanitize_popup_title(title: &str) -> String {
-    sanitize_terminal_text(title, false)
-}
-
-pub(crate) fn unique_popup_placeholder(index: isize, tag: isize) -> String {
-    format!("\u{1f}qsr-{}-{index}-{tag}", next_unique_token())
 }
 
 fn add_v_sep(mtm: MainThreadMarker, bar: &NSView, x: f64) {
@@ -449,22 +463,4 @@ fn add_v_sep(mtm: MainThreadMarker, bar: &NSView, x: f64) {
         1.0, 1.0, 1.0, 0.16,
     ));
     bar.addSubview(&sep);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sanitized_popup_title_can_never_collide_with_reserved_placeholder() {
-        let placeholder = unique_popup_placeholder(1, 1);
-        assert!(placeholder.starts_with('\u{1f}'));
-        let forged = sanitize_popup_title(&placeholder);
-        assert!(!forged.contains('\u{1f}'));
-        assert_ne!(forged, placeholder);
-        assert_ne!(
-            unique_popup_placeholder(1, 1),
-            unique_popup_placeholder(1, 1)
-        );
-    }
 }
