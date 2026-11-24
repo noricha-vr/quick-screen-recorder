@@ -429,7 +429,6 @@ pub fn apply_step_ui(
 pub(crate) struct CompletedFooterSpec {
     pub secondary_title: Option<&'static str>,
     pub primary_title: &'static str,
-    pub primary_reveals_in_finder: bool,
 }
 
 pub(crate) fn completed_footer_spec(has_saved_path: bool) -> CompletedFooterSpec {
@@ -437,13 +436,11 @@ pub(crate) fn completed_footer_spec(has_saved_path: bool) -> CompletedFooterSpec
         CompletedFooterSpec {
             secondary_title: Some("Close"),
             primary_title: "Show in Finder",
-            primary_reveals_in_finder: true,
         }
     } else {
         CompletedFooterSpec {
             secondary_title: None,
             primary_title: "Close",
-            primary_reveals_in_finder: false,
         }
     }
 }
@@ -457,11 +454,9 @@ mod tests {
         let with_file = completed_footer_spec(true);
         assert_eq!(with_file.secondary_title, Some("Close"));
         assert_eq!(with_file.primary_title, "Show in Finder");
-        assert!(with_file.primary_reveals_in_finder);
 
         let without_file = completed_footer_spec(false);
         assert_eq!(without_file.secondary_title, None);
         assert_eq!(without_file.primary_title, "Close");
-        assert!(!without_file.primary_reveals_in_finder);
     }
 }
