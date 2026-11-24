@@ -70,6 +70,7 @@ struct StopCoordinatorState {
     stop_capture_gen: Option<u64>,
     worker_running: bool,
     pending_late_start_gen: Option<u64>,
+    late_start_remove_retried_gen: Option<u64>,
 }
 
 /// Shared mutex-backed coordinator unifying stop state, finalization deadline, serial worker
@@ -94,6 +95,7 @@ impl StopControl {
                 stop_capture_gen: None,
                 worker_running: false,
                 pending_late_start_gen: None,
+                late_start_remove_retried_gen: None,
             }),
             cvar: Condvar::new(),
         }
@@ -304,10 +306,12 @@ impl StopControl {
                 let Ok(mut st) = self.state.lock() else {
                     return;
                 };
-                if st.pending_late_start_gen.is_some()
+                if let Some(late_gen) = st.pending_late_start_gen
                     && st.remove_phase == RemovePhase::Failed
                     && st.stop_capture_sent_at.is_none()
+                    && st.late_start_remove_retried_gen != Some(late_gen)
                 {
+                    st.late_start_remove_retried_gen = Some(late_gen);
                     st.remove_phase = RemovePhase::Idle;
                     st.forced_stop_on_timeout = false;
                     Step3Action::RetryRemove

@@ -251,12 +251,22 @@ fn run_live_two_window_overlay_verification(
                 return Err("toolbar_window level must stay above canvas_window".to_string());
             }
 
-            // Switch to Area width editing, type a new width, and commit via toolbar helper
-            // to ensure no RefCell double-borrow occurs when clicking canvas mid-edit.
+            // Switch to Area width editing using the REAL AppKit field editor, modify text to
+            // "800", commit via `commit_toolbar_text_editing`, and verify both non-reentrancy
+            // AND that `OverlayState.selection.width` actually updated to `800 / scale`.
             let _ = ov.toolbar_window.makeFirstResponder(Some(&ov.w_field));
-            ov.w_field.setStringValue(&NSString::from_str("800"));
+            let editor = ov
+                .w_field
+                .currentEditor()
+                .ok_or("w_field did not activate an AppKit field editor")?;
+            editor.setString(&NSString::from_str("800"));
             commit_toolbar_text_editing(&ov.toolbar_window);
-            let _ = ov.state.borrow();
+            let actual_px_w = (ov.state.borrow().selection.width * scale).round() as i32;
+            if (actual_px_w - 800).abs() > 2 {
+                return Err(format!(
+                    "expected width commit to update selection to ~800px, got {actual_px_w}px"
+                ));
+            }
 
             // Switch to Window mode: toolbar MUST stay key window (never dimmed!).
             ov.select_mode_segment(1);

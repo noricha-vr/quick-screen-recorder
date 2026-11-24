@@ -266,4 +266,58 @@ if printf '%s' "$OUT_ESC" | LC_ALL=C grep -q $'\033'; then
   exit 1
 fi
 
-echo "INSTALL_LOCAL_STUB_TESTS_OK (16/16 cases passed)"
+# 17. Rejects newline-containing paths (prevents codesign line injection).
+NL_DIR="$TMP_ROOT/$(printf 'bad\nSignature=adhoc')"
+mkdir -p "$NL_DIR"
+if run_inst --target-dir "$NL_DIR" --source-app "$SRC_V4" >/dev/null 2>&1; then
+  echo "FAIL: must reject newline-containing target directory" >&2
+  exit 1
+fi
+
+# 18. Refuses concurrent install when lock directory is held.
+mkdir -p "$APPS_DIR/.qsr-install.lock"
+if run_inst --target-dir "$APPS_DIR" --source-app "$SRC_V4" >/dev/null 2>&1; then
+  rmdir "$APPS_DIR/.qsr-install.lock"
+  echo "FAIL: must refuse concurrent install while lock exists" >&2
+  exit 1
+fi
+rmdir "$APPS_DIR/.qsr-install.lock"
+
+# 19. Post-swap verification failure rolls back cleanly to the previous app!
+: > "$TCC_LOG"
+run_inst --target-dir "$APPS_DIR" --source-app "$SRC_V3" >/dev/null
+# Make target fail verification ONLY when installed at target path (`--verify` checks sentinel):
+SRC_FAIL_POST="$TMP_ROOT/fail-post.app"
+make_fake_app "$SRC_FAIL_POST" "$BUNDLE_ID" "adhoc" "badpost"
+# Simulate post-swap verify failure by making codesign --verify fail ONLY for resolved $APPS_DIR/QuickScreenRecorder.app
+REAL_APPS_DIR="$(cd "$APPS_DIR" && pwd -P)"
+cat > "$STUB_BIN/codesign" << EOF
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "\$1" == "--verify" ]]; then
+  app="\${@: -1}"
+  if [[ "\$app" == "$REAL_APPS_DIR/QuickScreenRecorder.app" ]] && grep -q 'CDHash=badpost' "\$app/.stub-dvvv" 2>/dev/null; then
+    exit 1
+  fi
+  exit 0
+fi
+if [[ "\$1" == "-dvvv" ]]; then
+  cat "\$2/.stub-dvvv" >&2
+  exit 0
+fi
+if [[ "\$1" == "-d" && "\$2" == "-r" && "\$3" == "-" ]]; then
+  [[ -f "\$4/.stub-dr" ]] && cat "\$4/.stub-dr" >&2
+  exit 0
+fi
+exit 1
+EOF
+chmod +x "$STUB_BIN/codesign"
+: > "$TCC_LOG"
+if run_inst --target-dir "$APPS_DIR" --source-app "$SRC_FAIL_POST" >/dev/null 2>&1; then
+  echo "FAIL: post-swap verify failure should have failed" >&2
+  exit 1
+fi
+assert_log_lines 0
+grep -q 'CDHash=hash3333' "$APPS_DIR/QuickScreenRecorder.app/.stub-dvvv"
+
+echo "INSTALL_LOCAL_STUB_TESTS_OK (19/19 cases passed)"

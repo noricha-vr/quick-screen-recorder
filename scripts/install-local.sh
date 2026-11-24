@@ -41,6 +41,15 @@ sanitize_print() {
   printf '%s' "$1" | LC_ALL=C tr '\000-\037\177' '?'
 }
 
+reject_newlines() {
+  local label="$1"
+  local val="$2"
+  if [[ "$val" == *$'\n'* || "$val" == *$'\r'* ]]; then
+    echo "ERROR: $label must not contain newline characters" >&2
+    exit 2
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --target-dir)
@@ -87,6 +96,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+reject_newlines "--target-dir" "$TARGET_DIR"
+reject_newlines "--source-app" "$SOURCE_APP"
+reject_newlines "--sign-identity" "$SIGN_IDENTITY"
+
 if [[ "$FORCE_RESET_TCC" -eq 1 && "$NO_RESET_TCC" -eq 1 ]]; then
   echo "ERROR: --force-reset-tcc and --no-reset-tcc cannot be combined" >&2
   exit 2
@@ -101,6 +114,8 @@ if [[ ! -d "$TARGET_DIR" || -L "$TARGET_DIR" ]]; then
   exit 1
 fi
 REAL_TARGET_DIR="$(cd "$TARGET_DIR" && pwd -P)"
+reject_newlines "resolved target directory" "$REAL_TARGET_DIR"
+
 DIST_DIR="$ROOT_DIR/dist"
 if [[ -e "$DIST_DIR" ]]; then
   REAL_DIST_DIR="$(cd "$DIST_DIR" && pwd -P)"
@@ -178,10 +193,11 @@ inspect_signature_fingerprint() {
   cs_id="$(printf '%s\n' "$cs_out" | awk -F= '/^Identifier=/{print $2; exit}')"
   [[ "$cs_id" == "$EXPECTED_BUNDLE_ID" ]] || return 1
 
-  if printf '%s\n' "$cs_out" | grep -q '^Signature=adhoc$'; then
-    is_adhoc=1
-  elif printf '%s\n' "$cs_out" | grep -q '^Authority='; then
+  # Check `Authority=` first (certificate-signed bundles carry Authority and never Signature=adhoc).
+  if printf '%s\n' "$cs_out" | grep -q '^Authority='; then
     is_adhoc=0
+  elif printf '%s\n' "$cs_out" | grep -q '^Signature=adhoc$'; then
+    is_adhoc=1
   else
     return 1
   fi
@@ -191,6 +207,45 @@ inspect_signature_fingerprint() {
   fingerprint="${cdhashes}|${dr_out}"
   [[ -n "$cdhashes" || -n "$dr_out" ]] || return 1
   printf '%s|%s\n' "$is_adhoc" "$fingerprint"
+}
+
+# Atomic macOS kernel rename/exchange (`renamex_np`) that NEVER follows symlinks and NEVER nests
+# into an existing directory.
+# - mode "excl": atomically moves `src` -> `dst` ONLY IF `dst` does not exist (`RENAME_EXCL`).
+# - mode "swap": atomically swaps `src` <-> `dst` (`RENAME_SWAP`), leaving the old bundle intact
+#   at `src` as a rollback backup until post-install verification succeeds.
+atomic_renamex() {
+  local mode="$1"
+  local src="$2"
+  local dst="$3"
+  /usr/bin/python3 - "$mode" "$src" "$dst" << 'PY'
+import ctypes, errno, os, stat, sys
+
+mode, src, dst = sys.argv[1], sys.argv[2], sys.argv[3]
+libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+libc.renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+libc.renamex_np.restype = ctypes.c_int
+
+RENAME_SWAP = 0x00000002
+RENAME_EXCL = 0x00000004
+
+if mode == "swap":
+    st = os.lstat(dst)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        sys.stderr.write("ERROR: Destination is a symlink or non-directory during swap\n")
+        sys.exit(1)
+    flags = RENAME_SWAP
+elif mode == "excl":
+    flags = RENAME_EXCL
+else:
+    sys.exit(2)
+
+rc = libc.renamex_np(os.fsencode(src), os.fsencode(dst), flags)
+if rc != 0:
+    err = ctypes.get_errno()
+    sys.stderr.write(f"ERROR: renamex_np({mode}) failed: {os.strerror(err)} (errno {err})\n")
+    sys.exit(1)
+PY
 }
 
 # 1. Refuse to build/overwrite while the app is running.
@@ -204,12 +259,41 @@ fi
 # 3. Verify source bundle before touching destination (and ensure source != destination).
 verify_app_bundle "$SOURCE_APP" "source bundle"
 REAL_SOURCE_APP="$(cd "$SOURCE_APP" && pwd -P)"
+reject_newlines "resolved source bundle" "$REAL_SOURCE_APP"
 if [[ "$REAL_SOURCE_APP" == "$TARGET_APP" ]]; then
   echo "ERROR: Refusing to install bundle onto itself: $(sanitize_print "$TARGET_APP")" >&2
   exit 1
 fi
 
-# 4. Inspect existing installed bundle (if present) and fail closed if another app sits there.
+# 4. Acquire exclusive lock in target directory so concurrent installs cannot race.
+LOCK_DIR="$REAL_TARGET_DIR/.qsr-install.lock"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  echo "ERROR: Another install-local.sh appears to be running (lock exists: $(sanitize_print "$LOCK_DIR"))" >&2
+  exit 1
+fi
+
+STAGE_PARENT=""
+STAGE_APP=""
+SWAPPED_OLD_IN_STAGE=0
+INSTALL_VERIFIED=0
+
+cleanup_install() {
+  if [[ "$SWAPPED_OLD_IN_STAGE" -eq 1 && "$INSTALL_VERIFIED" -eq 0 && -d "$STAGE_APP" ]]; then
+    # Roll back atomically if post-swap verification failed; NEVER delete the old backup if rollback fails!
+    if atomic_renamex swap "$STAGE_APP" "$TARGET_APP" 2>/dev/null; then
+      SWAPPED_OLD_IN_STAGE=0
+      rm -rf "$STAGE_PARENT"
+    else
+      echo "WARNING: Automatic rollback failed; previous app backup preserved untouched at $(sanitize_print "$STAGE_APP")" >&2
+    fi
+  elif [[ -n "$STAGE_PARENT" ]]; then
+    rm -rf "$STAGE_PARENT"
+  fi
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+trap cleanup_install EXIT
+
+# 5. Inspect existing installed bundle (if present) under lock and fail closed on mismatch.
 OLD_EXISTED=0
 OLD_IS_ADHOC=0
 OLD_FINGERPRINT=""
@@ -233,54 +317,49 @@ if [[ -e "$TARGET_APP" || -L "$TARGET_APP" ]]; then
   fi
 fi
 
-# 5. Copy into an exclusively created 0700 staging directory (immune to predictable symlink races).
+# 6. Copy into an exclusively created 0700 staging directory (immune to predictable symlink races).
 STAGE_PARENT="$(mktemp -d "$REAL_TARGET_DIR/.qsr-install-stage.XXXXXX")"
 chmod 0700 "$STAGE_PARENT"
-BACKUP_PARENT="$(mktemp -d "$REAL_TARGET_DIR/.qsr-install-backup.XXXXXX")"
-chmod 0700 "$BACKUP_PARENT"
 STAGE_APP="$STAGE_PARENT/$APP_NAME"
-BACKUP_APP="$BACKUP_PARENT/$APP_NAME"
 
-cleanup_staging() {
-  if [[ -d "$BACKUP_APP" && ! -e "$TARGET_APP" ]]; then
-    mv "$BACKUP_APP" "$TARGET_APP" 2>/dev/null || true
-  fi
-  rm -rf "$STAGE_PARENT" "$BACKUP_PARENT"
-}
-trap cleanup_staging EXIT
-
-ditto "$REAL_SOURCE_APP" "$STAGE_APP"
+if ! ditto_out="$(ditto "$REAL_SOURCE_APP" "$STAGE_APP" 2>&1)"; then
+  echo "ERROR: ditto copy failed: $(sanitize_print "$ditto_out")" >&2
+  exit 1
+fi
 
 if [[ -n "$SIGN_IDENTITY" && "$SIGN_IDENTITY" != "-" ]]; then
   echo "==> Re-signing staged local copy with identity: $(sanitize_print "$SIGN_IDENTITY") (dist/ remains ad-hoc)"
-  codesign --force --deep --sign "$SIGN_IDENTITY" "$STAGE_APP"
+  if ! cs_resign_out="$(codesign --force --deep --sign "$SIGN_IDENTITY" "$STAGE_APP" 2>&1)"; then
+    echo "ERROR: Local re-signing failed: $(sanitize_print "$cs_resign_out")" >&2
+    exit 1
+  fi
 fi
 
 verify_app_bundle "$STAGE_APP" "staged bundle"
 
-# 6. Re-check running state right before atomic-style directory swap (catches launches during build).
+# 7. Re-check running state right before atomic swap (catches launches during build/staging).
 assert_app_not_running
 
 if [[ "$OLD_EXISTED" -eq 1 ]]; then
-  mv "$TARGET_APP" "$BACKUP_APP"
-fi
-mv "$STAGE_APP" "$TARGET_APP"
-if [[ -d "$BACKUP_APP" ]]; then
-  rm -rf "$BACKUP_APP"
+  atomic_renamex swap "$STAGE_APP" "$TARGET_APP"
+  SWAPPED_OLD_IN_STAGE=1
+else
+  atomic_renamex excl "$STAGE_APP" "$TARGET_APP"
 fi
 
-# 7. Re-verify installed bundle and parse its Designated Requirement / CDHash.
+# 8. Re-verify installed bundle BEFORE removing the swapped-out backup (rollback on failure).
 verify_app_bundle "$TARGET_APP" "installed bundle"
 if ! new_sig="$(inspect_signature_fingerprint "$TARGET_APP")"; then
-  echo "ERROR: Failed to parse signature/DR of installed bundle ($(sanitize_print "$TARGET_APP")); aborting before TCC reset." >&2
+  echo "ERROR: Failed to parse signature/DR of installed bundle ($(sanitize_print "$TARGET_APP")); rolling back." >&2
   exit 1
 fi
+INSTALL_VERIFIED=1
 NEW_IS_ADHOC="${new_sig%%|*}"
 NEW_FINGERPRINT="${new_sig#*|}"
 
 echo "==> Installed $(sanitize_print "$TARGET_APP") (bundle ID: $EXPECTED_BUNDLE_ID, ad-hoc: $NEW_IS_ADHOC)"
 
-# 8. Target-scoped TCC auto-reset (strictly ad-hoc only, allowlisted services only, exact bundle ID).
+# 9. Target-scoped TCC auto-reset (strictly ad-hoc only, allowlisted services only, exact bundle ID).
 if [[ "$NO_RESET_TCC" -eq 1 ]]; then
   echo "==> Skipping TCC reset (--no-reset-tcc)"
   exit 0

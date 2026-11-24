@@ -317,6 +317,41 @@ fn late_start_arriving_between_failed_remove_and_first_stop_retries_remove_and_w
 }
 
 #[test]
+fn late_start_repeated_remove_failure_bounds_retry_and_still_stops_stream() {
+    let t0 = Instant::now();
+    let ctrl = Arc::new(StopControl::new(t0, true));
+    let signal = Arc::new((Mutex::new(DelegateSignal::default()), Condvar::new()));
+
+    let t_cancel = t0 + Duration::from_millis(50);
+    assert!(ctrl.register_stop_request(StopMode::StartupAbort, t_cancel));
+
+    let remove_calls = Arc::new(AtomicUsize::new(0));
+    let stop_gens = Arc::new(Mutex::new(Vec::<u64>::new()));
+
+    ctrl.run_serial_worker_loop(
+        &signal,
+        || {
+            let n = remove_calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                let _ = ctrl.register_late_start_stop(77, t_cancel, &signal);
+            }
+            // Keep failing remove even on the post-start retry: MUST NOT infinite-loop!
+            false
+        },
+        |g| stop_gens.lock().unwrap().push(g),
+        || t_cancel,
+    );
+    assert_eq!(
+        remove_calls.load(Ordering::SeqCst),
+        2,
+        "post-start remove retry must be bounded to once per late_gen"
+    );
+    assert_eq!(*stop_gens.lock().unwrap(), vec![77]);
+    assert_eq!(ctrl.snapshot().remove_phase, RemovePhase::Failed);
+    assert!(!ctrl.snapshot().worker_running);
+}
+
+#[test]
 fn forced_timeout_did_fail_retains_staging_untouched_even_when_stream_stop_confirmed() {
     use std::os::unix::fs::PermissionsExt;
 
