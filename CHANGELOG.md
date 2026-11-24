@@ -5,6 +5,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-25
+
+### Changed
+
+- **Renamed application to `AirRec` (`AirRec.app` / `airrec` / `io.github.noricha-vr.airrec`)**:
+  - Moved the app name to the top of macOS System Settings → Privacy & Security lists so it appears in the first view without scrolling.
+  - Updated default export directory to `~/Movies/AirRec`, default filename tag to `AirRec`, and Application Support directory to `~/Library/Application Support/AirRec`.
+  - Upgraded the generated macOS `.icns` app icon (`16×16` through `1024×1024`) to the new obsidian-navy squircle with white rounded viewfinder brackets and crimson record core.
+
 ## [0.5.3] - 2026-11-24
 
 ### Changed

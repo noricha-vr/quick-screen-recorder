@@ -284,10 +284,7 @@ pub(crate) fn stop_active_recording_with_reason(
                         ),
                     };
                     if defer_modal {
-                        eprintln!(
-                            "QuickScreenRecorder: {}",
-                            sanitize_terminal_text(&notice, false)
-                        );
+                        eprintln!("AirRec: {}", sanitize_terminal_text(&notice, false));
                     } else {
                         show_error_alert(m, "Recording Saved Before Quit", &notice);
                     }
@@ -377,7 +374,7 @@ pub(crate) fn stop_active_recording_with_reason(
                 if should_quit {
                     if defer_modal {
                         eprintln!(
-                            "QuickScreenRecorder recording error on quit: {}",
+                            "AirRec recording error on quit: {}",
                             sanitize_terminal_text(&err, false)
                         );
                     } else {

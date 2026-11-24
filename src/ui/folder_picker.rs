@@ -28,7 +28,7 @@ pub enum FolderMenuItem {
 }
 
 /// Returns verified, canonicalized standard macOS export folders owned by the current user,
-/// starting with `~/Movies/Quick Screen Recorder`.
+/// starting with `~/Movies/AirRec`.
 pub fn preset_export_dirs() -> Vec<PathBuf> {
     let mut out = Vec::with_capacity(5);
     if let Some(app_movies) = default_movies_export_dir() {
@@ -143,8 +143,8 @@ pub fn live_folder_menu_model(
         return (
             vec![
                 FolderMenuItem::Dir {
-                    path: PathBuf::from("~/Movies/Quick Screen Recorder"),
-                    label: "~/Movies/Quick Screen Recorder".to_string(),
+                    path: PathBuf::from("~/Movies/AirRec"),
+                    label: "~/Movies/AirRec".to_string(),
                     selected: true,
                 },
                 FolderMenuItem::Separator,

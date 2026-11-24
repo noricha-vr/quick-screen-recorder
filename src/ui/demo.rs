@@ -146,7 +146,7 @@ pub fn run_demo_flow(
                     OnboardingStep::Completed,
                     Some(0.0),
                     Some(PathBuf::from(
-                        "~/Movies/Quick Screen Recorder/2026-11-24_09-30-00_Quick-Screen-Recorder.mp4",
+                        "~/Movies/AirRec/2026-11-24_09-30-00_AirRec.mp4",
                     )),
                 )
             } else if granted {

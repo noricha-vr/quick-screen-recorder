@@ -110,7 +110,7 @@ impl EditorWindow {
         let on_export_dir_change = opts.on_export_dir_change;
         let on_export_saved = opts.on_export_saved;
         let default_stem = if demo_showcase {
-            "2026-11-24_09-30-00_Quick-Screen-Recorder".to_string()
+            "2026-11-24_09-30-00_AirRec".to_string()
         } else {
             default_export_stem_now(opts.captured_app_name.as_deref())
         };
@@ -146,7 +146,7 @@ impl EditorWindow {
             window.setAppearance(Some(&dark));
         }
         window.setAcceptsMouseMovedEvents(true);
-        window.setTitle(&NSString::from_str("Quick Screen Recorder — Trim & Export"));
+        window.setTitle(&NSString::from_str("AirRec — Trim & Export"));
         window.setBackgroundColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
             0.09, 0.10, 0.14, 1.0,
         )));

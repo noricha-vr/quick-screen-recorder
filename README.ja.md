@@ -1,4 +1,4 @@
-# Quick Screen Recorder
+# AirRec
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform: macOS 15+](https://img.shields.io/badge/platform-macOS%2015%2B-lightgrey.svg)](https://www.apple.com/macos/)
@@ -34,7 +34,7 @@ Electron（Chromium + Node.js）ベースの画面録画ツールと異なり、
   - **書き出し時の `Mute audio` チェックボックス**: デフォルトで録音した音声が不要だった場合も、MP4 / HEVC / WebM / AV1 書き出し時にワンクリックで音声トラックを除外できます（CLI でも `convert --mute` 対応）。
   - **外部依存ゼロのネイティブ書き出し**: **MP4 (H.264)**、**MP4 (HEVC)**、**GIF**（並列 NeuQuant パレット量子化＋フレーム差分最適化）、**APNG**。
   - **FFmpeg 自動連携（任意）**: システムに `ffmpeg` がある場合は **WebM (VP9)** と **MP4 (AV1)** も自動で選択可能になります。
-  - **専用保存フォルダ・最適自動命名＆任意ファイル名編集・プログレスバー**: デフォルト保存先は **`~/Movies/Quick Screen Recorder`**（自動作成）で、エディタの **`Save to`** ドロップダウンまたはメニューバー **`◉ Rec` → `Save Folder`** からいつでも任意のフォルダ（`~/Movies`・`~/Desktop`・`~/Downloads`・`~/Documents` や **`Choose Folder...`** での新規フォルダ作成）へ変更・記憶できます。自動ファイル名は時系列順で並び検索しやすい **`YYYY-MM-DD_HH-MM-SS_Quick-Screen-Recorder`**（ウィンドウ録画時は対象アプリ名も付与）を初期表示し、エディタの **`Name`** 欄で任意の名前にそのまま編集してプログレスバー付きで即保存（または **`Copy`** でクリップボードコピー）できます。
+  - **専用保存フォルダ・最適自動命名＆任意ファイル名編集・プログレスバー**: デフォルト保存先は **`~/Movies/AirRec`**（自動作成）で、エディタの **`Save to`** ドロップダウンまたはメニューバー **`◉ Rec` → `Save Folder`** からいつでも任意のフォルダ（`~/Movies`・`~/Desktop`・`~/Downloads`・`~/Documents` や **`Choose Folder...`** での新規フォルダ作成）へ変更・記憶できます。自動ファイル名は時系列順で並び検索しやすい **`YYYY-MM-DD_HH-MM-SS_AirRec`**（ウィンドウ録画時は対象アプリ名も付与）を初期表示し、エディタの **`Name`** 欄で任意の名前にそのまま編集してプログレスバー付きで即保存（または **`Copy`** でクリップボードコピー）できます。
 - **プライバシー重視のローカル完結設計**
   - ネットワーク通信・外部テレメトリ送信は一切ありません。
   - **画面ロック・スリープ時の自動停止＆安全保存**: macOS の画面ロック・ユーザー切替・ディスプレイ／システムスリープを検知すると通常録画・タイムラプスを自動停止し、検知時点までの録画をローカル退避先（`Recovered`）へ安全保存した上でエディタで開きます（タイムラプスは各コマの撮影前・書き込み前にもセッションのロック状態を確認します）。
@@ -53,11 +53,11 @@ Electron（Chromium + Node.js）ベースの画面録画ツールと異なり、
 git clone https://github.com/noricha-vr/quick-screen-recorder.git
 cd quick-screen-recorder
 
-# Release ビルドと dist/QuickScreenRecorder.app の作成（ad-hoc 署名）
+# Release ビルドと dist/AirRec.app の作成（ad-hoc 署名）
 make bundle
 
 # 起動（メニューバーに「◉ Rec」が表示されます）
-open dist/QuickScreenRecorder.app
+open dist/AirRec.app
 
 # /Applications へ安全に導入（ad-hoc の署名ハッシュ変化時は ScreenCapture / Microphone の古い TCC を自動リセット）
 make install
@@ -71,7 +71,7 @@ make install
 2. メニューバーの **`◉ Rec` → `New Recording...`** をクリックするか、グローバルショートカット **`Cmd + Shift + 6`** を押します（`Esc` でキャンセル）。
 3. **Area / Window / Screen**、比率、解像度、フレームレート（`60`〜`1 fps` 実時間、または `1f/5s`〜`1f/1m` タイムラプス）、音声、カーソル・クリック強調を選び、**`● Record`** を押して録画を開始します。
 4. 録画中はメニューバーに経過秒数（`● 00:08`）が表示されます。メニューの **`Stop Recording`** または **`Cmd + Shift + 6`** で停止します。
-5. 自動で開く **Trim & Export** ウィンドウで **`IN` / `OUT`** 範囲、フォーマット、最大幅、**`Save to`** 保存先フォルダ（既定 `~/Movies/Quick Screen Recorder`、メニューバー **`◉ Rec` → `Save Folder`** からも変更可）、必要に応じて **`Name`** ファイル名欄（自動生成 `YYYY-MM-DD_HH-MM-SS_Quick-Screen-Recorder` 等）を調整し、**`Copy`** または **`Save`** を押します。
+5. 自動で開く **Trim & Export** ウィンドウで **`IN` / `OUT`** 範囲、フォーマット、最大幅、**`Save to`** 保存先フォルダ（既定 `~/Movies/AirRec`、メニューバー **`◉ Rec` → `Save Folder`** からも変更可）、必要に応じて **`Name`** ファイル名欄（自動生成 `YYYY-MM-DD_HH-MM-SS_AirRec` 等）を調整し、**`Copy`** または **`Save`** を押します。
 
 ## ライセンス
 

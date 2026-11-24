@@ -414,14 +414,14 @@ fn parse_region(spec: &str) -> Result<Rect, String> {
 
 pub fn usage_text() -> &'static str {
     "\
-Quick Screen Recorder — Fast native screen recorder for macOS (ScreenCaptureKit + Rust)
+AirRec — Fast native screen recorder for macOS (ScreenCaptureKit + Rust)
 
 USAGE:
-  quick-screen-recorder [--select | --edit <video.mp4>]
-  quick-screen-recorder record --output <out.mp4> [--duration <sec>] [--region x,y,w,h] [--fps 1..120 | --interval <sec>] [--codec h264|hevc] [--audio none|system|mic|both] [--no-cursor] [--no-clicks]
-  quick-screen-recorder convert --input <in.mp4> --output <out.ext> [--format mp4|hevc|gif|apng|webm|av1] [--fps 30] [--start <sec>] [--end <sec>] [--max-width <px>] [--mute]
-  quick-screen-recorder doctor
-  quick-screen-recorder stats
+  airrec [--select | --edit <video.mp4>]
+  airrec record --output <out.mp4> [--duration <sec>] [--region x,y,w,h] [--fps 1..120 | --interval <sec>] [--codec h264|hevc] [--audio none|system|mic|both] [--no-cursor] [--no-clicks]
+  airrec convert --input <in.mp4> --output <out.ext> [--format mp4|hevc|gif|apng|webm|av1] [--fps 30] [--start <sec>] [--end <sec>] [--max-width <px>] [--mute]
+  airrec doctor
+  airrec stats
 "
 }
 

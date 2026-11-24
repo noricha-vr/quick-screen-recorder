@@ -9,6 +9,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
+name = "airrec"
+version = "0.6.0"
+dependencies = [
+ "block2",
+ "color_quant",
+ "dispatch2",
+ "gif",
+ "libc",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-av-foundation",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
+ "objc2-core-media",
+ "objc2-core-video",
+ "objc2-foundation",
+ "objc2-quartz-core",
+ "objc2-screen-capture-kit",
+ "png",
+ "rayon",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -473,31 +498,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "quick-screen-recorder"
-version = "0.5.3"
-dependencies = [
- "block2",
- "color_quant",
- "dispatch2",
- "gif",
- "libc",
- "objc2",
- "objc2-app-kit",
- "objc2-av-foundation",
- "objc2-core-foundation",
- "objc2-core-graphics",
- "objc2-core-media",
- "objc2-core-video",
- "objc2-foundation",
- "objc2-quartz-core",
- "objc2-screen-capture-kit",
- "png",
- "rayon",
- "serde",
- "serde_json",
 ]
 
 [[package]]

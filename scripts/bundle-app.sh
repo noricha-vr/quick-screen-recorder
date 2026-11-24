@@ -2,10 +2,10 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APP_NAME="Quick Screen Recorder"
-BUNDLE_NAME="QuickScreenRecorder.app"
-BUNDLE_ID="io.github.noricha-vr.quick-screen-recorder"
-BIN_NAME="quick-screen-recorder"
+APP_NAME="AirRec"
+BUNDLE_NAME="AirRec.app"
+BUNDLE_ID="io.github.noricha-vr.airrec"
+BIN_NAME="airrec"
 VERSION="$(awk -F'"' '/^version = / { print $2; exit }' "$ROOT_DIR/Cargo.toml")"
 
 OUT_DIR="$ROOT_DIR/dist"
@@ -30,7 +30,7 @@ ICONSET_TMP="$(mktemp -d "${TMPDIR:-/tmp}/qsr-icon.XXXXXX")"
 ICONSET_DIR="$ICONSET_TMP/AppIcon.iconset"
 mkdir -p "$ICONSET_DIR"
 
-/usr/bin/python3 - "$ICONSET_DIR" << 'PY'
+/usr/bin/python3 -I - "$ICONSET_DIR" << 'PY'
 import math, struct, sys, zlib, os
 
 out_dir = sys.argv[1]
@@ -48,49 +48,79 @@ def write_png(path, w, h, rgba_bytes):
     with open(path, "wb") as f:
         f.write(png)
 
+def clamp01(v):
+    return 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
+
 def render_icon(size):
     buf = bytearray(size * size * 4)
-    cx = cy = (size - 1) * 0.5
-    pad = size * 0.08
-    half = size * 0.5 - pad
-    corner = size * 0.22
-    ring_r = size * 0.25
-    dot_r = size * 0.14
+    scale = 128.0 / size
+    aa_w = scale * 0.85
+
+    # macOS squircle bounds in 128x128 design space
+    sq_half = 54.0
+    sq_rad = 24.5
+    inner_sq = sq_half - sq_rad
 
     for y in range(size):
+        v = (y + 0.5) * scale
+        t = clamp01((v - 10.0) / 108.0)
+        bg_r = 30.0 * (1.0 - t) + 15.0 * t
+        bg_g = 38.0 * (1.0 - t) + 19.0 * t
+        bg_b = 56.0 * (1.0 - t) + 29.0 * t
+        ay = abs(v - 64.0)
+        dy_sq = ay - inner_sq
+
         for x in range(size):
-            dx = abs(x - cx) - (half - corner)
-            dy = abs(y - cy) - (half - corner)
-            outside = math.hypot(max(dx, 0.0), max(dy, 0.0)) + min(max(dx, dy), 0.0) - corner
-            if outside > 0.8:
+            u = (x + 0.5) * scale
+            ax = abs(u - 64.0)
+            dx_sq = ax - inner_sq
+            sq_d = math.hypot(max(dx_sq, 0.0), max(dy_sq, 0.0)) + min(max(dx_sq, dy_sq), 0.0) - sq_rad
+            if sq_d > aa_w:
                 continue
-            aa = max(0.0, min(1.0, 0.8 - outside))
-            t = y / max(size - 1, 1)
-            r = int(20 + 18 * (1.0 - t))
-            g = int(24 + 22 * (1.0 - t))
-            b = int(38 + 30 * (1.0 - t))
+            alpha = clamp01((aa_w - sq_d) / (2.0 * aa_w))
 
-            dist = math.hypot(x - cx, y - cy)
-            # Crisp white viewfinder ring
-            ring_d = abs(dist - ring_r)
-            if ring_d < size * 0.032:
-                blend = max(0.0, min(1.0, (size * 0.032 - ring_d) / max(size * 0.012, 0.5)))
-                r = int(r * (1 - blend) + 245 * blend)
-                g = int(g * (1 - blend) + 248 * blend)
-                b = int(b * (1 - blend) + 255 * blend)
+            r, g, b = bg_r, bg_g, bg_b
 
-            # Vivid red record core
-            if dist < dot_r + 1.0:
-                blend = max(0.0, min(1.0, dot_r + 0.6 - dist))
-                r = int(r * (1 - blend) + 255 * blend)
-                g = int(g * (1 - blend) + 64 * blend)
-                b = int(b * (1 - blend) + 58 * blend)
+            # Subtle 1.2px inner rim highlight for macOS depth
+            if sq_d > -1.8:
+                rim = clamp01((sq_d + 1.8) / 1.8) * 0.14
+                r = r * (1.0 - rim) + 255.0 * rim
+                g = g * (1.0 - rim) + 255.0 * rim
+                b = b * (1.0 - rim) + 255.0 * rim
+
+            # Folded 1st-quadrant viewfinder corner bracket (exact rounded L-bracket with round caps)
+            cx_h = 18.0 if ax < 18.0 else (30.0 if ax > 30.0 else ax)
+            d_h = math.hypot(ax - cx_h, ay - 36.0)
+            cy_v = 18.0 if ay < 18.0 else (30.0 if ay > 30.0 else ay)
+            d_v = math.hypot(ax - 36.0, ay - cy_v)
+            if ax >= 30.0 and ay >= 30.0:
+                d_arc = abs(math.hypot(ax - 30.0, ay - 30.0) - 6.0)
+            else:
+                d_arc = 1e9
+            d_br = min(d_h, d_v, d_arc) - 3.75
+            if d_br < aa_w:
+                bl = clamp01((aa_w - d_br) / (2.0 * aa_w))
+                r = r * (1.0 - bl) + 238.0 * bl
+                g = g * (1.0 - bl) + 244.0 * bl
+                b = b * (1.0 - bl) + 255.0 * bl
+
+            # Vivid radial-shaded red record core
+            d_core = math.hypot(u - 64.0, v - 64.0) - 22.0
+            if d_core < aa_w:
+                bl = clamp01((aa_w - d_core) / (2.0 * aa_w))
+                rt = clamp01(math.hypot(u - 57.0, v - 54.0) / 30.0)
+                cr = 255.0 * (1.0 - rt) + 217.0 * rt
+                cg = 94.0 * (1.0 - rt) + 38.0 * rt
+                cb = 87.0 * (1.0 - rt) + 38.0 * rt
+                r = r * (1.0 - bl) + cr * bl
+                g = g * (1.0 - bl) + cg * bl
+                b = b * (1.0 - bl) + cb * bl
 
             i = (y * size + x) * 4
-            buf[i] = r
-            buf[i + 1] = g
-            buf[i + 2] = b
-            buf[i + 3] = int(255 * aa)
+            buf[i] = int(r + 0.5)
+            buf[i + 1] = int(g + 0.5)
+            buf[i + 2] = int(b + 0.5)
+            buf[i + 3] = int(255.0 * alpha + 0.5)
     return buf
 
 specs = [
@@ -103,6 +133,7 @@ specs = [
     ("icon_256x256.png", 256),
     ("icon_256x256@2x.png", 512),
     ("icon_512x512.png", 512),
+    ("icon_512x512@2x.png", 1024),
 ]
 cache = {}
 for filename, px in specs:
@@ -148,9 +179,9 @@ cat > "$CONTENTS_DIR/Info.plist" << EOF
   <key>NSHighResolutionCapable</key>
   <true/>
   <key>NSScreenCaptureUsageDescription</key>
-  <string>Quick Screen Recorder captures your selected screen region or window locally on your Mac.</string>
+  <string>AirRec captures your selected screen region or window locally on your Mac.</string>
   <key>NSMicrophoneUsageDescription</key>
-  <string>Quick Screen Recorder records microphone audio locally only when Microphone capture is enabled.</string>
+  <string>AirRec records microphone audio locally only when Microphone capture is enabled.</string>
 </dict>
 </plist>
 EOF

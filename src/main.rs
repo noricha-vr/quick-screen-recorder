@@ -1,18 +1,16 @@
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use quick_screen_recorder::capture::shareable::query_shareable_content;
-use quick_screen_recorder::capture::{
+use airrec::capture::shareable::query_shareable_content;
+use airrec::capture::{
     ActiveRecording, CaptureConfig, CaptureTarget, SystemInterruptMonitor, pump_current_runloop,
 };
-use quick_screen_recorder::cli::{Command, parse_args, usage_text};
-use quick_screen_recorder::export::{ExportRequest, run_export};
-use quick_screen_recorder::fs_safety::sanitize_terminal_text;
-use quick_screen_recorder::observe::{
-    default_perf_log_path, format_perf_summary, summarize_perf_log,
-};
-use quick_screen_recorder::permissions::doctor_report;
-use quick_screen_recorder::ui::run_gui;
+use airrec::cli::{Command, parse_args, usage_text};
+use airrec::export::{ExportRequest, run_export};
+use airrec::fs_safety::sanitize_terminal_text;
+use airrec::observe::{default_perf_log_path, format_perf_summary, summarize_perf_log};
+use airrec::permissions::doctor_report;
+use airrec::ui::run_gui;
 
 fn main() -> ExitCode {
     let args = std::env::args().skip(1);
@@ -40,7 +38,7 @@ fn execute(command: Command) -> Result<(), String> {
             Ok(())
         }
         Command::Version => {
-            println!("quick-screen-recorder {}", env!("CARGO_PKG_VERSION"));
+            println!("airrec {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Command::Doctor => {

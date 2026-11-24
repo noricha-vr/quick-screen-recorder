@@ -2,13 +2,13 @@ use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
-use quick_screen_recorder::capture::recorder::is_valid_salvageable_mp4;
-use quick_screen_recorder::capture::{RecordingCodec, TIMELAPSE_PLAYBACK_FPS};
-use quick_screen_recorder::export::av_writer::{StreamingMp4Writer, write_rgba_frames_to_mp4};
-use quick_screen_recorder::export::avfoundation::{RgbaFrame, probe_video_metadata};
-use quick_screen_recorder::export::{ExportFormat, ExportRequest, run_export};
-use quick_screen_recorder::fs_safety::{ExclusiveStagingDir, next_unique_token};
-use quick_screen_recorder::staging::commit_or_recover_staging_with_policy;
+use airrec::capture::recorder::is_valid_salvageable_mp4;
+use airrec::capture::{RecordingCodec, TIMELAPSE_PLAYBACK_FPS};
+use airrec::export::av_writer::{StreamingMp4Writer, write_rgba_frames_to_mp4};
+use airrec::export::avfoundation::{RgbaFrame, probe_video_metadata};
+use airrec::export::{ExportFormat, ExportRequest, run_export};
+use airrec::fs_safety::{ExclusiveStagingDir, next_unique_token};
+use airrec::staging::commit_or_recover_staging_with_policy;
 
 fn make_temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("qsr-it-{name}-{}", next_unique_token()));

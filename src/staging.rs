@@ -292,7 +292,7 @@ impl ExclusiveStagingDir {
             .canon_dest
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("Quick-Screen-Recorder");
+            .unwrap_or("AirRec");
 
         for suffix in 2..=9999_u32 {
             let candidate = format!("{raw_stem}-{suffix}.{ext}");

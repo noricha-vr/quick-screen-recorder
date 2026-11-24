@@ -13,7 +13,8 @@ use crate::fs_safety::{
 };
 use crate::geometry::{AspectRatio, Rect};
 
-pub const APP_SUPPORT_DIR_NAME: &str = "QuickScreenRecorder";
+pub const APP_SUPPORT_DIR_NAME: &str = "AirRec";
+const LEGACY_APP_SUPPORT_DIR_NAME: &str = "QuickScreenRecorder";
 const MAX_PREFS_BYTES: u64 = 65_536;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -91,7 +92,7 @@ impl Preferences {
         }
     }
 
-    /// Resolves the pre-selected persistent export destination directory, defaulting to `~/Movies/Quick Screen Recorder`.
+    /// Resolves the pre-selected persistent export destination directory, defaulting to `~/Movies/AirRec`.
     pub fn resolved_export_dir(&self) -> Option<PathBuf> {
         if let Some(dir) = &self.export_dir {
             if is_usable_export_dir(dir) {
@@ -111,17 +112,38 @@ impl Preferences {
         )
     }
 
+    pub fn legacy_path() -> Option<PathBuf> {
+        let home = valid_home_dir()?;
+        Some(
+            home.join("Library")
+                .join("Application Support")
+                .join(LEGACY_APP_SUPPORT_DIR_NAME)
+                .join("preferences.json"),
+        )
+    }
+
     pub fn load() -> Self {
         match Self::default_path() {
-            Some(path) => Self::load_or_default_at(&path),
+            Some(path) => Self::load_or_migrate(&path, Self::legacy_path().as_deref()),
             None => Self::fail_closed_defaults(),
         }
     }
 
     pub fn load_or_default_at(path: &Path) -> Self {
-        match Self::load_from(path) {
+        Self::load_or_migrate(path, None)
+    }
+
+    pub fn load_or_migrate(primary: &Path, legacy: Option<&Path>) -> Self {
+        match Self::load_from(primary) {
             Ok(prefs) => prefs,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Self::default(),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => match legacy {
+                Some(legacy_path) => match Self::load_from(legacy_path) {
+                    Ok(prefs) => prefs,
+                    Err(le) if le.kind() == io::ErrorKind::NotFound => Self::default(),
+                    Err(_) => Self::fail_closed_defaults(),
+                },
+                None => Self::default(),
+            },
             Err(_) => Self::fail_closed_defaults(),
         }
     }
@@ -387,5 +409,56 @@ mod tests {
         assert_eq!(from_link.mic_input, MicInputPreference::Off);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_or_migrate_inherits_legacy_preferences_and_fails_closed_on_corrupt_legacy() {
+        let base = std::env::temp_dir().join(format!(
+            "qsr-migrate-{}",
+            crate::fs_safety::next_unique_token()
+        ));
+        let primary = base.join("AirRec").join("preferences.json");
+        let legacy_dir = base.join("QuickScreenRecorder");
+        let legacy = legacy_dir.join("preferences.json");
+        std::fs::create_dir_all(&legacy_dir).expect("mkdir legacy");
+
+        // 1. Legacy prefs with system audio OFF + specific mic device must be preserved when primary is absent.
+        let legacy_prefs = Preferences {
+            capture_system_audio: false,
+            mic_input: MicInputPreference::Device {
+                id: "usb-mic-01".to_string(),
+                name: "USB Mic".to_string(),
+            },
+            audio_mode: AudioCaptureMode::Microphone,
+            ..Preferences::default()
+        };
+        legacy_prefs.save_to(&legacy).expect("save legacy");
+        let loaded = Preferences::load_or_migrate(&primary, Some(&legacy));
+        assert!(!loaded.capture_system_audio);
+        assert_eq!(loaded.mic_input, legacy_prefs.mic_input);
+        assert_eq!(loaded.effective_audio_mode(), AudioCaptureMode::Microphone);
+
+        // 2. Corrupt legacy prefs must fail closed with both audio channels OFF.
+        atomic_write_private(&legacy, b"{not valid json").expect("write corrupt legacy");
+        let corrupt = Preferences::load_or_migrate(&primary, Some(&legacy));
+        assert!(!corrupt.capture_system_audio);
+        assert_eq!(corrupt.mic_input, MicInputPreference::Off);
+        assert_eq!(corrupt.effective_audio_mode(), AudioCaptureMode::None);
+
+        // 3. Existing primary prefs always win over legacy.
+        let primary_dir = primary.parent().expect("primary parent");
+        std::fs::create_dir_all(primary_dir).expect("mkdir primary");
+        let primary_prefs = Preferences {
+            capture_system_audio: true,
+            mic_input: MicInputPreference::Off,
+            audio_mode: AudioCaptureMode::SystemAudio,
+            ..Preferences::default()
+        };
+        primary_prefs.save_to(&primary).expect("save primary");
+        let loaded_primary = Preferences::load_or_migrate(&primary, Some(&legacy));
+        assert!(loaded_primary.capture_system_audio);
+        assert_eq!(loaded_primary.mic_input, MicInputPreference::Off);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

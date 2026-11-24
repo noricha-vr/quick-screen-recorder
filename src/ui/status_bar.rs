@@ -192,7 +192,7 @@ impl StatusBarController {
         let quit_item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
                 NSMenuItem::alloc(mtm),
-                &NSString::from_str("Quit Quick Screen Recorder"),
+                &NSString::from_str("Quit AirRec"),
                 Some(sel!(onQuitAction:)),
                 &NSString::from_str("q"),
             )

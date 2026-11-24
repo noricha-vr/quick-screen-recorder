@@ -59,9 +59,9 @@ fn pwuid_home_dir() -> Option<PathBuf> {
     p.is_absolute().then_some(p)
 }
 
-/// Returns `~/Movies/Quick Screen Recorder` (creating it privately if needed) when available as a
+/// Returns `~/Movies/AirRec` (creating it privately if needed) when available as a
 /// verified writable persistent directory owned by the current user, falling back safely to
-/// `~/Movies`, `~/Desktop`, `HOME`, or `~/Library/Application Support/QuickScreenRecorder/Exports`.
+/// `~/Movies`, `~/Desktop`, `HOME`, or `~/Library/Application Support/AirRec/Exports`.
 /// Never falls back to `/tmp` or auto-pruned cache directories (`None` prompts user to pick a folder).
 pub fn default_movies_export_dir() -> Option<PathBuf> {
     let home = valid_home_dir()?;
