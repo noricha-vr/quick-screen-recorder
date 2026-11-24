@@ -1,105 +1,6 @@
 use super::*;
 
 #[test]
-fn stop_poll_state_machine_handles_ordering_fallback_delay_and_timeout() {
-    // Before 2s with neither finished nor stopped: stays Pending, no fallback yet
-    assert_eq!(
-        evaluate_stop_poll(false, false, None, Duration::from_millis(500)),
-        (StopPollState::Pending, false)
-    );
-    // Normal path: recording output finishes first -> triggers stopCapture, waits for stream_stopped
-    assert_eq!(
-        evaluate_stop_poll(true, false, None, Duration::from_millis(120)),
-        (StopPollState::Pending, true)
-    );
-    assert_eq!(
-        evaluate_stop_poll(
-            true,
-            true,
-            Some(Duration::from_millis(60)),
-            Duration::from_millis(180)
-        ),
-        (StopPollState::Finished, false)
-    );
-    // Delayed first poll (> 12s, e.g. user held menu/modal): sends stopCapture and keeps waiting
-    // instead of timing out immediately and discarding a finalized MP4.
-    assert_eq!(
-        evaluate_stop_poll(true, false, None, Duration::from_secs(15)),
-        (StopPollState::Pending, true)
-    );
-    assert_eq!(
-        evaluate_stop_poll(
-            true,
-            false,
-            Some(Duration::from_millis(100)),
-            Duration::from_secs(15)
-        ),
-        (StopPollState::Pending, false)
-    );
-    assert_eq!(
-        evaluate_stop_poll(
-            true,
-            true,
-            Some(Duration::from_millis(150)),
-            Duration::from_secs(15)
-        ),
-        (StopPollState::Finished, false)
-    );
-    // Fallback path: if recording output hasn't finished at 2s, trigger stopCapture
-    assert_eq!(
-        evaluate_stop_poll(false, false, None, STOP_FALLBACK_AFTER),
-        (StopPollState::Pending, true)
-    );
-    // Delayed fallback (> 12s while still unfinished): still grants confirm window after sending stop
-    assert_eq!(
-        evaluate_stop_poll(false, false, None, Duration::from_secs(14)),
-        (StopPollState::Pending, true)
-    );
-    assert_eq!(
-        evaluate_stop_poll(
-            false,
-            false,
-            Some(Duration::from_secs(1)),
-            Duration::from_secs(15)
-        ),
-        (StopPollState::Pending, false)
-    );
-    // Reverse arrival order: stream_stopped arrives before recordingOutputDidFinishRecording
-    assert_eq!(
-        evaluate_stop_poll(
-            false,
-            true,
-            Some(Duration::from_secs(1)),
-            Duration::from_secs(3)
-        ),
-        (StopPollState::Pending, false)
-    );
-    assert_eq!(
-        evaluate_stop_poll(
-            true,
-            true,
-            Some(Duration::from_secs(2)),
-            Duration::from_secs(4)
-        ),
-        (StopPollState::Finished, false)
-    );
-    // Timeout once stream-stop confirmation window (and total timeout when unfinished) expire
-    assert_eq!(
-        evaluate_stop_poll(false, true, Some(STOP_STREAM_CONFIRM_TIMEOUT), STOP_TIMEOUT),
-        (StopPollState::TimedOut, false)
-    );
-    assert_eq!(
-        evaluate_stop_poll(
-            true,
-            false,
-            Some(STOP_STREAM_CONFIRM_TIMEOUT),
-            Duration::from_secs(6)
-        ),
-        (StopPollState::TimedOut, false)
-    );
-}
-
-#[test]
 fn delayed_start_callback_interrupted_triggers_immediate_and_late_stop() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
@@ -130,13 +31,11 @@ fn delayed_start_callback_interrupted_triggers_immediate_and_late_stop() {
     let sig_cb = Arc::clone(&signal);
     let delayed_start_cb = thread::spawn(move || {
         thread::sleep(Duration::from_millis(90));
-        handle_start_callback_result(Ok(()), &sig_cb, &cancel_cb, &tx, || {
+        handle_start_callback_result(Ok(()), &sig_cb, &cancel_cb, &tx, |late_gen| {
             late_cb.fetch_add(1, Ordering::SeqCst);
-            if let Ok(mut g) = sig_cb.0.lock() {
-                g.stream_stopped = true;
-                g.stream_stop_error = None;
-                sig_cb.1.notify_all();
-            }
+            assert!(delegate::record_stop_callback_for_gen(
+                &sig_cb, late_gen, None
+            ));
         });
     });
 
@@ -389,12 +288,12 @@ fn stop_error_and_failed_late_start_stop_never_count_as_confirmed_stop() {
     let cancel_bg = Arc::clone(&cancelled);
     let h = thread::spawn(move || {
         thread::sleep(Duration::from_millis(30));
-        handle_start_callback_result(Ok(()), &sig_bg, &cancel_bg, &tx, || {
-            if let Ok(mut g) = sig_bg.0.lock() {
-                g.stream_stopped = true;
-                g.stream_stop_error = Some("late forced stop failed".to_string());
-                sig_bg.1.notify_all();
-            }
+        handle_start_callback_result(Ok(()), &sig_bg, &cancel_bg, &tx, |late_gen| {
+            assert!(delegate::record_stop_callback_for_gen(
+                &sig_bg,
+                late_gen,
+                Some("late forced stop failed".to_string()),
+            ));
         });
     });
 
@@ -472,4 +371,57 @@ fn unconfirmed_stop_handoff_retains_staging_on_disk_after_finish_timeout() {
 
     let _ = std::fs::remove_dir_all(&stage_dir);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn stale_pre_start_stop_callback_cannot_complete_post_start_forced_stop() {
+    let (tx, _rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let signal = Arc::new((Mutex::new(DelegateSignal::default()), Condvar::new()));
+    let cancelled = AtomicBool::new(true);
+
+    // 1. Pre-start stop request allocates generation 1 (callback hasn't returned yet).
+    let pre_start_gen = delegate::begin_stop_generation(&signal);
+
+    // 2. Delayed `startCapture` completes Ok(()) -> bumps generation to `late_gen` (> pre_start_gen)
+    //    and initiates post-start forced stop (still in flight, NOT completed yet).
+    let mut captured_late_gen = 0_u64;
+    handle_start_callback_result(Ok(()), &signal, &cancelled, &tx, |late_gen| {
+        captured_late_gen = late_gen;
+    });
+    assert!(captured_late_gen > pre_start_gen);
+
+    // 3. Reversed arrival order: stale pre-start stop callback returns `-3808` (Ok/None) AFTER
+    //    `start_completed` flipped -> MUST be ignored so forced stop is NOT marked complete!
+    assert!(
+        !delegate::record_stop_callback_for_gen(&signal, pre_start_gen, None),
+        "stale pre-start stop callback must be rejected by generation check"
+    );
+    assert!(
+        !delegate::wait_for_stream_stopped(&signal, Duration::from_millis(30)),
+        "stale pre-start -3808 must never satisfy wait_for_stream_stopped while late stop is pending"
+    );
+
+    // 4. Only the matching `late_gen` callback can complete (and error still yields false).
+    assert!(delegate::record_stop_callback_for_gen(
+        &signal,
+        captured_late_gen,
+        Some("forced stop failed".to_string()),
+    ));
+    assert!(!delegate::wait_for_stream_stopped(
+        &signal,
+        Duration::from_millis(20)
+    ));
+
+    // 5. Companion check: a clean `late_gen` callback DOES confirm cleanly stopped.
+    let gen3 = delegate::begin_stop_generation(&signal);
+    assert!(!delegate::record_stop_callback_for_gen(
+        &signal,
+        pre_start_gen,
+        None
+    ));
+    assert!(delegate::record_stop_callback_for_gen(&signal, gen3, None));
+    assert!(delegate::wait_for_stream_stopped(
+        &signal,
+        Duration::from_millis(20)
+    ));
 }

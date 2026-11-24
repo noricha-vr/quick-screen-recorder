@@ -21,11 +21,11 @@ mod finish;
 
 use delegate::{
     DelegateSignal, RecordingDelegate, SendableStreamStop, StartWaitOutcome, StreamStopControl,
-    evaluate_stop_poll, handle_start_callback_result, wait_for_capture_start_with_interrupt,
+    handle_start_callback_result, wait_for_capture_start_with_interrupt,
     wait_for_recording_started,
 };
-use finish::finalize_stop_staging_outcome;
 pub use finish::is_valid_salvageable_mp4;
+use finish::{evaluate_stop_poll, finalize_stop_staging_outcome};
 
 use crate::capture::filter::build_filter_and_dimensions;
 use crate::capture::shareable::query_shareable_content_for_capture;
@@ -241,8 +241,8 @@ impl RecordingSession {
             } else {
                 Ok(())
             };
-            handle_start_callback_result(res, &sig_cb, &cancel_cb, &tx, || {
-                stopper_cb.stop_force_on_late_start();
+            handle_start_callback_result(res, &sig_cb, &cancel_cb, &tx, |late_gen| {
+                stopper_cb.stop_force_on_late_start(late_gen);
             });
         });
 

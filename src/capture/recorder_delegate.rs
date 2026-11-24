@@ -10,16 +10,13 @@ use objc2_screen_capture_kit::{
     SCRecordingOutput, SCRecordingOutputDelegate, SCStream, SCStreamErrorCode,
 };
 
-use crate::capture::recorder::{
-    STOP_FALLBACK_AFTER, STOP_STREAM_CONFIRM_TIMEOUT, STOP_TIMEOUT, StopPollState,
-};
-
 #[derive(Default)]
 pub(super) struct DelegateSignal {
     pub(super) start_completed: bool,
     pub(super) started: bool,
     pub(super) finished: bool,
     pub(super) error: Option<String>,
+    pub(super) stop_gen: u64,
     pub(super) stream_stopped: bool,
     pub(super) stream_stop_error: Option<String>,
 }
@@ -28,6 +25,40 @@ pub(super) struct DelegateSignal {
 /// `stopCapture` succeeded without error (rejecting stop errors and pre-start `-3808` races).
 pub(super) fn is_cleanly_stopped(s: &DelegateSignal) -> bool {
     s.start_completed && s.stream_stopped && s.stream_stop_error.is_none()
+}
+
+/// Allocates a fresh monotonic stop generation and clears prior stop completion state so any
+/// older in-flight stop callback can never mark this newer stop request as completed.
+pub(super) fn begin_stop_generation(signal: &Arc<(Mutex<DelegateSignal>, Condvar)>) -> u64 {
+    let (lock, _) = &**signal;
+    if let Ok(mut guard) = lock.lock() {
+        guard.stop_gen = guard.stop_gen.wrapping_add(1);
+        guard.stream_stopped = false;
+        guard.stream_stop_error = None;
+        guard.stop_gen
+    } else {
+        0
+    }
+}
+
+/// Records a `stopCapture` completion result ONLY if its `expected_gen` still matches the latest
+/// stop generation on `signal`. Returns `false` when an obsolete pre-start callback arrives late.
+pub(super) fn record_stop_callback_for_gen(
+    signal: &Arc<(Mutex<DelegateSignal>, Condvar)>,
+    expected_gen: u64,
+    stop_err: Option<String>,
+) -> bool {
+    let (lock, cvar) = &**signal;
+    if let Ok(mut guard) = lock.lock() {
+        if guard.stop_gen != expected_gen {
+            return false;
+        }
+        guard.stream_stopped = true;
+        guard.stream_stop_error = stop_err;
+        cvar.notify_all();
+        return true;
+    }
+    false
 }
 
 /// Shared one-shot guard ensuring `removeRecordingOutput` and `stopCaptureWithCompletionHandler`
@@ -54,6 +85,10 @@ impl StreamStopControl {
         }
     }
 
+    pub(super) fn mark_stop_capture_sent(&self) {
+        self.stop_capture_sent.store(true, Ordering::Release);
+    }
+
     pub(super) fn trigger_stop_capture_once(
         &self,
         stream: &SCStream,
@@ -62,6 +97,7 @@ impl StreamStopControl {
         if self.stop_capture_sent.swap(true, Ordering::AcqRel) {
             return;
         }
+        let expected_gen = begin_stop_generation(signal);
         let sig = Arc::clone(signal);
         let stop_block = RcBlock::new(move |err: *mut NSError| {
             let stop_err = if !err.is_null() {
@@ -75,14 +111,7 @@ impl StreamStopControl {
             } else {
                 None
             };
-            let (lock, cvar) = &*sig;
-            if let Ok(mut guard) = lock.lock() {
-                guard.stream_stopped = true;
-                if stop_err.is_some() {
-                    guard.stream_stop_error = stop_err;
-                }
-                cvar.notify_all();
-            }
+            let _ = record_stop_callback_for_gen(&sig, expected_gen, stop_err);
         });
         unsafe {
             stream.stopCaptureWithCompletionHandler(Some(&stop_block));
@@ -144,9 +173,10 @@ impl SendableStreamStop {
     }
 
     /// Unconditional teardown used when a delayed `startCapture` completion handler succeeds
-    /// AFTER startup was already cancelled by an interrupt/timeout. Installs a real completion
-    /// handler so `signal` records whether the post-start stop succeeded or failed.
-    pub(super) fn stop_force_on_late_start(&self) {
+    /// AFTER startup was already cancelled by an interrupt/timeout. Uses the fresh `expected_gen`
+    /// allocated when `start_completed` flipped so earlier pre-start callbacks are ignored.
+    pub(super) fn stop_force_on_late_start(&self, expected_gen: u64) {
+        self.control.mark_stop_capture_sent();
         autoreleasepool(|_| {
             let _ = unsafe {
                 self.stream
@@ -164,12 +194,7 @@ impl SendableStreamStop {
                 } else {
                     None
                 };
-                let (lock, cvar) = &*sig;
-                if let Ok(mut guard) = lock.lock() {
-                    guard.stream_stopped = true;
-                    guard.stream_stop_error = stop_err;
-                    cvar.notify_all();
-                }
+                let _ = record_stop_callback_for_gen(&sig, expected_gen, stop_err);
             });
             unsafe {
                 self.stream
@@ -306,35 +331,42 @@ pub(super) fn handle_start_callback_result<C>(
     tx: &mpsc::SyncSender<Result<(), String>>,
     on_late_start_cleanup: C,
 ) where
-    C: FnOnce(),
+    C: FnOnce(u64),
 {
-    let reset_for_late_stop = || {
+    let reset_for_late_stop = || -> u64 {
         let (lock, cvar) = &**signal;
         if let Ok(mut guard) = lock.lock() {
             guard.start_completed = true;
+            guard.stop_gen = guard.stop_gen.wrapping_add(1);
             guard.stream_stopped = false;
             guard.stream_stop_error = None;
+            let next_gen = guard.stop_gen;
             cvar.notify_all();
+            next_gen
+        } else {
+            0
         }
     };
     if res.is_err() {
         let (lock, cvar) = &**signal;
         if let Ok(mut guard) = lock.lock() {
             guard.start_completed = true;
+            guard.stop_gen = guard.stop_gen.wrapping_add(1);
             guard.stream_stopped = true;
+            guard.stream_stop_error = None;
             cvar.notify_all();
         }
         let _ = tx.send(res);
         return;
     }
     if cancelled_after_start.load(Ordering::Acquire) {
-        reset_for_late_stop();
-        on_late_start_cleanup();
+        let late_gen = reset_for_late_stop();
+        on_late_start_cleanup(late_gen);
         return;
     }
     if tx.send(res).is_err() || cancelled_after_start.load(Ordering::Acquire) {
-        reset_for_late_stop();
-        on_late_start_cleanup();
+        let late_gen = reset_for_late_stop();
+        on_late_start_cleanup(late_gen);
         return;
     }
     let (lock, cvar) = &**signal;
@@ -457,31 +489,4 @@ where
         return Ok(());
     }
     Err(timeout_msg)
-}
-
-/// Pure transition table for [`crate::capture::recorder::PendingRecordingStop::poll`].
-/// Returns `(next_poll_state, should_send_stop_capture)`.
-pub(super) fn evaluate_stop_poll(
-    finished: bool,
-    stream_stopped: bool,
-    stop_sent_elapsed: Option<Duration>,
-    total_elapsed: Duration,
-) -> (StopPollState, bool) {
-    if finished && stream_stopped {
-        return (StopPollState::Finished, stop_sent_elapsed.is_none());
-    }
-    if stop_sent_elapsed.is_none() && (finished || total_elapsed >= STOP_FALLBACK_AFTER) {
-        return (StopPollState::Pending, true);
-    }
-    let timed_out = match stop_sent_elapsed {
-        Some(sent_for) if finished => sent_for >= STOP_STREAM_CONFIRM_TIMEOUT,
-        Some(sent_for) => total_elapsed >= STOP_TIMEOUT && sent_for >= STOP_STREAM_CONFIRM_TIMEOUT,
-        None => false,
-    };
-    let state = if timed_out {
-        StopPollState::TimedOut
-    } else {
-        StopPollState::Pending
-    };
-    (state, false)
 }

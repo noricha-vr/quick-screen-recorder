@@ -6,11 +6,10 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use crate::config::APP_SUPPORT_DIR_NAME;
 use crate::export_name::sanitize_export_stem;
 use crate::fs_safety::{
     clear_fd_extended_acl, ensure_private_dir, has_only_safe_acls, is_usable_export_dir,
-    private_cache_dir, random_hex_token, valid_home_dir, verify_pre_canonical_target_parent,
+    private_cache_dir, random_hex_token, verify_pre_canonical_target_parent,
 };
 
 #[path = "staging_io.rs"]
@@ -23,25 +22,8 @@ use io_helpers::{
 pub use io_helpers::{
     commit_or_recover_default, commit_or_recover_salvaged_default, commit_or_recover_staging,
     commit_or_recover_staging_with_policy, preserve_capture_to_recovery,
-    preserve_recording_on_quit, preserve_staged_permanently,
+    preserve_recording_on_quit, preserve_staged_permanently, private_recovery_dir,
 };
-
-/// Returns a private (`0700`, non-auto-pruned) local recovery directory inside Application Support
-/// so finished recordings are never lost if a removable/network destination disconnects mid-capture.
-pub fn private_recovery_dir() -> Result<PathBuf, String> {
-    let base = if let Some(home) = valid_home_dir() {
-        let app_support = home
-            .join("Library")
-            .join("Application Support")
-            .join(APP_SUPPORT_DIR_NAME);
-        ensure_private_dir(&app_support)?;
-        app_support.join("Recovered")
-    } else {
-        private_cache_dir()?.join("Recovered")
-    };
-    ensure_private_dir(&base)?;
-    Ok(base)
-}
 
 /// Exclusively created (`0700`) staging directory inside our private cache directory, paired with
 /// a pinned `O_DIRECTORY | O_NOFOLLOW` descriptor for the verified destination directory.
@@ -64,6 +46,16 @@ impl ExclusiveStagingDir {
     }
 
     pub fn create_for_target_with_policy(
+        target: &Path,
+        ext: &str,
+        prevent_overwrite: bool,
+    ) -> Result<Self, String> {
+        let cache_root = private_cache_dir()?;
+        Self::create_in_cache_root(&cache_root, target, ext, prevent_overwrite)
+    }
+
+    pub(crate) fn create_in_cache_root(
+        cache_root: &Path,
         target: &Path,
         ext: &str,
         prevent_overwrite: bool,
@@ -129,7 +121,6 @@ impl ExclusiveStagingDir {
         }
 
         // Stage inside our private 0700 cache dir so destination group/ACL peers can never touch staged files
-        let cache_root = private_cache_dir()?;
         let stage_dir_path = cache_root.join(format!(".qsr-work-{}", random_hex_token()));
         DirBuilder::new()
             .mode(0o700)
@@ -162,6 +153,12 @@ impl ExclusiveStagingDir {
             return Err("Staging directory ownership, 0700 mode, or ACL check failed".to_string());
         }
         let stage_dir_fd = OwnedFd::from(stage_dir_file);
+        // Pre-allocate `.qsr-keep` at creation so `retain_staged_in_place()` guarantees permanent
+        // exclusion from cache pruning even under later ENOSPC / EMFILE conditions.
+        if let Err(err) = ensure_keep_marker(stage_dir_fd.as_raw_fd(), true) {
+            let _ = fs::remove_dir_all(&stage_dir_path);
+            return Err(format!("Failed pre-allocating staging keep marker: {err}"));
+        }
 
         let clean_ext = ext.trim_start_matches('.');
         let staged_name = format!("staged.{clean_ext}");
@@ -428,21 +425,10 @@ impl ExclusiveStagingDir {
         ))
     }
 
-    /// Disarms drop cleanup and writes `.qsr-keep` on `stage_dir_fd` without renaming the dir.
+    /// Disarms drop cleanup while keeping the pre-allocated `.qsr-keep` marker in place.
     pub fn retain_staged_in_place(&mut self) -> PathBuf {
         let _ = fs::set_permissions(&self.staged_file, fs::Permissions::from_mode(0o600));
-        let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        let marker_fd = unsafe {
-            libc::openat(
-                self.stage_dir_fd.as_raw_fd(),
-                c".qsr-keep".as_ptr(),
-                flags,
-                0o600_u32,
-            )
-        };
-        if marker_fd >= 0 {
-            unsafe { libc::close(marker_fd) };
-        }
+        let _ = ensure_keep_marker(self.stage_dir_fd.as_raw_fd(), false);
         self.keep_staged_on_drop = true;
         self.staged_file.clone()
     }
@@ -484,6 +470,19 @@ impl ExclusiveStagingDir {
         }
         self.staged_file.clone()
     }
+}
+
+fn ensure_keep_marker(dir_fd: libc::c_int, excl: bool) -> io::Result<()> {
+    let mut flags = libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    if excl {
+        flags |= libc::O_EXCL;
+    }
+    let fd = unsafe { libc::openat(dir_fd, c".qsr-keep".as_ptr(), flags, 0o600_u32) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    unsafe { libc::close(fd) };
+    Ok(())
 }
 
 impl Drop for ExclusiveStagingDir {

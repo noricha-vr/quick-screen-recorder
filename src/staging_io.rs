@@ -6,11 +6,30 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use crate::config::APP_SUPPORT_DIR_NAME;
 use crate::export_name::sanitize_export_stem;
 use crate::fs_safety::{
-    clear_fd_extended_acl, ensure_private_dir, format_tilde_path, random_hex_token,
+    clear_fd_extended_acl, ensure_private_dir, format_tilde_path, private_cache_dir,
+    random_hex_token, valid_home_dir,
 };
-use crate::staging::{ExclusiveStagingDir, private_recovery_dir};
+use crate::staging::ExclusiveStagingDir;
+
+/// Returns a private (`0700`, non-auto-pruned) local recovery directory inside Application Support
+/// so finished recordings are never lost if a removable/network destination disconnects mid-capture.
+pub fn private_recovery_dir() -> Result<PathBuf, String> {
+    let base = if let Some(home) = valid_home_dir() {
+        let app_support = home
+            .join("Library")
+            .join("Application Support")
+            .join(APP_SUPPORT_DIR_NAME);
+        ensure_private_dir(&app_support)?;
+        app_support.join("Recovered")
+    } else {
+        private_cache_dir()?.join("Recovered")
+    };
+    ensure_private_dir(&base)?;
+    Ok(base)
+}
 
 pub(super) fn fstatat_overwrite_mode(
     dir_fd: libc::c_int,

@@ -234,3 +234,54 @@ fn preserve_staged_permanently_survives_gui_temp_files_cleanup_on_stop_error() {
     let _ = fs::remove_dir_all(kept.parent().unwrap());
     let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn preallocated_keep_marker_survives_retain_marker_creation_failure_and_cache_pruning() {
+    let base = std::env::temp_dir().join(format!("qsr-prekeep-{}", random_hex_token()));
+    let cache_dir = base.join("cache");
+    let dest_dir = base.join("dest");
+    fs::create_dir_all(&cache_dir).expect("mkdir cache");
+    fs::create_dir_all(&dest_dir).expect("mkdir dest");
+    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)).expect("chmod cache");
+    let target = dest_dir.join("capture.mp4");
+
+    let mut staging =
+        ExclusiveStagingDir::create_in_cache_root(&cache_dir, &target, "mp4", false).expect("stg");
+    let staged_path = staging.staged_file().to_path_buf();
+    let stage_dir = staged_path.parent().expect("stage dir").to_path_buf();
+    fs::write(&staged_path, b"critical-unflushed-recording").expect("write payload");
+
+    // Pre-allocated `.qsr-keep` exists before retain is ever needed.
+    assert!(stage_dir.join(".qsr-keep").exists());
+
+    // Simulate ENOSPC/EMFILE/EACCES at retain time by making `stage_dir` read-only (0o500),
+    // ensuring creating any new file inside `stage_dir` fails during `retain_staged_in_place()`.
+    fs::set_permissions(&stage_dir, fs::Permissions::from_mode(0o500)).expect("chmod 0500");
+    assert!(
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(stage_dir.join(".probe-cannot-create"))
+            .is_err(),
+        "new file creation inside read-only staging dir must fail"
+    );
+    let kept = staging.retain_staged_in_place();
+    assert_eq!(kept, staged_path);
+    drop(staging);
+
+    // Restore writable mode so `prune_stale_cache_files_in` CAN delete unmarked dirs, then run
+    // expired cache pruning (`Duration::ZERO`) — pre-allocated `.qsr-keep` MUST protect the dir!
+    fs::set_permissions(&stage_dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    prune_stale_cache_files_in(&cache_dir, Duration::ZERO);
+
+    assert!(
+        staged_path.exists(),
+        "retained staged file must survive expired cache pruning even when marker creation fails at retain time"
+    );
+    assert_eq!(
+        fs::read(&staged_path).expect("read preserved payload"),
+        b"critical-unflushed-recording"
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}
