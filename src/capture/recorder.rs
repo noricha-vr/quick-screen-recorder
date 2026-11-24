@@ -3,87 +3,33 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
+use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2::{AnyThread, DefinedClass, define_class, msg_send};
 use objc2_av_foundation::{AVFileTypeMPEG4, AVVideoCodecTypeH264, AVVideoCodecTypeHEVC};
 use objc2_core_media::{CMTime, CMTimeFlags};
-use objc2_foundation::{NSError, NSObject, NSObjectProtocol, NSString, NSURL};
+use objc2_foundation::{NSError, NSString, NSURL};
 use objc2_screen_capture_kit::{
-    SCRecordingOutput, SCRecordingOutputConfiguration, SCRecordingOutputDelegate, SCStream,
-    SCStreamConfiguration, SCStreamErrorCode,
+    SCRecordingOutput, SCRecordingOutputConfiguration, SCStream, SCStreamConfiguration,
+    SCStreamErrorCode,
 };
+
+#[path = "recorder_delegate.rs"]
+mod delegate;
+
+use delegate::{DelegateSignal, RecordingDelegate};
 
 use crate::capture::filter::build_filter_and_dimensions;
 use crate::capture::shareable::query_shareable_content_for_capture;
-use crate::capture::{CaptureConfig, RecordingCodec};
+use crate::capture::{CaptureConfig, RecordingCodec, RecordingOutcome};
+use crate::export::avfoundation::probe_video_metadata;
 use crate::fs_safety::ExclusiveStagingDir;
 use crate::observe::{PerfEvent, PerfKind, now_unix_secs, record_perf_event};
+use crate::staging::commit_or_recover_default;
 
 const STOP_FALLBACK_AFTER: Duration = Duration::from_secs(2);
 const STOP_TIMEOUT: Duration = Duration::from_secs(12);
 const STOP_STREAM_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
-
-#[derive(Default)]
-struct DelegateSignal {
-    started: bool,
-    finished: bool,
-    error: Option<String>,
-    stream_stopped: bool,
-    stream_stop_error: Option<String>,
-}
-
-struct DelegateIvars {
-    signal: Arc<(Mutex<DelegateSignal>, Condvar)>,
-}
-
-define_class!(
-    #[unsafe(super(NSObject))]
-    #[name = "QSRRecordingOutputDelegate"]
-    #[ivars = DelegateIvars]
-    struct RecordingDelegate;
-
-    unsafe impl NSObjectProtocol for RecordingDelegate {}
-
-    unsafe impl SCRecordingOutputDelegate for RecordingDelegate {
-        #[unsafe(method(recordingOutputDidStartRecording:))]
-        fn did_start(&self, _output: &SCRecordingOutput) {
-            let (lock, cvar) = &*self.ivars().signal;
-            if let Ok(mut guard) = lock.lock() {
-                guard.started = true;
-                cvar.notify_all();
-            }
-        }
-
-        #[unsafe(method(recordingOutput:didFailWithError:))]
-        fn did_fail(&self, _output: &SCRecordingOutput, error: &NSError) {
-            let msg = error.localizedDescription().to_string();
-            let (lock, cvar) = &*self.ivars().signal;
-            if let Ok(mut guard) = lock.lock() {
-                guard.error = Some(msg);
-                guard.finished = true;
-                cvar.notify_all();
-            }
-        }
-
-        #[unsafe(method(recordingOutputDidFinishRecording:))]
-        fn did_finish(&self, _output: &SCRecordingOutput) {
-            let (lock, cvar) = &*self.ivars().signal;
-            if let Ok(mut guard) = lock.lock() {
-                guard.finished = true;
-                cvar.notify_all();
-            }
-        }
-    }
-);
-
-impl RecordingDelegate {
-    fn new(signal: Arc<(Mutex<DelegateSignal>, Condvar)>) -> Retained<Self> {
-        let this = Self::alloc().set_ivars(DelegateIvars { signal });
-        // SAFETY: Calling `[super init]` on freshly allocated NSObject subclass.
-        unsafe { msg_send![super(this), init] }
-    }
-}
 
 pub struct RecordingSession {
     stream: Retained<SCStream>,
@@ -282,6 +228,11 @@ impl RecordingSession {
         &self.output_path
     }
 
+    /// Returns `true` if ScreenCaptureKit already stopped or failed the recording output early.
+    pub fn has_ended_unexpectedly(&self) -> bool {
+        self.signal.0.lock().map(|g| g.finished).unwrap_or(false)
+    }
+
     /// Initiates recording finalization without blocking the caller's thread or AppKit runloop.
     pub fn begin_stop(self) -> PendingRecordingStop {
         let elapsed_ms = self.started_at.elapsed().as_millis() as u64;
@@ -310,7 +261,7 @@ impl RecordingSession {
     }
 
     /// Blocking stop helper for headless CLI sessions and app shutdown cleanup.
-    pub fn stop(self) -> Result<PathBuf, String> {
+    pub fn stop(self) -> Result<RecordingOutcome, String> {
         let mut pending = self.begin_stop();
         let signal = Arc::clone(&pending.signal);
         {
@@ -388,8 +339,8 @@ impl PendingRecordingStop {
     }
 
     /// Stops the underlying capture stream (if not already stopped), verifies both trailer
-    /// finalization and stream stop completion, commits the MP4, and records local telemetry.
-    pub fn finish(mut self) -> Result<PathBuf, String> {
+    /// finalization and stream stop completion, commits/recovers the MP4, and records telemetry.
+    pub fn finish(mut self) -> Result<RecordingOutcome, String> {
         self.send_stop_capture();
         let (finished, finish_err, stream_stopped, stream_stop_err) = self
             .signal
@@ -410,28 +361,48 @@ impl PendingRecordingStop {
                 None,
             ));
 
+        // If macOS aborted the output (e.g. screen lock beat our notification by milliseconds)
+        // but AVFoundation already flushed a valid playable MP4, salvage it with a warning.
+        let mut partial_warn: Option<String> = None;
         if let Some(err) = finish_err {
-            self.record_perf(0, false);
-            return Err(format!("Recording finalization error: {err}"));
-        }
-        if !finished {
+            if is_valid_salvageable_mp4(self.staging.staged_file()) {
+                partial_warn = Some(format!("Recording ended early: {err}"));
+            } else {
+                self.record_perf(0, false);
+                return Err(format!("Recording finalization error: {err}"));
+            }
+        } else if !finished {
             self.record_perf(0, false);
             return Err(
                 "Timed out waiting for MP4 recording output to flush container trailer".to_string(),
             );
         }
         if let Some(err) = stream_stop_err {
-            self.record_perf(0, false);
-            return Err(format!("Failed to stop screen/audio capture stream: {err}"));
-        }
-        if !stream_stopped {
+            if partial_warn.is_none() {
+                self.record_perf(0, false);
+                return Err(format!("Failed to stop screen/audio capture stream: {err}"));
+            }
+        } else if !stream_stopped && partial_warn.is_none() {
             self.record_perf(0, false);
             return Err("Timed out confirming capture stream stopped".to_string());
         }
 
-        let size = self.staging.commit()?;
-        self.record_perf(size, true);
-        Ok(self.output_path)
+        let (final_path, size, final_warning) = match commit_or_recover_default(
+            &mut self.staging,
+            self.output_path.clone(),
+            partial_warn,
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                self.record_perf(0, false);
+                return Err(err);
+            }
+        };
+        self.record_perf(size, final_warning.is_none());
+        Ok(RecordingOutcome {
+            output_path: final_path,
+            partial_error: final_warning,
+        })
     }
 
     fn record_perf(&self, output_bytes: u64, ok: bool) {
@@ -475,6 +446,11 @@ fn evaluate_stop_poll(
         StopPollState::Pending
     };
     (state, false)
+}
+
+fn is_valid_salvageable_mp4(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() > 0)
+        && probe_video_metadata(path).is_ok()
 }
 
 #[cfg(test)]

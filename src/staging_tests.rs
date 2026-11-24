@@ -159,3 +159,44 @@ fn quit_during_recording_preserves_video_in_recovery_and_excludes_from_temp_clea
 
     let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn commit_or_recover_staging_rescues_on_destination_loss_and_retains_on_double_failure() {
+    let base = std::env::temp_dir().join(format!("qsr-cor-{}", random_hex_token()));
+    let dest_dir = base.join("usb-dest");
+    let rec_dir = base.join("rec");
+    fs::create_dir_all(&dest_dir).expect("mkdir dest");
+    let target = dest_dir.join("clip.mp4");
+
+    // 1. Destination lost -> recovers cleanly into recovery_dir with warning.
+    let mut s1 = ExclusiveStagingDir::create_for_target(&target, "mp4").expect("stage1");
+    fs::write(s1.staged_file(), b"realtime-mp4-bytes").expect("write s1");
+    fs::remove_dir_all(&dest_dir).expect("unmount mock usb");
+    let (saved_path, size, warn) =
+        commit_or_recover_staging(&mut s1, target.clone(), None, Ok(rec_dir.clone()))
+            .expect("recover into rec_dir");
+    drop(s1);
+    assert_eq!(size, b"realtime-mp4-bytes".len() as u64);
+    assert!(warn.is_some());
+    assert_eq!(fs::read(&saved_path).unwrap(), b"realtime-mp4-bytes");
+
+    // 2. Both destination and recovery fail -> error reports retained staging path that survives drop.
+    fs::create_dir_all(&dest_dir).expect("remount mock usb");
+    let mut s2 = ExclusiveStagingDir::create_for_target(&target, "mp4").expect("stage2");
+    fs::write(s2.staged_file(), b"double-fail-bytes").expect("write s2");
+    fs::remove_dir_all(&dest_dir).expect("unmount mock usb again");
+    let err = commit_or_recover_staging(
+        &mut s2,
+        target,
+        None,
+        Err("recovery dir blocked".to_string()),
+    )
+    .expect_err("double failure returns Err");
+    let retained_file = s2.staged_file().to_path_buf();
+    drop(s2);
+    assert!(err.contains("preserved in staging"), "got: {err}");
+    assert_eq!(fs::read(&retained_file).unwrap(), b"double-fail-bytes");
+
+    let _ = fs::remove_dir_all(retained_file.parent().unwrap());
+    let _ = fs::remove_dir_all(&base);
+}

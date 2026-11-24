@@ -3,17 +3,22 @@ pub mod cadence;
 mod filter;
 pub mod recorder;
 pub mod shareable;
+pub mod system_events;
 pub mod timelapse;
 mod timelapse_frame;
 mod timelapse_loop;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 pub use cadence::{CaptureCadence, TIMELAPSE_PLAYBACK_FPS};
 use recorder::{PendingRecordingStop, RecordingSession, StopPollState};
+pub use system_events::{
+    SystemInterruptMonitor, SystemInterruptReason, current_session_interrupt, pump_current_runloop,
+};
 use timelapse::{PendingTimelapseStop, TimelapseSession};
 
 use crate::geometry::Rect;
@@ -157,6 +162,12 @@ pub enum PendingStop {
 
 impl ActiveRecording {
     pub fn start(config: &CaptureConfig, output_path: &Path) -> Result<Self, String> {
+        if let Some(reason) = current_session_interrupt() {
+            return Err(format!(
+                "Cannot start recording because {}",
+                reason.clause()
+            ));
+        }
         match config.cadence.normalized() {
             CaptureCadence::RealTime { .. } => Ok(Self::RealTime(RecordingSession::start(
                 config,
@@ -185,8 +196,17 @@ impl ActiveRecording {
 
     pub fn has_ended_unexpectedly(&self) -> bool {
         match self {
-            Self::RealTime(_) => false,
+            Self::RealTime(s) => s.has_ended_unexpectedly(),
             Self::Timelapse(s) => s.has_worker_exited(),
+        }
+    }
+
+    /// Optional thread-safe immediate stop hook (used by `SystemInterruptMonitor` so timelapse
+    /// workers stop capturing frames instantaneously on lock/sleep before UI/CLI timers tick).
+    pub fn stop_hook(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        match self {
+            Self::RealTime(_) => None,
+            Self::Timelapse(s) => Some(s.stop_hook()),
         }
     }
 
@@ -199,10 +219,7 @@ impl ActiveRecording {
 
     pub fn stop(self) -> Result<RecordingOutcome, String> {
         match self {
-            Self::RealTime(s) => Ok(RecordingOutcome {
-                output_path: s.stop()?,
-                partial_error: None,
-            }),
+            Self::RealTime(s) => s.stop(),
             Self::Timelapse(s) => s.stop(),
         }
     }
@@ -218,10 +235,7 @@ impl PendingStop {
 
     pub fn finish(self) -> Result<RecordingOutcome, String> {
         match self {
-            Self::RealTime(p) => Ok(RecordingOutcome {
-                output_path: p.finish()?,
-                partial_error: None,
-            }),
+            Self::RealTime(p) => p.finish(),
             Self::Timelapse(p) => p.finish(),
         }
     }

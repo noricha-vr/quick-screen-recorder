@@ -82,6 +82,7 @@ pub struct EditorOpenOptions {
     pub captured_app_name: Option<String>,
     pub demo_showcase: bool,
     pub tutorial_hint: bool,
+    pub initial_notice: Option<String>,
     pub on_export_dir_change: Rc<dyn Fn(PathBuf)>,
     pub on_export_saved: Rc<dyn Fn(PathBuf)>,
 }
@@ -105,6 +106,7 @@ impl EditorWindow {
     ) -> Result<Self, String> {
         let demo_showcase = opts.demo_showcase;
         let tutorial_hint = opts.tutorial_hint;
+        let initial_notice = opts.initial_notice;
         let on_export_dir_change = opts.on_export_dir_change;
         let on_export_saved = opts.on_export_saved;
         let default_stem = if demo_showcase {
@@ -180,6 +182,16 @@ impl EditorWindow {
             tutorial_hint,
         );
         let folder_items = Rc::new(RefCell::new(controls.folder_items));
+        if let Some(notice) = initial_notice {
+            controls
+                .status_label
+                .setTextColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
+                    0.96, 0.78, 0.36, 1.0,
+                )));
+            controls
+                .status_label
+                .setStringValue(&NSString::from_str(&notice));
+        }
 
         let state = Rc::new(RefCell::new(EditorState {
             input_path: input_path.to_path_buf(),

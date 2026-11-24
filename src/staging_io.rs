@@ -7,7 +7,10 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::export_name::sanitize_export_stem;
-use crate::fs_safety::{clear_fd_extended_acl, ensure_private_dir, random_hex_token};
+use crate::fs_safety::{
+    clear_fd_extended_acl, ensure_private_dir, format_tilde_path, random_hex_token,
+};
+use crate::staging::{ExclusiveStagingDir, private_recovery_dir};
 
 pub(super) fn fstatat_overwrite_mode(
     dir_fd: libc::c_int,
@@ -287,23 +290,73 @@ pub fn preserve_file_to_recovery_dir(
     ))
 }
 
-/// Rescues a finished GUI recording before app termination: removes it from `temp_files` so
-/// shutdown cleanup never deletes it, and moves cache-staged captures into `recovery_dir`.
-/// If `recovery_dir` is unavailable, renames the file in place to `qsr-preserved-*` so startup
-/// cache pruning never removes it either, returning `Err((reason, surviving_path))`.
-pub fn preserve_recording_on_quit(
+/// Commits a finalized staged MP4 to `output_path`. If the destination became unavailable
+/// (e.g. external drive unmounted), rescues the file into `recovery_dir`; if recovery also fails,
+/// disarms drop cleanup and exempts the staged file from cache pruning so footage is never lost.
+pub fn commit_or_recover_staging(
+    staging: &mut ExclusiveStagingDir,
+    output_path: PathBuf,
+    partial_error: Option<String>,
+    recovery_dir: Result<PathBuf, String>,
+) -> Result<(PathBuf, u64, Option<String>), String> {
+    match staging.commit() {
+        Ok(size) => Ok((output_path, size, partial_error)),
+        Err(com_err) => {
+            match recovery_dir.and_then(|rec_dir| staging.preserve_to_recovery_dir(&rec_dir)) {
+                Ok((recovered_path, rec_size)) => {
+                    let rec_display = format_tilde_path(&recovered_path);
+                    let msg = match partial_error {
+                        Some(cap_err) => format!(
+                            "{cap_err}; also failed moving recording to destination ({com_err}). Saved locally instead: {rec_display}"
+                        ),
+                        None => format!(
+                            "Destination became unavailable ({com_err}). Recording was saved locally instead: {rec_display}"
+                        ),
+                    };
+                    Ok((recovered_path, rec_size, Some(msg)))
+                }
+                Err(rec_err) => {
+                    let kept_path = staging.retain_staged_file();
+                    let kept_display = format_tilde_path(&kept_path);
+                    Err(match partial_error {
+                        Some(cap_err) => format!(
+                            "{cap_err}; failed committing partial video ({com_err}) and local recovery failed ({rec_err}). The finished MP4 was preserved in staging at: {kept_display}"
+                        ),
+                        None => format!(
+                            "Failed saving recording to destination ({com_err}) and local recovery failed ({rec_err}). The finished MP4 was preserved in staging at: {kept_display}"
+                        ),
+                    })
+                }
+            }
+        }
+    }
+}
+
+/// Convenience wrapper using the default private local recovery directory.
+pub fn commit_or_recover_default(
+    staging: &mut ExclusiveStagingDir,
+    output_path: PathBuf,
+    partial_error: Option<String>,
+) -> Result<(PathBuf, u64, Option<String>), String> {
+    commit_or_recover_staging(staging, output_path, partial_error, private_recovery_dir())
+}
+
+/// Rescues a finished GUI capture out of `temp_files` into `recovery_dir` so shutdown cleanup,
+/// OS reboots, and 24-hour cache pruning never delete it. If `recovery_dir` is unavailable,
+/// renames the file in place to `qsr-preserved-*` and returns `Err((reason, surviving_path))`.
+pub fn preserve_capture_to_recovery(
     output_path: &Path,
     temp_files: &mut Vec<PathBuf>,
     recovery_dir: Result<PathBuf, String>,
+    stem_hint: &str,
 ) -> Result<PathBuf, (String, PathBuf)> {
     let was_temp = temp_files.iter().any(|p| p == output_path);
     temp_files.retain(|p| p != output_path);
     if !was_temp {
         return Ok(output_path.to_path_buf());
     }
-    let rec_res = recovery_dir.and_then(|rec_dir| {
-        preserve_file_to_recovery_dir(output_path, &rec_dir, "Quit-Saved-Recording")
-    });
+    let rec_res = recovery_dir
+        .and_then(|rec_dir| preserve_file_to_recovery_dir(output_path, &rec_dir, stem_hint));
     match rec_res {
         Ok(saved) => Ok(saved),
         Err(err) => {
@@ -312,6 +365,20 @@ pub fn preserve_recording_on_quit(
             Err((err, surviving))
         }
     }
+}
+
+/// Rescues a finished GUI recording before app termination.
+pub fn preserve_recording_on_quit(
+    output_path: &Path,
+    temp_files: &mut Vec<PathBuf>,
+    recovery_dir: Result<PathBuf, String>,
+) -> Result<PathBuf, (String, PathBuf)> {
+    preserve_capture_to_recovery(
+        output_path,
+        temp_files,
+        recovery_dir,
+        "Quit-Saved-Recording",
+    )
 }
 
 fn rename_file_as_preserved_in_place(path: &Path) -> Option<PathBuf> {

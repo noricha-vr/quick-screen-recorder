@@ -16,10 +16,13 @@ use crate::fs_safety::{
 #[path = "staging_io.rs"]
 mod io_helpers;
 
-pub use io_helpers::preserve_recording_on_quit;
 use io_helpers::{
     XdevTempGuard, copy_into_pinned_dir_overwrite, fstatat_overwrite_mode, rename_excl_within_dir,
     stage_once_on_dest_volume,
+};
+pub use io_helpers::{
+    commit_or_recover_default, commit_or_recover_staging, preserve_capture_to_recovery,
+    preserve_recording_on_quit,
 };
 
 /// Returns a private (`0700`, non-auto-pruned) local recovery directory inside Application Support

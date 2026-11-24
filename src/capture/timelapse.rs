@@ -15,9 +15,9 @@ use crate::capture::timelapse_frame::{FRAME_CAPTURE_TIMEOUT, dispatch_screenshot
 use crate::capture::timelapse_loop::{LoopExit, SyncState, run_timelapse_loop};
 use crate::capture::{CaptureConfig, RecordingCodec, RecordingOutcome};
 use crate::export::av_writer::{StreamingMp4Writer, WRITER_FINISH_TIMEOUT};
-use crate::fs_safety::{ExclusiveStagingDir, format_tilde_path};
+use crate::fs_safety::ExclusiveStagingDir;
 use crate::observe::{PerfEvent, PerfKind, now_unix_secs, record_perf_event};
-use crate::staging::private_recovery_dir;
+use crate::staging::commit_or_recover_default;
 
 const START_INIT_TIMEOUT: Duration = Duration::from_secs(12);
 
@@ -121,6 +121,12 @@ impl TimelapseSession {
     /// Returns `true` if the background worker already exited (e.g. unrecoverable capture failure).
     pub fn has_worker_exited(&self) -> bool {
         self.worker_done.load(Ordering::Acquire)
+    }
+
+    /// Returns a thread-safe closure that immediately signals the worker to stop capturing frames.
+    pub fn stop_hook(&self) -> Arc<dyn Fn() + Send + Sync> {
+        let sync = Arc::clone(&self.sync);
+        Arc::new(move || sync.signal_stop())
     }
 
     pub fn begin_stop(mut self) -> PendingTimelapseStop {
@@ -289,40 +295,14 @@ fn run_timelapse_worker(
     // Mark commit phase active so slow cross-volume copies (e.g. multi-GiB MP4 to USB/SMB)
     // are never cut off by the capture/encoder finalization timeout.
     committing.store(true, Ordering::Release);
-    // If the destination disconnected (e.g. external drive unmounted), rescue the finished local
-    // MP4 into our private recovery folder; if recovery also fails, retain staging intact on disk.
-    let (final_path, size, final_warning) = match staging.commit() {
-        Ok(s) => (output_path, s, partial_error),
-        Err(com_err) => match private_recovery_dir()
-            .and_then(|rec_dir| staging.preserve_to_recovery_dir(&rec_dir))
-        {
-            Ok((recovered_path, rec_size)) => {
-                let rec_display = format_tilde_path(&recovered_path);
-                let msg = match partial_error {
-                    Some(cap_err) => format!(
-                        "{cap_err}; also failed moving recording to destination ({com_err}). Saved locally instead: {rec_display}"
-                    ),
-                    None => format!(
-                        "Destination became unavailable ({com_err}). Recording was saved locally instead: {rec_display}"
-                    ),
-                };
-                (recovered_path, rec_size, Some(msg))
-            }
-            Err(rec_err) => {
-                let kept_path = staging.retain_staged_file();
-                let kept_display = format_tilde_path(&kept_path);
+    let (final_path, size, final_warning) =
+        match commit_or_recover_default(&mut staging, output_path, partial_error) {
+            Ok(v) => v,
+            Err(err) => {
                 record_timelapse_perf(cfg.codec, started_at.elapsed(), 0, false);
-                return Err(match partial_error {
-                    Some(cap_err) => format!(
-                        "{cap_err}; failed committing partial video ({com_err}) and local recovery failed ({rec_err}). The finished MP4 was preserved in staging at: {kept_display}"
-                    ),
-                    None => format!(
-                        "Failed saving recording to destination ({com_err}) and local recovery failed ({rec_err}). The finished MP4 was preserved in staging at: {kept_display}"
-                    ),
-                });
+                return Err(err);
             }
-        },
-    };
+        };
 
     let clean_ok = final_warning.is_none();
     record_timelapse_perf(cfg.codec, started_at.elapsed(), size, clean_ok);

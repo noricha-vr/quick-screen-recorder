@@ -37,6 +37,7 @@ Unlike Electron-based recorders that keep a full Chromium runtime resident in me
   - **Smart Export Folder, Naming & Real-Time Progress**: Defaults to **`~/Movies/Quick Screen Recorder`** (auto-created) and lets you switch destinations anytime via the **`Save to`** dropdown in the editor or **`Save Folder`** in the `◉ Rec` menu bar (`~/Movies/Quick Screen Recorder`, `~/Movies`, `~/Desktop`, `~/Downloads`, `~/Documents`, or **`Choose Folder...`** with New Folder creation). Auto-names files chronologically for Finder sorting & Spotlight search (`YYYY-MM-DD_HH-MM-SS_Quick-Screen-Recorder`, plus target app name on Window captures) while letting you freely edit the **`Name`** field before clicking **`Save`** (atomic non-overwriting write + live progress bar) or **`Copy`**.
 - **Privacy by Design**
   - 100% local execution with **zero network access** and **zero external telemetry**.
+  - **Auto-Stop & Save on Lock/Sleep**: Automatically stops active real-time and timelapse recordings the moment macOS locks the screen, switches users, or puts the display/system to sleep—saving everything captured up to that point safely to local recovery and opening it in the editor with zero post-lock frames.
   - Container metadata is stripped automatically on export (`setMetadata(None)` / `-map_metadata -1`).
   - Local performance stats (`stats` command) record only format, duration, and encode latency—never file paths, window titles, or personal identifiers.
 

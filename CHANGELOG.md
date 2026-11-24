@@ -5,6 +5,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-24
+
+### Added
+
+- **Automatic stop & save on macOS screen lock, user switch, and sleep**:
+  - Monitors macOS `com.apple.screenIsLocked`, `NSWorkspaceSessionDidResignActiveNotification`, `NSWorkspaceScreensDidSleepNotification`, and `NSWorkspaceWillSleepNotification` (plus synchronous `CGSessionCopyCurrentDictionary` fallback) across both real-time and interval timelapse recordings.
+  - Immediately halts capture on lock/sleep (discarding any post-lock timelapse frames), finalizes the MP4 up to that exact point, preserves GUI auto-stopped recordings in `~/Library/Application Support/QuickScreenRecorder/Recovered` (exempt from cache pruning and reboot loss), and opens them in the Trim & Export editor with an inline non-modal status notice.
+  - Headless CLI `record` sessions also pump the current runloop and stop cleanly on lock/sleep, printing the auto-stop reason and saved file path.
+
+### Fixed
+
+- Added unified local recovery preservation (`~/Library/Application Support/QuickScreenRecorder/Recovered` and cache-prune-exempt staging retention) and early-stop detection (`has_ended_unexpectedly`) to real-time `SCRecordingOutput` recordings, matching timelapse safety guarantees.
+
 ## [0.5.0] - 2026-11-24
 
 ### Added
