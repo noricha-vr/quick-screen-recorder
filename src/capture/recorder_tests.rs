@@ -124,17 +124,24 @@ fn delayed_start_callback_interrupted_triggers_immediate_and_late_stop() {
         let _ = latch_bg.trigger(crate::capture::SystemInterruptReason::ScreenLocked);
     });
 
+    let signal = Arc::new((Mutex::new(DelegateSignal::default()), Condvar::new()));
     let cancel_cb = Arc::clone(&cancelled);
     let late_cb = Arc::clone(&late_cleanups);
+    let sig_cb = Arc::clone(&signal);
     let delayed_start_cb = thread::spawn(move || {
         thread::sleep(Duration::from_millis(90));
-        handle_start_callback_result(Ok(()), &cancel_cb, &tx, || {
+        handle_start_callback_result(Ok(()), &sig_cb, &cancel_cb, &tx, || {
             late_cb.fetch_add(1, Ordering::SeqCst);
+            if let Ok(mut g) = sig_cb.0.lock() {
+                g.stream_stopped = true;
+                g.stream_stop_error = None;
+                sig_cb.1.notify_all();
+            }
         });
     });
 
-    let signal = Arc::new((Mutex::new(DelegateSignal::default()), Condvar::new()));
     let started = Instant::now();
+    let sig_wait = Arc::clone(&signal);
     let wait_res = wait_for_capture_start_with_interrupt(
         &rx,
         &signal,
@@ -148,7 +155,11 @@ fn delayed_start_callback_interrupted_triggers_immediate_and_late_stop() {
         || false,
         || {
             immediate_stops.fetch_add(1, Ordering::SeqCst);
-            true
+            // Simulate pre-start `-3808` setting stream_stopped=true while start_completed=false.
+            if let Ok(mut g) = sig_wait.0.lock() {
+                g.stream_stopped = true;
+            }
+            delegate::wait_for_stream_stopped(&sig_wait, Duration::from_secs(2))
         },
     );
     assert!(
@@ -260,7 +271,13 @@ fn async_did_start_before_stream_stopped_and_unconfirmed_stop_preserve_session()
     // Case 1: Stop initiates asynchronously; AFTER the stop request is sent, a background thread
     // delivers `did_start` first and `stream_stopped` afterward. `wait_for_stream_stopped` waits
     // for stop confirmation so the post-stop recheck sees `started == true` and preserves staging!
-    let signal = Arc::new((Mutex::new(DelegateSignal::default()), Condvar::new()));
+    let signal = Arc::new((
+        Mutex::new(DelegateSignal {
+            start_completed: true,
+            ..Default::default()
+        }),
+        Condvar::new(),
+    ));
     let sig_bg = Arc::clone(&signal);
     let sig_wait = Arc::clone(&signal);
     let mut async_handle: Option<thread::JoinHandle<()>> = None;
@@ -323,4 +340,136 @@ fn async_did_start_before_stream_stopped_and_unconfirmed_stop_preserve_session()
         Ok(StartWaitOutcome::HandOffToStop),
         "unconfirmed capture-start stop must hand off to normal stop/recovery"
     );
+}
+
+#[test]
+fn stop_error_and_failed_late_start_stop_never_count_as_confirmed_stop() {
+    use std::thread;
+
+    // 1. Stop completion callback returned an error -> `wait_for_stream_stopped` MUST return false,
+    // so `wait_for_recording_started` preserves staging by returning Ok(()) for handoff.
+    let err_stop_sig = Arc::new((
+        Mutex::new(DelegateSignal {
+            start_completed: true,
+            stream_stopped: true,
+            stream_stop_error: Some("SCStream stop error".to_string()),
+            ..Default::default()
+        }),
+        Condvar::new(),
+    ));
+    assert!(!delegate::wait_for_stream_stopped(
+        &err_stop_sig,
+        Duration::from_millis(50)
+    ));
+    let sig_check = Arc::clone(&err_stop_sig);
+    let res = wait_for_recording_started(
+        &err_stop_sig,
+        Duration::from_secs(1),
+        || Some("interrupted: screen locked".to_string()),
+        || delegate::wait_for_stream_stopped(&sig_check, Duration::from_millis(50)),
+    );
+    assert!(
+        res.is_ok(),
+        "stop error must not be treated as confirmed stop; staging must be handed off"
+    );
+
+    // 2. Pre-start `-3808` (`stream_stopped=true, start_completed=false`) followed by delayed
+    // `startCapture` whose forced post-start stop FAILS -> must return false & HandOffToStop!
+    let (tx, rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let late_sig = Arc::new((
+        Mutex::new(DelegateSignal {
+            start_completed: false,
+            stream_stopped: true, // pre-start -3808
+            ..Default::default()
+        }),
+        Condvar::new(),
+    ));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let sig_bg = Arc::clone(&late_sig);
+    let cancel_bg = Arc::clone(&cancelled);
+    let h = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(30));
+        handle_start_callback_result(Ok(()), &sig_bg, &cancel_bg, &tx, || {
+            if let Ok(mut g) = sig_bg.0.lock() {
+                g.stream_stopped = true;
+                g.stream_stop_error = Some("late forced stop failed".to_string());
+                sig_bg.1.notify_all();
+            }
+        });
+    });
+
+    let sig_wait = Arc::clone(&late_sig);
+    let handoff = wait_for_capture_start_with_interrupt(
+        &rx,
+        &late_sig,
+        Duration::from_secs(2),
+        &cancelled,
+        || Some("interrupted: screen locked".to_string()),
+        || false,
+        || delegate::wait_for_stream_stopped(&sig_wait, Duration::from_secs(2)),
+    );
+    h.join().expect("join late start thread");
+    assert_eq!(
+        handoff,
+        Ok(StartWaitOutcome::HandOffToStop),
+        "failed late-start stop must hand off staging instead of dropping it"
+    );
+}
+
+#[test]
+fn unconfirmed_stop_handoff_retains_staging_on_disk_after_finish_timeout() {
+    let dir = std::env::temp_dir().join(format!(
+        "qsr-unconfirmed-handoff-{}",
+        crate::fs_safety::random_hex_token()
+    ));
+    std::fs::create_dir_all(&dir).expect("create temp test dir");
+    let target = dir.join("capture.mp4");
+    let mut staging = ExclusiveStagingDir::create_for_target(&target, "mp4").expect("staging");
+    let staged_path = staging.staged_file().to_path_buf();
+    let stage_dir = staged_path.parent().expect("stage dir").to_path_buf();
+    std::fs::write(&staged_path, b"in-progress-unflushed-bytes").expect("write staged bytes");
+
+    // Simulate startup handoff on unconfirmed stop followed by finish() timing out with
+    // `finished == false` and `stop_issue == Some(...)`.
+    let sig = Arc::new((Mutex::new(DelegateSignal::default()), Condvar::new()));
+    let handoff = wait_for_recording_started(
+        &sig,
+        Duration::from_secs(1),
+        || Some("interrupted: screen locked".to_string()),
+        || false,
+    );
+    assert!(handoff.is_ok());
+
+    let finish_res = finalize_stop_staging_outcome(
+        &mut staging,
+        target.clone(),
+        false,
+        None,
+        Some("Timed out confirming capture stream stopped".to_string()),
+        Ok(dir.join("Recovered")),
+    );
+    assert!(
+        finish_res.is_err(),
+        "unconfirmed stop timeout must report Err"
+    );
+    let err_msg = finish_res.unwrap_err();
+    assert!(err_msg.contains("retained untouched"), "err={err_msg}");
+
+    // Dropping `staging` MUST NOT delete the file or directory when stop was unconfirmed!
+    drop(staging);
+    assert!(
+        staged_path.exists(),
+        "staged file must survive drop when stream stop was unconfirmed"
+    );
+    assert!(
+        stage_dir.join(".qsr-keep").exists(),
+        ".qsr-keep marker must exempt retained staging from cache pruning"
+    );
+    assert_eq!(
+        std::fs::read(&staged_path).expect("read retained bytes"),
+        b"in-progress-unflushed-bytes"
+    );
+
+    let _ = std::fs::remove_dir_all(&stage_dir);
+    let _ = std::fs::remove_dir_all(&dir);
 }

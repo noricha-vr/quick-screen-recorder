@@ -16,13 +16,16 @@ use objc2_screen_capture_kit::{
 
 #[path = "recorder_delegate.rs"]
 mod delegate;
+#[path = "recorder_finish.rs"]
+mod finish;
 
-pub use delegate::is_valid_salvageable_mp4;
 use delegate::{
     DelegateSignal, RecordingDelegate, SendableStreamStop, StartWaitOutcome, StreamStopControl,
-    evaluate_stop_poll, format_stop_error_with_preservation, handle_start_callback_result,
-    wait_for_capture_start_with_interrupt, wait_for_recording_started,
+    evaluate_stop_poll, handle_start_callback_result, wait_for_capture_start_with_interrupt,
+    wait_for_recording_started,
 };
+use finish::finalize_stop_staging_outcome;
+pub use finish::is_valid_salvageable_mp4;
 
 use crate::capture::filter::build_filter_and_dimensions;
 use crate::capture::shareable::query_shareable_content_for_capture;
@@ -30,7 +33,7 @@ use crate::capture::system_events::{InterruptLatch, StopHook, current_session_in
 use crate::capture::{CaptureConfig, RecordingCodec, RecordingOutcome};
 use crate::fs_safety::ExclusiveStagingDir;
 use crate::observe::{PerfEvent, PerfKind, now_unix_secs, record_perf_event};
-use crate::staging::{commit_or_recover_default, commit_or_recover_salvaged_default};
+use crate::staging::private_recovery_dir;
 
 pub(super) const STOP_FALLBACK_AFTER: Duration = Duration::from_secs(2);
 pub(super) const STOP_TIMEOUT: Duration = Duration::from_secs(12);
@@ -230,6 +233,7 @@ impl RecordingSession {
 
         let cancel_cb = Arc::clone(&cancelled_after_start);
         let stopper_cb = Arc::clone(&stopper);
+        let sig_cb = Arc::clone(&signal);
         let start_block = RcBlock::new(move |err: *mut NSError| {
             let res = if !err.is_null() {
                 let msg = unsafe { (&*err).localizedDescription().to_string() };
@@ -237,7 +241,7 @@ impl RecordingSession {
             } else {
                 Ok(())
             };
-            handle_start_callback_result(res, &cancel_cb, &tx, || {
+            handle_start_callback_result(res, &sig_cb, &cancel_cb, &tx, || {
                 stopper_cb.stop_force_on_late_start();
             });
         });
@@ -348,8 +352,9 @@ impl RecordingSession {
                     .saturating_sub(pending.stop_initiated_at.elapsed())
                     .max(STOP_STREAM_CONFIRM_TIMEOUT);
                 let guard = lock.lock().map_err(|_| "Mutex poisoned")?;
-                let _ = cvar
-                    .wait_timeout_while(guard, remaining, |s| !(s.finished && s.stream_stopped));
+                let _ = cvar.wait_timeout_while(guard, remaining, |s| {
+                    !(s.finished && s.start_completed && s.stream_stopped)
+                });
             }
         }
         pending.finish()
@@ -367,16 +372,16 @@ impl PendingRecordingStop {
 
     /// Non-blocking poll designed for a short `NSTimer` tick on the main thread.
     pub fn poll(&mut self) -> StopPollState {
-        let (finished, stream_stopped) = self
+        let (finished, stream_settled) = self
             .signal
             .0
             .lock()
-            .map(|g| (g.finished, g.stream_stopped))
+            .map(|g| (g.finished, g.start_completed && g.stream_stopped))
             .unwrap_or((true, true));
         let stop_sent_elapsed = self.stop_capture_sent_at.map(|t| t.elapsed());
         let (state, should_send_stop) = evaluate_stop_poll(
             finished,
-            stream_stopped,
+            stream_settled,
             stop_sent_elapsed,
             self.stop_initiated_at.elapsed(),
         );
@@ -387,16 +392,17 @@ impl PendingRecordingStop {
     }
 
     /// Stops the underlying capture stream (if not already stopped), verifies both trailer
-    /// finalization and stream stop completion independently, commits/recovers the MP4, and
-    /// records telemetry. Salvaged clips never overwrite an existing file and never mask stream-stop errors.
+    /// finalization and clean stream stop independently, commits/recovers the MP4, and retains
+    /// staging untouched whenever stream stop was not cleanly confirmed.
     pub fn finish(mut self) -> Result<RecordingOutcome, String> {
         self.send_stop_capture();
-        let (finished, finish_err, stream_stopped, stream_stop_err) = self
+        let (start_completed, finished, finish_err, stream_stopped, stream_stop_err) = self
             .signal
             .0
             .lock()
             .map(|g| {
                 (
+                    g.start_completed,
                     g.finished,
                     g.error.clone(),
                     g.stream_stopped,
@@ -405,6 +411,7 @@ impl PendingRecordingStop {
             })
             .unwrap_or((
                 false,
+                false,
                 Some("Recording state lock poisoned".to_string()),
                 false,
                 None,
@@ -412,56 +419,22 @@ impl PendingRecordingStop {
 
         let stop_issue = if let Some(err) = stream_stop_err {
             Some(format!("Failed to stop screen/audio capture stream: {err}"))
+        } else if !start_completed {
+            Some("Timed out confirming capture stream start/stop settled".to_string())
         } else if !stream_stopped {
             Some("Timed out confirming capture stream stopped".to_string())
         } else {
             None
         };
 
-        let mut salvaged_warn: Option<String> = None;
-        if let Some(err) = finish_err {
-            if is_valid_salvageable_mp4(self.staging.staged_file()) {
-                salvaged_warn = Some(format!("Recording ended early: {err}"));
-            } else {
-                self.record_perf(0, false);
-                return Err(match stop_issue {
-                    Some(stop_err) => format!("Recording finalization error: {err}; {stop_err}"),
-                    None => format!("Recording finalization error: {err}"),
-                });
-            }
-        } else if !finished {
-            self.record_perf(0, false);
-            return Err(match stop_issue {
-                Some(stop_err) => format!(
-                    "Timed out waiting for MP4 recording output to flush container trailer; {stop_err}"
-                ),
-                None => "Timed out waiting for MP4 recording output to flush container trailer"
-                    .to_string(),
-            });
-        }
-
-        // If stopping the capture stream itself failed or timed out, preserve any playable MP4
-        // directly into permanent recovery (never GUI `temp_files`) before returning `Err`.
-        if let Some(stop_err) = stop_issue {
-            self.record_perf(0, false);
-            return Err(format_stop_error_with_preservation(
-                &stop_err,
-                &mut self.staging,
-            ));
-        }
-
-        // Salvaged clips use non-overwriting publish so existing target files are never replaced.
-        let commit_res = if salvaged_warn.is_some() {
-            commit_or_recover_salvaged_default(
-                &mut self.staging,
-                self.output_path.clone(),
-                salvaged_warn,
-            )
-        } else {
-            commit_or_recover_default(&mut self.staging, self.output_path.clone(), None)
-        };
-
-        let (final_path, size, final_warning) = match commit_res {
+        let (final_path, size, final_warning) = match finalize_stop_staging_outcome(
+            &mut self.staging,
+            self.output_path.clone(),
+            finished,
+            finish_err,
+            stop_issue,
+            private_recovery_dir(),
+        ) {
             Ok(v) => v,
             Err(err) => {
                 self.record_perf(0, false);

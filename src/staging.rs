@@ -428,28 +428,28 @@ impl ExclusiveStagingDir {
         ))
     }
 
-    /// Disarms automatic drop cleanup and exempts staging from 24h startup pruning via
-    /// `.qsr-keep` marker (created on `stage_dir_fd`) and `qsr-preserved-*` rename.
-    pub fn retain_staged_file(&mut self) -> PathBuf {
+    /// Disarms drop cleanup and writes `.qsr-keep` on `stage_dir_fd` without renaming the dir.
+    pub fn retain_staged_in_place(&mut self) -> PathBuf {
         let _ = fs::set_permissions(&self.staged_file, fs::Permissions::from_mode(0o600));
-        // Create `.qsr-keep` via pinned `stage_dir_fd` so startup pruning skips this directory
-        // even if renaming the parent entry fails.
+        let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC;
         let marker_fd = unsafe {
             libc::openat(
                 self.stage_dir_fd.as_raw_fd(),
                 c".qsr-keep".as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                flags,
                 0o600_u32,
             )
         };
         if marker_fd >= 0 {
-            unsafe {
-                libc::close(marker_fd);
-            }
+            unsafe { libc::close(marker_fd) };
         }
         self.keep_staged_on_drop = true;
+        self.staged_file.clone()
+    }
 
-        // Also rename `.qsr-work-*` -> `qsr-preserved-*` so it is permanently outside prune globs.
+    /// Disarms drop cleanup, marks `.qsr-keep`, and renames `.qsr-work-*` -> `qsr-preserved-*`.
+    pub fn retain_staged_file(&mut self) -> PathBuf {
+        self.retain_staged_in_place();
         if let (Some(parent), Some(old_name), Some(file_name)) = (
             self.stage_dir_path.parent(),
             self.stage_dir_path.file_name().and_then(|s| s.to_str()),

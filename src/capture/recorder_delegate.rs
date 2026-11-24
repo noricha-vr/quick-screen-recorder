@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -14,15 +13,21 @@ use objc2_screen_capture_kit::{
 use crate::capture::recorder::{
     STOP_FALLBACK_AFTER, STOP_STREAM_CONFIRM_TIMEOUT, STOP_TIMEOUT, StopPollState,
 };
-use crate::export::avfoundation::{extract_rgba_frame, probe_video_metadata};
 
 #[derive(Default)]
 pub(super) struct DelegateSignal {
+    pub(super) start_completed: bool,
     pub(super) started: bool,
     pub(super) finished: bool,
     pub(super) error: Option<String>,
     pub(super) stream_stopped: bool,
     pub(super) stream_stop_error: Option<String>,
+}
+
+/// Returns `true` ONLY when `startCapture` has settled, `stopCapture` has completed, AND
+/// `stopCapture` succeeded without error (rejecting stop errors and pre-start `-3808` races).
+pub(super) fn is_cleanly_stopped(s: &DelegateSignal) -> bool {
+    s.start_completed && s.stream_stopped && s.stream_stop_error.is_none()
 }
 
 /// Shared one-shot guard ensuring `removeRecordingOutput` and `stopCaptureWithCompletionHandler`
@@ -139,21 +144,43 @@ impl SendableStreamStop {
     }
 
     /// Unconditional teardown used when a delayed `startCapture` completion handler succeeds
-    /// AFTER startup was already cancelled by an interrupt/timeout (earlier pre-start stop calls
-    /// may have returned `-3808` before the stream transitioned to running).
+    /// AFTER startup was already cancelled by an interrupt/timeout. Installs a real completion
+    /// handler so `signal` records whether the post-start stop succeeded or failed.
     pub(super) fn stop_force_on_late_start(&self) {
         autoreleasepool(|_| {
             let _ = unsafe {
                 self.stream
                     .removeRecordingOutput_error(&self.recording_output)
             };
+            let sig = Arc::clone(&self.signal);
+            let stop_block = RcBlock::new(move |err: *mut NSError| {
+                let stop_err = if !err.is_null() {
+                    let ns_err = unsafe { &*err };
+                    if ns_err.code() == SCStreamErrorCode::AttemptToStopStreamState.0 {
+                        None
+                    } else {
+                        Some(ns_err.localizedDescription().to_string())
+                    }
+                } else {
+                    None
+                };
+                let (lock, cvar) = &*sig;
+                if let Ok(mut guard) = lock.lock() {
+                    guard.stream_stopped = true;
+                    guard.stream_stop_error = stop_err;
+                    cvar.notify_all();
+                }
+            });
             unsafe {
-                self.stream.stopCaptureWithCompletionHandler(None);
+                self.stream
+                    .stopCaptureWithCompletionHandler(Some(&stop_block));
             }
         });
     }
 }
 
+/// Waits up to `timeout` for BOTH `startCapture` and `stopCapture` to settle, and returns `true`
+/// ONLY when `is_cleanly_stopped` holds (`start_completed && stream_stopped && no stop error`).
 pub(super) fn wait_for_stream_stopped(
     signal: &Arc<(Mutex<DelegateSignal>, Condvar)>,
     timeout: Duration,
@@ -162,10 +189,12 @@ pub(super) fn wait_for_stream_stopped(
     let Ok(guard) = lock.lock() else {
         return false;
     };
-    let Ok((guard, _)) = cvar.wait_timeout_while(guard, timeout, |s| !s.stream_stopped) else {
+    let Ok((guard, _)) =
+        cvar.wait_timeout_while(guard, timeout, |s| !(s.start_completed && s.stream_stopped))
+    else {
         return false;
     };
-    guard.stream_stopped
+    is_cleanly_stopped(&guard)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,6 +275,10 @@ where
                         &mut trigger_stop_and_confirm,
                     );
                 }
+                if let Ok(mut guard) = signal.0.lock() {
+                    guard.start_completed = true;
+                    signal.1.notify_all();
+                }
                 return Ok(StartWaitOutcome::Started);
             }
             Ok(Err(err)) => return Err(err),
@@ -262,23 +295,52 @@ where
     }
 }
 
-/// Invoked inside the `startCaptureWithCompletionHandler` completion block. If startup was
-/// already cancelled while this callback was delayed, runs `on_late_start_cleanup` so a newly
-/// running stream is torn down immediately instead of remaining active.
+/// Invoked inside the `startCaptureWithCompletionHandler` completion block. Updates
+/// `start_completed` on `signal`, and if startup was already cancelled while this callback was
+/// delayed, clears any earlier pre-start `-3808` stop status before running `on_late_start_cleanup`
+/// so callers wait for the post-start stop completion handler to confirm success or failure.
 pub(super) fn handle_start_callback_result<C>(
     res: Result<(), String>,
+    signal: &Arc<(Mutex<DelegateSignal>, Condvar)>,
     cancelled_after_start: &AtomicBool,
     tx: &mpsc::SyncSender<Result<(), String>>,
     on_late_start_cleanup: C,
 ) where
     C: FnOnce(),
 {
-    if res.is_ok() && cancelled_after_start.load(Ordering::Acquire) {
+    let reset_for_late_stop = || {
+        let (lock, cvar) = &**signal;
+        if let Ok(mut guard) = lock.lock() {
+            guard.start_completed = true;
+            guard.stream_stopped = false;
+            guard.stream_stop_error = None;
+            cvar.notify_all();
+        }
+    };
+    if res.is_err() {
+        let (lock, cvar) = &**signal;
+        if let Ok(mut guard) = lock.lock() {
+            guard.start_completed = true;
+            guard.stream_stopped = true;
+            cvar.notify_all();
+        }
+        let _ = tx.send(res);
+        return;
+    }
+    if cancelled_after_start.load(Ordering::Acquire) {
+        reset_for_late_stop();
         on_late_start_cleanup();
         return;
     }
     if tx.send(res).is_err() || cancelled_after_start.load(Ordering::Acquire) {
+        reset_for_late_stop();
         on_late_start_cleanup();
+        return;
+    }
+    let (lock, cvar) = &**signal;
+    if let Ok(mut guard) = lock.lock() {
+        guard.start_completed = true;
+        cvar.notify_all();
     }
 }
 
@@ -422,41 +484,4 @@ pub(super) fn evaluate_stop_poll(
         StopPollState::Pending
     };
     (state, false)
-}
-
-/// Strictly verifies that `path` is a non-empty playable video file with at least one playable
-/// video track and a decodable initial frame (rejecting non-video files and truncated MP4s).
-pub fn is_valid_salvageable_mp4(path: &Path) -> bool {
-    let Ok(meta_fs) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !meta_fs.is_file() || meta_fs.len() == 0 {
-        return false;
-    }
-    let Ok(meta) = probe_video_metadata(path) else {
-        return false;
-    };
-    meta.has_video
-        && meta.is_playable
-        && meta.duration_sec >= 0.05
-        && extract_rgba_frame(path, 0.0, Some(64)).is_ok()
-}
-
-pub(super) fn format_stop_error_with_preservation(
-    stop_err: &str,
-    staging: &mut crate::fs_safety::ExclusiveStagingDir,
-) -> String {
-    match crate::staging::preserve_staged_permanently(
-        staging,
-        crate::staging::private_recovery_dir(),
-    ) {
-        Ok(saved_path) => format!(
-            "{stop_err}. Playable footage was preserved at {}",
-            crate::fs_safety::format_tilde_path(&saved_path)
-        ),
-        Err((rec_err, kept_path)) => format!(
-            "{stop_err} (recovery failed: {rec_err}). Playable footage was preserved in staging at {}",
-            crate::fs_safety::format_tilde_path(&kept_path)
-        ),
-    }
 }
