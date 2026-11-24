@@ -7,7 +7,7 @@ use std::sync::mpsc;
 use block2::RcBlock;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSAlert, NSAlertFirstButtonReturn, NSAlertSecondButtonReturn, NSApplication};
-use objc2_foundation::{NSString, NSTimer};
+use objc2_foundation::{NSRunLoop, NSRunLoopCommonModes, NSString, NSTimer};
 
 use crate::capture::audio_devices::{
     MicPermissionStatus, microphone_permission_status, request_microphone_permission_channel,
@@ -186,7 +186,10 @@ fn start_recording_from_overlay(
                 }
             });
             let timer = unsafe {
-                NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.05, true, &poll_block)
+                let t =
+                    NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.05, true, &poll_block);
+                NSRunLoop::mainRunLoop().addTimer_forMode(&t, NSRunLoopCommonModes);
+                t
             };
             runtime.borrow_mut().mic_perm_timer = Some(timer);
         }
@@ -257,7 +260,10 @@ fn launch_recording_session(
                     }
                 });
                 rt.rec_timer = Some(unsafe {
-                    NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.5, true, &block)
+                    let t =
+                        NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.5, true, &block);
+                    NSRunLoop::mainRunLoop().addTimer_forMode(&t, NSRunLoopCommonModes);
+                    t
                 });
             }
             if tutorial_active {
@@ -346,8 +352,12 @@ pub(crate) fn stop_active_recording(mtm: MainThreadMarker, runtime: &Rc<RefCell<
         }
     });
 
-    let timer =
-        unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.035, true, &poll_block) };
+    let timer = unsafe {
+        let t = NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.035, true, &poll_block);
+        // Register in common modes so menu tracking / modal sheets never pause stop finalization.
+        NSRunLoop::mainRunLoop().addTimer_forMode(&t, NSRunLoopCommonModes);
+        t
+    };
     runtime.borrow_mut().stop_poll_timer = Some(timer);
 }
 

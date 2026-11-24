@@ -10,7 +10,9 @@ use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{NSBezierPath, NSButton, NSColor, NSPopUpButton, NSTextField, NSView};
-use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer};
+use objc2_foundation::{
+    NSObjectProtocol, NSPoint, NSRect, NSRunLoop, NSRunLoopCommonModes, NSSize, NSString, NSTimer,
+};
 
 use crate::export::avfoundation::VideoMetadata;
 use crate::export::{ExportFormat, ExportRequest, ExportResult, run_export_with_options};
@@ -271,6 +273,7 @@ pub fn spawn_async_export(
     });
 
     unsafe {
-        let _ = NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.035, true, &poll_block);
+        let t = NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.035, true, &poll_block);
+        NSRunLoop::mainRunLoop().addTimer_forMode(&t, NSRunLoopCommonModes);
     }
 }

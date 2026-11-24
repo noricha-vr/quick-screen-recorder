@@ -22,6 +22,7 @@ use crate::observe::{PerfEvent, PerfKind, now_unix_secs, record_perf_event};
 
 const STOP_FALLBACK_AFTER: Duration = Duration::from_secs(2);
 const STOP_TIMEOUT: Duration = Duration::from_secs(12);
+const STOP_STREAM_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 struct DelegateSignal {
@@ -116,7 +117,7 @@ pub struct PendingRecordingStop {
     fps: u32,
     codec: RecordingCodec,
     stop_initiated_at: Instant,
-    stop_capture_sent: bool,
+    stop_capture_sent_at: Option<Instant>,
 }
 
 impl RecordingSession {
@@ -293,7 +294,7 @@ impl RecordingSession {
             fps: self.fps,
             codec: self.codec,
             stop_initiated_at: Instant::now(),
-            stop_capture_sent: false,
+            stop_capture_sent_at: None,
         };
         if remove_failed {
             pending.send_stop_capture();
@@ -313,7 +314,9 @@ impl RecordingSession {
                     .map_err(|_| "Mutex poisoned")?;
                 drop(guard);
                 pending.send_stop_capture();
-                let remaining = STOP_TIMEOUT.saturating_sub(pending.stop_initiated_at.elapsed());
+                let remaining = STOP_TIMEOUT
+                    .saturating_sub(pending.stop_initiated_at.elapsed())
+                    .max(STOP_STREAM_CONFIRM_TIMEOUT);
                 let guard = lock.lock().map_err(|_| "Mutex poisoned")?;
                 let _ = cvar
                     .wait_timeout_while(guard, remaining, |s| !(s.finished && s.stream_stopped));
@@ -325,8 +328,8 @@ impl RecordingSession {
 
 impl PendingRecordingStop {
     fn send_stop_capture(&mut self) {
-        if !self.stop_capture_sent {
-            self.stop_capture_sent = true;
+        if self.stop_capture_sent_at.is_none() {
+            self.stop_capture_sent_at = Some(Instant::now());
             let sig = Arc::clone(&self.signal);
             let stop_block = RcBlock::new(move |err: *mut NSError| {
                 let stop_err = if !err.is_null() {
@@ -364,10 +367,11 @@ impl PendingRecordingStop {
             .lock()
             .map(|g| (g.finished, g.stream_stopped))
             .unwrap_or((true, true));
+        let stop_sent_elapsed = self.stop_capture_sent_at.map(|t| t.elapsed());
         let (state, should_send_stop) = evaluate_stop_poll(
             finished,
             stream_stopped,
-            self.stop_capture_sent,
+            stop_sent_elapsed,
             self.stop_initiated_at.elapsed(),
         );
         if should_send_stop {
@@ -439,22 +443,31 @@ impl PendingRecordingStop {
 
 /// Pure transition table for [`PendingRecordingStop::poll`].
 /// Returns `(next_poll_state, should_send_stop_capture)`.
+/// Never times out on the tick that first sends `stopCaptureWithCompletionHandler`,
+/// guaranteeing a full stream-stop confirmation window even after a delayed runloop tick.
 fn evaluate_stop_poll(
     finished: bool,
     stream_stopped: bool,
-    stop_capture_sent: bool,
-    elapsed: Duration,
+    stop_sent_elapsed: Option<Duration>,
+    total_elapsed: Duration,
 ) -> (StopPollState, bool) {
     if finished && stream_stopped {
-        return (StopPollState::Finished, !stop_capture_sent);
+        return (StopPollState::Finished, stop_sent_elapsed.is_none());
     }
-    let should_send_stop = !stop_capture_sent && (finished || elapsed >= STOP_FALLBACK_AFTER);
-    let state = if elapsed >= STOP_TIMEOUT {
+    if stop_sent_elapsed.is_none() && (finished || total_elapsed >= STOP_FALLBACK_AFTER) {
+        return (StopPollState::Pending, true);
+    }
+    let timed_out = match stop_sent_elapsed {
+        Some(sent_for) if finished => sent_for >= STOP_STREAM_CONFIRM_TIMEOUT,
+        Some(sent_for) => total_elapsed >= STOP_TIMEOUT && sent_for >= STOP_STREAM_CONFIRM_TIMEOUT,
+        None => false,
+    };
+    let state = if timed_out {
         StopPollState::TimedOut
     } else {
         StopPollState::Pending
     };
-    (state, should_send_stop)
+    (state, false)
 }
 
 #[cfg(test)]
