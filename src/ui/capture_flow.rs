@@ -254,6 +254,7 @@ fn launch_recording_session(
         Ok(session) => {
             monitor.attach_stop_hook(session.stop_hook());
             let early_interrupt = monitor.poll_interrupt();
+            let early_ended = session.has_ended_unexpectedly();
             {
                 let mut rt = runtime.borrow_mut();
                 rt.temp_files.push(raw_out);
@@ -302,6 +303,10 @@ fn launch_recording_session(
             }
             if let Some(reason) = early_interrupt {
                 stop_active_recording_with_reason(mtm, runtime, Some(reason));
+                return;
+            }
+            if early_ended {
+                stop_active_recording(mtm, runtime);
                 return;
             }
             if tutorial_active {

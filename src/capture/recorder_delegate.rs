@@ -131,6 +131,13 @@ impl SendableStreamStop {
         });
     }
 
+    /// Initiates teardown and waits up to `confirm_timeout` for ScreenCaptureKit's `stopCapture`
+    /// completion handler so callers never drop `staging` while the stream could still start/write.
+    pub(super) fn stop_and_wait_stopped(&self, confirm_timeout: Duration) -> bool {
+        self.stop_now(Duration::from_millis(250));
+        wait_for_stream_stopped(&self.signal, confirm_timeout)
+    }
+
     /// Unconditional teardown used when a delayed `startCapture` completion handler succeeds
     /// AFTER startup was already cancelled by an interrupt/timeout (earlier pre-start stop calls
     /// may have returned `-3808` before the stream transitioned to running).
@@ -147,72 +154,109 @@ impl SendableStreamStop {
     }
 }
 
+pub(super) fn wait_for_stream_stopped(
+    signal: &Arc<(Mutex<DelegateSignal>, Condvar)>,
+    timeout: Duration,
+) -> bool {
+    let (lock, cvar) = &**signal;
+    let Ok(guard) = lock.lock() else {
+        return false;
+    };
+    let Ok((guard, _)) = cvar.wait_timeout_while(guard, timeout, |s| !s.stream_stopped) else {
+        return false;
+    };
+    guard.stream_stopped
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StartWaitOutcome {
+    Started,
+    HandOffToStop,
+}
+
+fn record_startup_abort_error(signal: &Arc<(Mutex<DelegateSignal>, Condvar)>, msg: &str) {
+    if let Ok(mut guard) = signal.0.lock() {
+        guard.error.get_or_insert_with(|| msg.to_string());
+    }
+}
+
 /// Coordinates a potentially delayed `startCaptureWithCompletionHandler` result with concurrent
 /// system-interrupt cancellation so startup never blocks 8 seconds on lock/sleep and late start
-/// completions can never leave a stream running. Checks `writer_started()` AFTER stop teardown
-/// completes so even if `recordingOutputDidStartRecording:` fires mid-stop, ownership of `staging`
-/// stays with `RecordingSession` for normal stop/recovery instead of dropping captured footage.
+/// completions can never leave a stream running. Only returns `Err` (allowing `staging` to be
+/// dropped) after `trigger_stop_and_confirm()` confirms `stream_stopped == true` AND
+/// `writer_started()` is still `false`; otherwise returns `Ok(StartWaitOutcome::HandOffToStop)`
+/// so `RecordingSession` keeps `staging` alive through normal stop/recovery.
 pub(super) fn wait_for_capture_start_with_interrupt<F, W, S>(
     rx: &mpsc::Receiver<Result<(), String>>,
+    signal: &Arc<(Mutex<DelegateSignal>, Condvar)>,
     timeout: Duration,
     cancelled_after_start: &AtomicBool,
     mut check_interrupted: F,
     mut writer_started: W,
-    mut trigger_immediate_stop: S,
-) -> Result<(), String>
+    mut trigger_stop_and_confirm: S,
+) -> Result<StartWaitOutcome, String>
 where
     F: FnMut() -> Option<String>,
     W: FnMut() -> bool,
-    S: FnMut(),
+    S: FnMut() -> bool,
 {
     let deadline = Instant::now() + timeout;
+    let abort_or_handoff = |msg: String,
+                            is_interrupt: bool,
+                            writer_started: &mut W,
+                            trigger_stop_and_confirm: &mut S|
+     -> Result<StartWaitOutcome, String> {
+        if !writer_started() {
+            cancelled_after_start.store(true, Ordering::Release);
+        }
+        let stop_confirmed = trigger_stop_and_confirm();
+        if writer_started() || !stop_confirmed {
+            if !is_interrupt {
+                record_startup_abort_error(signal, &msg);
+            }
+            return Ok(StartWaitOutcome::HandOffToStop);
+        }
+        Err(msg)
+    };
     loop {
         if let Some(msg) = check_interrupted() {
-            if !writer_started() {
-                cancelled_after_start.store(true, Ordering::Release);
-            }
-            trigger_immediate_stop();
-            if writer_started() {
-                return Ok(());
-            }
-            return Err(msg);
+            return abort_or_handoff(
+                msg,
+                true,
+                &mut writer_started,
+                &mut trigger_stop_and_confirm,
+            );
         }
         let rem = deadline.saturating_duration_since(Instant::now());
         if rem.is_zero() {
-            if !writer_started() {
-                cancelled_after_start.store(true, Ordering::Release);
-            }
-            trigger_immediate_stop();
-            if writer_started() {
-                return Ok(());
-            }
-            return Err("Timed out starting ScreenCaptureKit stream".to_string());
+            return abort_or_handoff(
+                "Timed out starting ScreenCaptureKit stream".to_string(),
+                false,
+                &mut writer_started,
+                &mut trigger_stop_and_confirm,
+            );
         }
         match rx.recv_timeout(rem.min(Duration::from_millis(25))) {
             Ok(Ok(())) => {
                 if let Some(msg) = check_interrupted() {
-                    if !writer_started() {
-                        cancelled_after_start.store(true, Ordering::Release);
-                    }
-                    trigger_immediate_stop();
-                    if writer_started() {
-                        return Ok(());
-                    }
-                    return Err(msg);
+                    return abort_or_handoff(
+                        msg,
+                        true,
+                        &mut writer_started,
+                        &mut trigger_stop_and_confirm,
+                    );
                 }
-                return Ok(());
+                return Ok(StartWaitOutcome::Started);
             }
             Ok(Err(err)) => return Err(err),
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                if !writer_started() {
-                    cancelled_after_start.store(true, Ordering::Release);
-                }
-                trigger_immediate_stop();
-                if writer_started() {
-                    return Ok(());
-                }
-                return Err("ScreenCaptureKit start handler disconnected".to_string());
+                return abort_or_handoff(
+                    "ScreenCaptureKit start handler disconnected".to_string(),
+                    false,
+                    &mut writer_started,
+                    &mut trigger_stop_and_confirm,
+                );
             }
         }
     }
@@ -291,18 +335,18 @@ impl RecordingDelegate {
 }
 
 /// Waits up to `timeout` for `recordingOutputDidStartRecording:` while polling `check_interrupted`
-/// every 50ms so screen lock/sleep before writer startup aborts immediately. Once `guard.started`
-/// becomes `true`, returns `Ok(())` even if an interrupt or delegate failure occurred right after
-/// start so the caller routes `staging` through normal stop/recovery instead of dropping footage.
+/// every 50ms. Only returns `Err` (dropping `staging`) when `trigger_stop_and_confirm()` confirms
+/// `stream_stopped == true` AND `guard.started` is still `false` afterward; otherwise returns
+/// `Ok(())` so `RecordingSession` preserves `staging` through normal stop/recovery.
 pub(super) fn wait_for_recording_started<F, S>(
     signal: &Arc<(Mutex<DelegateSignal>, Condvar)>,
     timeout: Duration,
     mut check_interrupted: F,
-    mut trigger_stop: S,
+    mut trigger_stop_and_confirm: S,
 ) -> Result<(), String>
 where
     F: FnMut() -> Option<String>,
-    S: FnMut(),
+    S: FnMut() -> bool,
 {
     let (lock, cvar) = &**signal;
     let deadline = Instant::now() + timeout;
@@ -310,9 +354,9 @@ where
     while !guard.started && guard.error.is_none() {
         if let Some(msg) = check_interrupted() {
             drop(guard);
-            trigger_stop();
-            // Re-check `started` AFTER stop teardown in case `did_start` arrived mid-stop.
-            if lock.lock().map(|g| g.started).unwrap_or(false) {
+            let stop_confirmed = trigger_stop_and_confirm();
+            let started = lock.lock().map(|g| g.started).unwrap_or(true);
+            if started || !stop_confirmed {
                 return Ok(());
             }
             return Err(msg);
@@ -329,24 +373,28 @@ where
     if guard.started {
         drop(guard);
         if check_interrupted().is_some() {
-            trigger_stop();
+            let _ = trigger_stop_and_confirm();
         }
         return Ok(());
     }
     if let Some(err) = guard.error.clone() {
         drop(guard);
-        trigger_stop();
-        if lock.lock().map(|g| g.started).unwrap_or(false) {
+        let stop_confirmed = trigger_stop_and_confirm();
+        let started = lock.lock().map(|g| g.started).unwrap_or(true);
+        if started || !stop_confirmed {
             return Ok(());
         }
         return Err(format!("Recording output failed to start: {err}"));
     }
     drop(guard);
-    trigger_stop();
-    if lock.lock().map(|g| g.started).unwrap_or(false) {
+    let stop_confirmed = trigger_stop_and_confirm();
+    let started = lock.lock().map(|g| g.started).unwrap_or(true);
+    let timeout_msg = "Timed out waiting for hardware recording writer to start".to_string();
+    if started || !stop_confirmed {
+        record_startup_abort_error(signal, &timeout_msg);
         return Ok(());
     }
-    Err("Timed out waiting for hardware recording writer to start".to_string())
+    Err(timeout_msg)
 }
 
 /// Pure transition table for [`crate::capture::recorder::PendingRecordingStop::poll`].

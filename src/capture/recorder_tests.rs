@@ -133,9 +133,11 @@ fn delayed_start_callback_interrupted_triggers_immediate_and_late_stop() {
         });
     });
 
+    let signal = Arc::new((Mutex::new(DelegateSignal::default()), Condvar::new()));
     let started = Instant::now();
     let wait_res = wait_for_capture_start_with_interrupt(
         &rx,
+        &signal,
         Duration::from_secs(8),
         &cancelled,
         || {
@@ -146,6 +148,7 @@ fn delayed_start_callback_interrupted_triggers_immediate_and_late_stop() {
         || false,
         || {
             immediate_stops.fetch_add(1, Ordering::SeqCst);
+            true
         },
     );
     assert!(
@@ -190,6 +193,7 @@ fn interrupt_after_writer_started_preserves_session_for_normal_stop_and_recovery
         || Some("interrupted: screen locked".to_string()),
         || {
             stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
         },
     );
     assert!(
@@ -209,10 +213,10 @@ fn interrupt_after_writer_started_preserves_session_for_normal_stop_and_recovery
         Condvar::new(),
     ));
     let res_err_after_start =
-        wait_for_recording_started(&err_signal, Duration::from_secs(1), || None, || {});
+        wait_for_recording_started(&err_signal, Duration::from_secs(1), || None, || true);
     assert!(res_err_after_start.is_ok());
 
-    // Case 3: Writer has NOT started when interrupted -> returns Err immediately (no footage lost).
+    // Case 3: Writer has NOT started and stop IS confirmed -> returns Err cleanly (no footage lost).
     let unstarted = Arc::new((Mutex::new(DelegateSignal::default()), Condvar::new()));
     let unstarted_stops = AtomicUsize::new(0);
     let res_unstarted = wait_for_recording_started(
@@ -221,70 +225,102 @@ fn interrupt_after_writer_started_preserves_session_for_normal_stop_and_recovery
         || Some("interrupted: screen locked".to_string()),
         || {
             unstarted_stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
         },
     );
     assert!(res_unstarted.is_err());
     assert_eq!(unstarted_stops.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-    // Case 4: `wait_for_capture_start_with_interrupt` preserves Ok(()) if writer already started.
+    // Case 4: `wait_for_capture_start_with_interrupt` hands off to stop if writer already started.
     let (_tx, rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let cap_sig = Arc::new((Mutex::new(DelegateSignal::default()), Condvar::new()));
     let cancelled = AtomicBool::new(false);
     let late_stops = AtomicUsize::new(0);
     let res_capture_wait = wait_for_capture_start_with_interrupt(
         &rx,
+        &cap_sig,
         Duration::from_secs(1),
         &cancelled,
         || Some("interrupted: screen locked".to_string()),
         || true,
         || {
             late_stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true
         },
     );
-    assert!(res_capture_wait.is_ok());
+    assert_eq!(res_capture_wait, Ok(StartWaitOutcome::HandOffToStop));
     assert!(!cancelled.load(std::sync::atomic::Ordering::Acquire));
     assert_eq!(late_stops.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 #[test]
-fn writer_starting_mid_stop_still_preserves_session_for_recovery() {
-    use std::sync::atomic::Ordering;
+fn async_did_start_before_stream_stopped_and_unconfirmed_stop_preserve_session() {
+    use std::thread;
 
-    // Case 1: `wait_for_recording_started` sees `started == false`, invokes stop closure, and
-    // `did_start` arrives mid-stop -> must re-check `started` after stop and return Ok(()).
+    // Case 1: Stop initiates asynchronously; AFTER the stop request is sent, a background thread
+    // delivers `did_start` first and `stream_stopped` afterward. `wait_for_stream_stopped` waits
+    // for stop confirmation so the post-stop recheck sees `started == true` and preserves staging!
     let signal = Arc::new((Mutex::new(DelegateSignal::default()), Condvar::new()));
-    let sig_in_stop = Arc::clone(&signal);
+    let sig_bg = Arc::clone(&signal);
+    let sig_wait = Arc::clone(&signal);
+    let mut async_handle: Option<thread::JoinHandle<()>> = None;
     let res = wait_for_recording_started(
         &signal,
         Duration::from_secs(1),
         || Some("interrupted: screen locked".to_string()),
-        move || {
-            sig_in_stop.0.lock().expect("lock").started = true;
+        || {
+            let s = Arc::clone(&sig_bg);
+            async_handle = Some(thread::spawn(move || {
+                thread::sleep(Duration::from_millis(20));
+                if let Ok(mut g) = s.0.lock() {
+                    g.started = true;
+                }
+                thread::sleep(Duration::from_millis(20));
+                if let Ok(mut g) = s.0.lock() {
+                    g.stream_stopped = true;
+                    s.1.notify_all();
+                }
+            }));
+            delegate::wait_for_stream_stopped(&sig_wait, Duration::from_secs(2))
         },
     );
     assert!(
         res.is_ok(),
-        "writer starting during stop teardown must return Ok so staging is preserved"
+        "async did_start arriving before stream_stopped confirmation must preserve staging"
+    );
+    if let Some(h) = async_handle {
+        h.join().expect("join async delegate thread");
+    }
+
+    // Case 2: Stream stop confirmation times out (`false`) even while `started == false` ->
+    // MUST still preserve staging (`Ok` / `HandOffToStop`) instead of deleting it prematurely.
+    let unconfirmed_sig = Arc::new((Mutex::new(DelegateSignal::default()), Condvar::new()));
+    let res_unconfirmed = wait_for_recording_started(
+        &unconfirmed_sig,
+        Duration::from_secs(1),
+        || Some("interrupted: screen locked".to_string()),
+        || false,
+    );
+    assert!(
+        res_unconfirmed.is_ok(),
+        "unconfirmed stream stop must hand off staging to normal stop/recovery"
     );
 
-    // Case 2: `wait_for_capture_start_with_interrupt` sees `started == false`, invokes stop
-    // closure, and `did_start` arrives mid-stop -> must re-check after stop and return Ok(()).
     let (_tx, rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let cap_sig = Arc::new((Mutex::new(DelegateSignal::default()), Condvar::new()));
     let cancelled = AtomicBool::new(false);
-    let started_flag = Arc::new(AtomicBool::new(false));
-    let started_read = Arc::clone(&started_flag);
-    let started_in_stop = Arc::clone(&started_flag);
-    let res_start_wait = wait_for_capture_start_with_interrupt(
+    let res_cap_unconfirmed = wait_for_capture_start_with_interrupt(
         &rx,
+        &cap_sig,
         Duration::from_secs(1),
         &cancelled,
         || Some("interrupted: screen locked".to_string()),
-        move || started_read.load(Ordering::Acquire),
-        move || {
-            started_in_stop.store(true, Ordering::Release);
-        },
+        || false,
+        || false,
     );
-    assert!(
-        res_start_wait.is_ok(),
-        "writer starting during capture-start stop teardown must return Ok so staging is preserved"
+    assert_eq!(
+        res_cap_unconfirmed,
+        Ok(StartWaitOutcome::HandOffToStop),
+        "unconfirmed capture-start stop must hand off to normal stop/recovery"
     );
 }

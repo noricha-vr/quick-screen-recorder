@@ -19,8 +19,8 @@ mod delegate;
 
 pub use delegate::is_valid_salvageable_mp4;
 use delegate::{
-    DelegateSignal, RecordingDelegate, SendableStreamStop, StreamStopControl, evaluate_stop_poll,
-    format_stop_error_with_preservation, handle_start_callback_result,
+    DelegateSignal, RecordingDelegate, SendableStreamStop, StartWaitOutcome, StreamStopControl,
+    evaluate_stop_poll, format_stop_error_with_preservation, handle_start_callback_result,
     wait_for_capture_start_with_interrupt, wait_for_recording_started,
 };
 
@@ -247,21 +247,21 @@ impl RecordingSession {
         }
 
         let writer_started = || signal.0.lock().map(|g| g.started).unwrap_or(false);
-        wait_for_capture_start_with_interrupt(
+        let start_outcome = wait_for_capture_start_with_interrupt(
             &rx,
+            &signal,
             Duration::from_secs(8),
             &cancelled_after_start,
             check_interrupted,
             writer_started,
-            || stopper.stop_now(Duration::from_millis(250)),
+            || stopper.stop_and_wait_stopped(STOP_STREAM_CONFIRM_TIMEOUT),
         )?;
 
-        // Once `wait_for_recording_started` returns `Ok(())`, the hardware writer has started
-        // writing to `staging`. Return `Ok(Self)` even if an interrupt occurred right after start
-        // so the caller's normal stop/recovery path finalizes and preserves captured footage.
-        wait_for_recording_started(&signal, Duration::from_secs(8), check_interrupted, || {
-            stopper.stop_now(Duration::from_millis(250));
-        })?;
+        if start_outcome == StartWaitOutcome::Started {
+            wait_for_recording_started(&signal, Duration::from_secs(8), check_interrupted, || {
+                stopper.stop_and_wait_stopped(STOP_STREAM_CONFIRM_TIMEOUT)
+            })?;
+        }
 
         Ok(Self {
             stream,
@@ -287,7 +287,11 @@ impl RecordingSession {
 
     /// Returns `true` if ScreenCaptureKit already stopped or failed the recording output early.
     pub fn has_ended_unexpectedly(&self) -> bool {
-        self.signal.0.lock().map(|g| g.finished).unwrap_or(false)
+        self.signal
+            .0
+            .lock()
+            .map(|g| g.finished || g.error.is_some())
+            .unwrap_or(false)
     }
 
     /// Thread-safe immediate stop hook that removes `SCRecordingOutput` and stops `SCStream`
