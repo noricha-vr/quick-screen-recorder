@@ -303,9 +303,11 @@ fn stop_timeout_exceeds_writer_finish_and_recovers_delayed_finalization() {
     );
 
     let sync = SyncState::new();
+    let committing = Arc::new(AtomicBool::new(false));
     let (done_tx, done_rx) = mpsc::sync_channel::<Result<RecordingOutcome, String>>(1);
     let mut pending = PendingTimelapseStop {
         sync,
+        committing,
         done_rx,
         result: None,
         stop_initiated_at: Instant::now(),
@@ -321,6 +323,51 @@ fn stop_timeout_exceeds_writer_finish_and_recovers_delayed_finalization() {
     done_tx.send(Ok(expected.clone())).expect("send result");
     assert_eq!(pending.poll(), StopPollState::Finished);
     assert_eq!(pending.finish(), Ok(expected));
+}
+
+#[test]
+fn slow_cross_volume_commit_does_not_time_out_after_encoder_finishes() {
+    let sync = SyncState::new();
+    let committing = Arc::new(AtomicBool::new(true));
+    let (done_tx, done_rx) = mpsc::sync_channel::<Result<RecordingOutcome, String>>(1);
+    let mut pending = PendingTimelapseStop {
+        sync,
+        committing: Arc::clone(&committing),
+        done_rx,
+        result: None,
+        stop_initiated_at: Instant::now(),
+        timeout: Duration::from_millis(15),
+    };
+
+    thread::sleep(Duration::from_millis(30));
+    assert_eq!(
+        pending.poll(),
+        StopPollState::Pending,
+        "active cross-volume commit must never time out at encoder finalization limit"
+    );
+
+    let expected = RecordingOutcome {
+        output_path: PathBuf::from("/tmp/slow-usb-timelapse.mp4"),
+        partial_error: None,
+    };
+    done_tx
+        .send(Ok(expected.clone()))
+        .expect("send commit done");
+    assert_eq!(pending.poll(), StopPollState::Finished);
+    assert_eq!(pending.finish(), Ok(expected));
+
+    // Verify normal timeout still triggers when encoder is NOT yet in commit phase.
+    let (_tx2, rx2) = mpsc::sync_channel::<Result<RecordingOutcome, String>>(1);
+    let mut stuck = PendingTimelapseStop {
+        sync: SyncState::new(),
+        committing: Arc::new(AtomicBool::new(false)),
+        done_rx: rx2,
+        result: None,
+        stop_initiated_at: Instant::now(),
+        timeout: Duration::from_millis(15),
+    };
+    thread::sleep(Duration::from_millis(30));
+    assert_eq!(stuck.poll(), StopPollState::TimedOut);
 }
 
 #[test]

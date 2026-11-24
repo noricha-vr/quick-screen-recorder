@@ -33,12 +33,14 @@ pub struct TimelapseSession {
     sync: Arc<SyncState>,
     frames_written: Arc<AtomicU64>,
     worker_done: Arc<AtomicBool>,
+    committing: Arc<AtomicBool>,
     done_rx: Option<mpsc::Receiver<Result<RecordingOutcome, String>>>,
     started_at: Instant,
 }
 
 pub struct PendingTimelapseStop {
     sync: Arc<SyncState>,
+    committing: Arc<AtomicBool>,
     done_rx: mpsc::Receiver<Result<RecordingOutcome, String>>,
     result: Option<Result<RecordingOutcome, String>>,
     stop_initiated_at: Instant,
@@ -61,6 +63,8 @@ impl TimelapseSession {
         let frames_worker = Arc::clone(&frames_written);
         let worker_done = Arc::new(AtomicBool::new(false));
         let done_flag_worker = Arc::clone(&worker_done);
+        let committing = Arc::new(AtomicBool::new(false));
+        let committing_worker = Arc::clone(&committing);
 
         // Rendezvous channel (capacity 0): `init_tx.send(Ok(()))` succeeds if and only if
         // `init_rx.recv_timeout(...)` actually received the handoff, eliminating start/stop races.
@@ -76,6 +80,7 @@ impl TimelapseSession {
                 Duration::from_secs(u64::from(interval_secs)),
                 sync_worker,
                 frames_worker,
+                committing_worker,
                 started_at,
                 init_tx,
             );
@@ -90,6 +95,7 @@ impl TimelapseSession {
                 sync,
                 frames_written,
                 worker_done,
+                committing,
                 done_rx: Some(done_rx),
                 started_at,
             }),
@@ -125,6 +131,7 @@ impl TimelapseSession {
             .expect("TimelapseSession::done_rx present until stop");
         PendingTimelapseStop {
             sync: Arc::clone(&self.sync),
+            committing: Arc::clone(&self.committing),
             done_rx,
             result: None,
             stop_initiated_at: Instant::now(),
@@ -134,12 +141,24 @@ impl TimelapseSession {
 
     pub fn stop(self) -> Result<RecordingOutcome, String> {
         let mut pending = self.begin_stop();
-        match pending.done_rx.recv_timeout(pending.timeout) {
-            Ok(res) => {
-                pending.result = Some(res);
-                pending.finish()
+        loop {
+            match pending.done_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(res) => {
+                    pending.result = Some(res);
+                    return pending.finish();
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("Timelapse worker exited unexpectedly".to_string());
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Never cut off an active cross-volume file commit once encoding has finished.
+                    if !pending.committing.load(Ordering::Acquire)
+                        && pending.stop_initiated_at.elapsed() >= pending.timeout
+                    {
+                        return Err("Timed out finalizing timelapse MP4".to_string());
+                    }
+                }
             }
-            Err(_) => Err("Timed out finalizing timelapse MP4".to_string()),
         }
     }
 }
@@ -165,7 +184,9 @@ impl PendingTimelapseStop {
                 StopPollState::Finished
             }
             Err(mpsc::TryRecvError::Empty) => {
-                if self.stop_initiated_at.elapsed() >= self.timeout {
+                if !self.committing.load(Ordering::Acquire)
+                    && self.stop_initiated_at.elapsed() >= self.timeout
+                {
                     StopPollState::TimedOut
                 } else {
                     StopPollState::Pending
@@ -189,11 +210,12 @@ impl PendingTimelapseStop {
 #[allow(clippy::too_many_arguments)]
 fn run_timelapse_worker(
     cfg: CaptureConfig,
-    staging: ExclusiveStagingDir,
+    mut staging: ExclusiveStagingDir,
     output_path: PathBuf,
     interval: Duration,
     sync: Arc<SyncState>,
     frames_written: Arc<AtomicU64>,
+    committing: Arc<AtomicBool>,
     started_at: Instant,
     init_tx: mpsc::SyncSender<Result<(), String>>,
 ) -> Result<RecordingOutcome, String> {
@@ -271,8 +293,11 @@ fn run_timelapse_worker(
             None => fin_err,
         });
     }
+    // Mark commit phase active so slow cross-volume copies (e.g. multi-GiB MP4 to USB/SMB)
+    // are never cut off by the capture/encoder finalization timeout.
+    committing.store(true, Ordering::Release);
     // If the destination disconnected (e.g. external drive unmounted), rescue the finished local
-    // MP4 into our private recovery folder before `ExclusiveStagingDir::drop()` cleans staging.
+    // MP4 into our private recovery folder; if recovery also fails, retain staging intact on disk.
     let (final_path, size, final_warning) = match staging.commit() {
         Ok(s) => (output_path, s, partial_error),
         Err(com_err) => match private_recovery_dir()
@@ -291,13 +316,15 @@ fn run_timelapse_worker(
                 (recovered_path, rec_size, Some(msg))
             }
             Err(rec_err) => {
+                let kept_path = staging.retain_staged_file();
+                let kept_display = format_tilde_path(&kept_path);
                 record_timelapse_perf(cfg.codec, started_at.elapsed(), 0, false);
                 return Err(match partial_error {
                     Some(cap_err) => format!(
-                        "{cap_err}; failed committing partial video ({com_err}) and local recovery also failed ({rec_err})"
+                        "{cap_err}; failed committing partial video ({com_err}) and local recovery failed ({rec_err}). The finished MP4 was preserved in staging at: {kept_display}"
                     ),
                     None => format!(
-                        "Failed saving recording to destination ({com_err}) and local recovery also failed ({rec_err})"
+                        "Failed saving recording to destination ({com_err}) and local recovery failed ({rec_err}). The finished MP4 was preserved in staging at: {kept_display}"
                     ),
                 });
             }

@@ -50,6 +50,7 @@ pub struct ExclusiveStagingDir {
     dest_parent_dev: u64,
     dest_parent_ino: u64,
     canon_dest: PathBuf,
+    keep_staged_on_drop: bool,
 }
 
 impl ExclusiveStagingDir {
@@ -172,6 +173,7 @@ impl ExclusiveStagingDir {
             dest_parent_dev,
             dest_parent_ino,
             canon_dest,
+            keep_staged_on_drop: false,
         })
     }
 
@@ -420,11 +422,21 @@ impl ExclusiveStagingDir {
             "Failed moving staged file to recovery directory: {err}"
         ))
     }
+
+    /// Disarms automatic cleanup on drop so a completed local staged MP4 is preserved (`0600` in
+    /// our `0700` staging directory) even if both destination commit and recovery-dir move fail.
+    pub fn retain_staged_file(&mut self) -> PathBuf {
+        let _ = fs::set_permissions(&self.staged_file, fs::Permissions::from_mode(0o600));
+        self.keep_staged_on_drop = true;
+        self.staged_file.clone()
+    }
 }
 
 impl Drop for ExclusiveStagingDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.stage_dir_path);
+        if !self.keep_staged_on_drop {
+            let _ = fs::remove_dir_all(&self.stage_dir_path);
+        }
     }
 }
 
@@ -433,7 +445,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn preserve_to_recovery_dir_rescues_recording_when_destination_disappears() {
+    fn preserve_to_recovery_dir_and_retain_staged_protect_finished_recordings() {
         let base = std::env::temp_dir().join(format!("qsr-recover-{}", random_hex_token()));
         let dest_dir = base.join("external-drive");
         let rec_dir = base.join("local-recovered");
@@ -442,40 +454,41 @@ mod tests {
 
         let staging = ExclusiveStagingDir::create_for_target(&target, "mp4").expect("stage");
         fs::write(staging.staged_file(), b"valid-mp4-payload").expect("write staged mp4");
-
-        // Simulate external drive disconnecting before commit().
         fs::remove_dir_all(&dest_dir).expect("remove mock external drive");
-        assert!(
-            staging.commit().is_err(),
-            "commit must fail when destination disappeared"
-        );
+        assert!(staging.commit().is_err());
 
-        // Symlinked recovery directory must be refused before attempting recovery.
         let sym_rec = base.join("symlink-recovered");
         std::os::unix::fs::symlink(&base, &sym_rec).expect("create symlink");
-        assert!(
-            staging.preserve_to_recovery_dir(&sym_rec).is_err(),
-            "recovery must reject symlinked recovery directory"
-        );
+        assert!(staging.preserve_to_recovery_dir(&sym_rec).is_err());
 
-        let (recovered_path, size) = staging
-            .preserve_to_recovery_dir(&rec_dir)
-            .expect("preserve staged mp4 locally");
+        let (rec_path, size) = staging.preserve_to_recovery_dir(&rec_dir).expect("recover");
         assert_eq!(size, b"valid-mp4-payload".len() as u64);
-
-        // Drop staging dir and verify the recovered MP4 survives intact with 0600 mode.
         drop(staging);
+        assert_eq!(fs::read(&rec_path).unwrap(), b"valid-mp4-payload");
         assert_eq!(
-            fs::read(&recovered_path).expect("read recovered mp4"),
-            b"valid-mp4-payload"
+            fs::symlink_metadata(&rec_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
         );
-        let rec_mode = fs::symlink_metadata(&recovered_path)
-            .expect("stat recovered")
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(rec_mode, 0o600);
 
+        fs::create_dir_all(&dest_dir).expect("recreate mock drive");
+        let mut staging2 = ExclusiveStagingDir::create_for_target(&target, "mp4").expect("stage2");
+        fs::write(staging2.staged_file(), b"last-resort-mp4").expect("write staged2");
+        fs::remove_dir_all(&dest_dir).expect("remove mock drive again");
+        assert!(staging2.commit().is_err());
+        assert!(staging2.preserve_to_recovery_dir(&sym_rec).is_err());
+        let kept = staging2.retain_staged_file();
+        drop(staging2);
+        assert_eq!(fs::read(&kept).unwrap(), b"last-resort-mp4");
+        assert_eq!(
+            fs::symlink_metadata(&kept).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let _ = fs::remove_dir_all(kept.parent().unwrap());
         let _ = fs::remove_dir_all(&base);
     }
 }
