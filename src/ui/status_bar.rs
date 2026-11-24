@@ -118,6 +118,7 @@ impl StatusBarController {
         }
 
         let menu = NSMenu::new(mtm);
+        menu.setAutoenablesItems(false);
 
         let record_item = unsafe {
             NSMenuItem::initWithTitle_action_keyEquivalent(
@@ -221,6 +222,7 @@ impl StatusBarController {
         }
         self.record_item
             .setTitle(&NSString::from_str("New Recording..."));
+        self.record_item.setEnabled(true);
     }
 
     pub fn set_recording_elapsed(&self, mtm: MainThreadMarker, secs: u64) {
@@ -231,6 +233,16 @@ impl StatusBarController {
         }
         self.record_item
             .setTitle(&NSString::from_str("Stop Recording"));
+        self.record_item.setEnabled(true);
+    }
+
+    pub fn set_stopping(&self, mtm: MainThreadMarker) {
+        if let Some(btn) = self.status_item.button(mtm) {
+            btn.setTitle(&NSString::from_str("… Saving"));
+        }
+        self.record_item
+            .setTitle(&NSString::from_str("Saving Recording..."));
+        self.record_item.setEnabled(false);
     }
 
     pub fn set_codec_label(&self, codec: RecordingCodec) {

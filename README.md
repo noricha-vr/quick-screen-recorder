@@ -18,16 +18,19 @@ Unlike Electron-based recorders that keep a full Chromium runtime resident in me
 
 ## Highlights
 
-- **Guided First-Run Onboarding & Interactive Tutorial** — Opens automatically on first launch with a live Screen Recording permission indicator (amber -> green after macOS **Quit & Reopen**), one-click deep link to **System Settings > Privacy & Security > Screen & System Audio Recording**, and an animated top-right menu bar walkthrough from your first capture to saved export (reopen anytime via **`◉ Rec` → `Quick Start Guide...`**).
+- **Guided First-Run Onboarding & Interactive Tutorial** — Opens automatically on first launch with a live Screen Recording permission banner (amber -> green after macOS **Quit & Reopen**), an inline **`Open Settings →`** action right inside the permission banner linking directly to **System Settings > Privacy & Security > Screen & System Audio Recording**, and an animated top-right menu bar walkthrough from your first capture to saved export (reopen anytime via **`◉ Rec` → `Quick Start Guide...`**).
 - **Zero Electron / Zero WebView** — Pure Rust + native AppKit status-bar app and borderless overlay. Instant startup and minimal idle memory.
-- **Hardware-Direct Recording (`SCRecordingOutput`)** — Streams selected regions, individual windows, or full displays directly to hardware H.264 / HEVC MP4 with near-zero CPU overhead.
-- **Flexible Capture Selector**
-  - **Area mode**: Drag to create, grab inside to reposition, 8-way resize handles, aspect-ratio lock (`Free`, `16:9`, `16:10`, `4:3`, `3:2`, `1:1`, `9:16`), and exact `W × H` pixel input.
+- **Hardware-Direct Recording (`SCRecordingOutput`)** — Streams selected regions, individual windows, or full displays directly to hardware H.264 / HEVC MP4 with near-zero CPU overhead and non-blocking stream teardown.
+- **Flexible Capture Selector & High-Contrast Following Toolbar**
+  - **Smart Following 2-Row Toolbar**: Automatically docks directly below your selected area or window (flipping above when near the Dock, or floating safely inside fullscreen targets) with an elevated high-contrast frame, crisp rim, and native drop shadow so it stands out over both dark and bright screens.
+  - **Area mode**: Subtle macOS-style 10pt rounded selection corners, drag to create, grab inside to reposition, 8-way resize handles, aspect-ratio lock (`Free`, `16:9`, `16:10`, `4:3`, `3:2`, `1:1`, `9:16`), and exact `W × H` pixel input.
   - **Window mode**: Hover and click any on-screen window to switch the capture target on the fly (overlapping windows are excluded automatically during capture).
   - **Screen mode**: Full-display capture across multi-monitor setups.
-  - Toggle **cursor visibility**, **native click highlights**, **system audio**, and **microphone** right from the floating bar.
+  - **Split Audio Controls (Persisted)**: Independent **System Audio** toggle (ON by default) and **Mic** input device dropdown (`Off`, `System (<default mic>)` ON by default, or any specific connected microphone), automatically remembered across launches. Microphone access is requested natively on demand when recording with a mic.
+  - Toggle **FPS** (`30` / `60`), **cursor visibility**, and **native click highlights** right from the floating bar.
 - **Instant Trim & Multi-Format Export Editor**
   - **Dual-bracket `IN` / `OUT` timeline**: Drag rectangular start/end trim brackets or scrub the playhead with live hardware-decoded frame preview.
+  - **One-Click `Mute audio` on Export**: Strip audio tracks cleanly from MP4 / HEVC / WebM / AV1 exports (also available in CLI via `convert --mute`) when you captured audio by default and want a silent clip.
   - **Zero-dependency native exports**: **MP4 (H.264)**, **MP4 (HEVC)**, **GIF** (multithreaded NeuQuant global palette + frame-delta bounding-box optimization), and **APNG**.
   - **Optional FFmpeg exports**: Automatically unlocks **WebM (VP9)** and **MP4 (AV1)** when `ffmpeg` is installed on your Mac.
   - **Smart Export Folder, Naming & Real-Time Progress**: Defaults to **`~/Movies/Quick Screen Recorder`** (auto-created) and lets you switch destinations anytime via the **`Save to`** dropdown in the editor or **`Save Folder`** in the `◉ Rec` menu bar (`~/Movies/Quick Screen Recorder`, `~/Movies`, `~/Desktop`, `~/Downloads`, `~/Documents`, or **`Choose Folder...`** with New Folder creation). Auto-names files chronologically for Finder sorting & Spotlight search (`YYYY-MM-DD_HH-MM-SS_Quick-Screen-Recorder`, plus target app name on Window captures) while letting you freely edit the **`Name`** field before clicking **`Save`** (atomic non-overwriting write + live progress bar) or **`Copy`**.
@@ -87,7 +90,7 @@ quick-screen-recorder --edit ./demo.mp4
 # Headless timed capture (e.g. 5s of a 1280x720 region at 60fps)
 quick-screen-recorder record --output ./capture.mp4 --duration 5 --region 100,100,1280,720 --fps 60
 
-# Fast format conversion & trimming (e.g. MP4 -> optimized 30fps GIF, max width 800px)
+# Fast format conversion & trimming (e.g. MP4 -> optimized 30fps GIF, max width 800px; add --mute to strip audio)
 quick-screen-recorder convert --input ./capture.mp4 --output ./clip.gif --format gif --fps 30 --start 0.5 --end 4.0 --max-width 800
 
 # View local-only export/capture latency percentiles

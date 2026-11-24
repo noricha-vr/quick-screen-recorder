@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::capture::{AudioCaptureMode, RecordingCodec};
+use crate::capture::{AudioCaptureMode, MicInputPreference, RecordingCodec};
 use crate::export::ExportFormat;
 use crate::fs_safety::{
     atomic_write_private, default_movies_export_dir, ensure_private_dir, is_usable_export_dir,
@@ -16,12 +16,20 @@ use crate::geometry::{AspectRatio, Rect};
 pub const APP_SUPPORT_DIR_NAME: &str = "QuickScreenRecorder";
 const MAX_PREFS_BYTES: u64 = 65_536;
 
+const fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Preferences {
     pub fps: u32,
     pub show_cursor: bool,
     pub highlight_clicks: bool,
     pub audio_mode: AudioCaptureMode,
+    #[serde(default = "default_true")]
+    pub capture_system_audio: bool,
+    #[serde(default)]
+    pub mic_input: MicInputPreference,
     pub aspect_ratio: AspectRatio,
     pub last_region: Rect,
     pub recording_codec: RecordingCodec,
@@ -39,7 +47,9 @@ impl Default for Preferences {
             fps: 60,
             show_cursor: true,
             highlight_clicks: true,
-            audio_mode: AudioCaptureMode::None,
+            audio_mode: AudioCaptureMode::Both,
+            capture_system_audio: true,
+            mic_input: MicInputPreference::SystemDefault,
             aspect_ratio: AspectRatio::Free,
             last_region: Rect::new(160.0, 140.0, 960.0, 600.0),
             recording_codec: RecordingCodec::H264,
@@ -132,12 +142,18 @@ impl Preferences {
         atomic_write_private(path, body.as_bytes())
     }
 
+    pub fn effective_audio_mode(&self) -> AudioCaptureMode {
+        AudioCaptureMode::from_split(self.capture_system_audio, self.mic_input.is_enabled())
+    }
+
     /// Applies only capture-overlay fields so concurrent Menu Bar / Editor updates (such as `export_dir` or `recording_codec`) are preserved.
     pub fn merge_capture_selection(&mut self, overlay_prefs: &Self) {
         self.fps = overlay_prefs.fps;
         self.show_cursor = overlay_prefs.show_cursor;
         self.highlight_clicks = overlay_prefs.highlight_clicks;
-        self.audio_mode = overlay_prefs.audio_mode;
+        self.capture_system_audio = overlay_prefs.capture_system_audio;
+        self.mic_input = overlay_prefs.mic_input.clone();
+        self.audio_mode = self.effective_audio_mode();
         self.aspect_ratio = overlay_prefs.aspect_ratio;
         self.last_region = overlay_prefs.last_region;
     }
@@ -160,6 +176,8 @@ mod tests {
             show_cursor: false,
             highlight_clicks: true,
             audio_mode: AudioCaptureMode::SystemAudio,
+            capture_system_audio: true,
+            mic_input: MicInputPreference::Off,
             aspect_ratio: AspectRatio::R16x9,
             last_region: Rect::new(200.0, 120.0, 1280.0, 720.0),
             recording_codec: RecordingCodec::Hevc,
@@ -216,6 +234,25 @@ mod tests {
         assert_eq!(live.export_dir, Some(PathBuf::from("/tmp/preserved-dir")));
         assert_eq!(live.recording_codec, RecordingCodec::Hevc);
         assert!(live.onboarding_completed);
+
+        // Legacy v0.3 preferences JSON lacking split audio fields defaults to system audio ON + SystemDefault mic
+        let legacy_json = r#"{
+            "fps": 60,
+            "show_cursor": true,
+            "highlight_clicks": false,
+            "audio_mode": "none",
+            "aspect_ratio": "free",
+            "last_region": {"x": 100.0, "y": 100.0, "width": 800.0, "height": 600.0},
+            "recording_codec": "h264",
+            "default_export_format": "mp4",
+            "export_max_width": null
+        }"#;
+        let legacy_path = dir.join("legacy.json");
+        atomic_write_private(&legacy_path, legacy_json.as_bytes()).expect("write legacy");
+        let migrated = Preferences::load_from(&legacy_path).expect("load legacy");
+        assert!(migrated.capture_system_audio);
+        assert_eq!(migrated.mic_input, MicInputPreference::SystemDefault);
+        assert_eq!(migrated.effective_audio_mode(), AudioCaptureMode::Both);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

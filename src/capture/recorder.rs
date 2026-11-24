@@ -7,18 +7,21 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2::{AnyThread, DefinedClass, define_class, msg_send};
 use objc2_av_foundation::{AVFileTypeMPEG4, AVVideoCodecTypeH264, AVVideoCodecTypeHEVC};
-use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_core_media::{CMTime, CMTimeFlags};
-use objc2_foundation::{NSArray, NSError, NSObject, NSObjectProtocol, NSURL};
+use objc2_foundation::{NSError, NSObject, NSObjectProtocol, NSString, NSURL};
 use objc2_screen_capture_kit::{
-    SCContentFilter, SCDisplay, SCRecordingOutput, SCRecordingOutputConfiguration,
-    SCRecordingOutputDelegate, SCRunningApplication, SCStream, SCStreamConfiguration, SCWindow,
+    SCRecordingOutput, SCRecordingOutputConfiguration, SCRecordingOutputDelegate, SCStream,
+    SCStreamConfiguration,
 };
 
+use crate::capture::filter::build_filter_and_dimensions;
 use crate::capture::shareable::query_shareable_content_for_capture;
-use crate::capture::{CaptureConfig, CaptureTarget, RecordingCodec};
+use crate::capture::{CaptureConfig, RecordingCodec};
 use crate::fs_safety::ExclusiveStagingDir;
 use crate::observe::{PerfEvent, PerfKind, now_unix_secs, record_perf_event};
+
+const STOP_FALLBACK_AFTER: Duration = Duration::from_secs(2);
+const STOP_TIMEOUT: Duration = Duration::from_secs(12);
 
 #[derive(Default)]
 struct DelegateSignal {
@@ -91,6 +94,29 @@ pub struct RecordingSession {
     codec: RecordingCodec,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopPollState {
+    Pending,
+    Finished,
+    TimedOut,
+}
+
+/// Non-blocking handle returned by [`RecordingSession::begin_stop`] so the AppKit main runloop
+/// never blocks while CoreAudio / ScreenCaptureKit finalizes the MP4 trailer and tears down mic capture.
+pub struct PendingRecordingStop {
+    stream: Retained<SCStream>,
+    _recording_output: Retained<SCRecordingOutput>,
+    _delegate: Retained<RecordingDelegate>,
+    signal: Arc<(Mutex<DelegateSignal>, Condvar)>,
+    staging: ExclusiveStagingDir,
+    output_path: PathBuf,
+    elapsed_ms: u64,
+    fps: u32,
+    codec: RecordingCodec,
+    stop_initiated_at: Instant,
+    stop_capture_sent: bool,
+}
+
 impl RecordingSession {
     pub fn start(config: &CaptureConfig, output_path: &Path) -> Result<Self, String> {
         let staging = ExclusiveStagingDir::create_for_target(output_path, "mp4")?;
@@ -119,12 +145,19 @@ impl RecordingSession {
             stream_cfg.setCapturesAudio(config.audio_mode.captures_system());
             stream_cfg.setExcludesCurrentProcessAudio(true);
             stream_cfg.setCaptureMicrophone(config.audio_mode.captures_mic());
+            if config.audio_mode.captures_mic() {
+                if let Some(dev_id) = config.microphone_device_id.as_deref() {
+                    if !dev_id.is_empty() {
+                        stream_cfg.setMicrophoneCaptureDeviceID(Some(&NSString::from_str(dev_id)));
+                    }
+                }
+            }
             if let Some(rect) = source_rect_opt {
                 stream_cfg.setSourceRect(rect);
             }
         }
 
-        let out_ns_str = objc2_foundation::NSString::from_str(
+        let out_ns_str = NSString::from_str(
             staging
                 .staged_file()
                 .to_str()
@@ -197,15 +230,14 @@ impl RecordingSession {
             stream.startCaptureWithCompletionHandler(Some(&start_block));
         }
 
-        rx.recv_timeout(Duration::from_secs(5))
+        rx.recv_timeout(Duration::from_secs(8))
             .map_err(|_| "Timed out starting ScreenCaptureKit stream".to_string())??;
 
-        // Wait for SCRecordingOutput to confirm file writer initialization
         {
             let (lock, cvar) = &*signal;
             let guard = lock.lock().map_err(|_| "Mutex poisoned")?;
             let (guard, _) = cvar
-                .wait_timeout_while(guard, Duration::from_secs(5), |s| {
+                .wait_timeout_while(guard, Duration::from_secs(8), |s| {
                     !s.started && s.error.is_none()
                 })
                 .map_err(|_| "Mutex poisoned")?;
@@ -240,228 +272,119 @@ impl RecordingSession {
         &self.output_path
     }
 
-    pub fn stop(self) -> Result<PathBuf, String> {
+    /// Initiates recording finalization without blocking the caller's thread or AppKit runloop.
+    pub fn begin_stop(self) -> PendingRecordingStop {
         let elapsed_ms = self.started_at.elapsed().as_millis() as u64;
-
-        let (tx, rx) = mpsc::sync_channel::<Result<(), String>>(1);
-        let stop_block = RcBlock::new(move |err: *mut NSError| {
-            if !err.is_null() {
-                let msg = unsafe { (&*err).localizedDescription().to_string() };
-                let _ = tx.send(Err(format!("Error stopping stream: {msg}")));
-            } else {
-                let _ = tx.send(Ok(()));
-            }
-        });
-
-        unsafe {
-            let _ = self
-                .stream
-                .removeRecordingOutput_error(&self.recording_output);
+        let remove_failed = unsafe {
             self.stream
-                .stopCaptureWithCompletionHandler(Some(&stop_block));
-        }
-
-        let stop_res = rx
-            .recv_timeout(Duration::from_secs(5))
-            .map_err(|_| "Timed out stopping capture stream".to_string())?;
-
-        // Wait for SCRecordingOutputDelegate::recordingOutputDidFinishRecording so MP4 moov atom is flushed
-        let (finished, finish_err) = {
-            let (lock, cvar) = &*self.signal;
-            let guard = lock.lock().map_err(|_| "Mutex poisoned")?;
-            let (guard, _) = cvar
-                .wait_timeout_while(guard, Duration::from_secs(8), |s| !s.finished)
-                .map_err(|_| "Mutex poisoned")?;
-            (guard.finished, guard.error.clone())
+                .removeRecordingOutput_error(&self.recording_output)
+                .is_err()
         };
-
-        if let Err(e) = stop_res {
-            record_perf_event(&PerfEvent {
-                ts_unix: now_unix_secs(),
-                kind: PerfKind::Record,
-                format: self.codec.label().to_ascii_lowercase(),
-                fps: self.fps,
-                input_duration_ms: elapsed_ms,
-                elapsed_ms,
-                output_bytes: 0,
-                ok: false,
-            });
-            return Err(e);
+        let mut pending = PendingRecordingStop {
+            stream: self.stream,
+            _recording_output: self.recording_output,
+            _delegate: self._delegate,
+            signal: self.signal,
+            staging: self.staging,
+            output_path: self.output_path,
+            elapsed_ms,
+            fps: self.fps,
+            codec: self.codec,
+            stop_initiated_at: Instant::now(),
+            stop_capture_sent: false,
+        };
+        if remove_failed {
+            pending.send_stop_capture();
         }
+        pending
+    }
+
+    /// Blocking stop helper for headless CLI sessions and app shutdown cleanup.
+    pub fn stop(self) -> Result<PathBuf, String> {
+        let mut pending = self.begin_stop();
+        let signal = Arc::clone(&pending.signal);
+        {
+            let (lock, cvar) = &*signal;
+            if let Ok(guard) = lock.lock() {
+                let (guard, _) = cvar
+                    .wait_timeout_while(guard, STOP_FALLBACK_AFTER, |s| !s.finished)
+                    .map_err(|_| "Mutex poisoned")?;
+                if !guard.finished {
+                    drop(guard);
+                    pending.send_stop_capture();
+                    let guard = lock.lock().map_err(|_| "Mutex poisoned")?;
+                    let _ = cvar.wait_timeout_while(guard, STOP_TIMEOUT, |s| !s.finished);
+                }
+            }
+        }
+        pending.finish()
+    }
+}
+
+impl PendingRecordingStop {
+    fn send_stop_capture(&mut self) {
+        if !self.stop_capture_sent {
+            self.stop_capture_sent = true;
+            unsafe {
+                self.stream.stopCaptureWithCompletionHandler(None);
+            }
+        }
+    }
+
+    /// Non-blocking poll designed for a short `NSTimer` tick on the main thread.
+    pub fn poll(&mut self) -> StopPollState {
+        let finished = self.signal.0.lock().map(|g| g.finished).unwrap_or(true);
+        if finished {
+            return StopPollState::Finished;
+        }
+        let elapsed = self.stop_initiated_at.elapsed();
+        if !self.stop_capture_sent && elapsed >= STOP_FALLBACK_AFTER {
+            self.send_stop_capture();
+        }
+        if elapsed >= STOP_TIMEOUT {
+            StopPollState::TimedOut
+        } else {
+            StopPollState::Pending
+        }
+    }
+
+    /// Stops the underlying capture stream (if not already stopped), commits the finalized MP4,
+    /// and records local latency telemetry.
+    pub fn finish(mut self) -> Result<PathBuf, String> {
+        self.send_stop_capture();
+        let (finished, finish_err) = self
+            .signal
+            .0
+            .lock()
+            .map(|g| (g.finished, g.error.clone()))
+            .unwrap_or((false, Some("Recording state lock poisoned".to_string())));
+
         if let Some(err) = finish_err {
+            self.record_perf(0, false);
             return Err(format!("Recording finalization error: {err}"));
         }
         if !finished {
+            self.record_perf(0, false);
             return Err(
                 "Timed out waiting for MP4 recording output to flush container trailer".to_string(),
             );
         }
 
         let size = self.staging.commit()?;
+        self.record_perf(size, true);
+        Ok(self.output_path)
+    }
+
+    fn record_perf(&self, output_bytes: u64, ok: bool) {
         record_perf_event(&PerfEvent {
             ts_unix: now_unix_secs(),
             kind: PerfKind::Record,
             format: self.codec.label().to_ascii_lowercase(),
             fps: self.fps,
-            input_duration_ms: elapsed_ms,
-            elapsed_ms,
-            output_bytes: size,
-            ok: true,
+            input_duration_ms: self.elapsed_ms,
+            elapsed_ms: self.elapsed_ms,
+            output_bytes,
+            ok,
         });
-
-        Ok(self.output_path)
     }
-}
-
-fn build_filter_and_dimensions(
-    content: &objc2_screen_capture_kit::SCShareableContent,
-    config: &CaptureConfig,
-) -> Result<(Retained<SCContentFilter>, usize, usize, Option<CGRect>), String> {
-    match &config.target {
-        CaptureTarget::Window { window_id } => {
-            let sc_windows = unsafe { content.windows() };
-            let mut found: Option<Retained<SCWindow>> = None;
-            for i in 0..sc_windows.count() {
-                let w = sc_windows.objectAtIndex(i);
-                if unsafe { w.windowID() } == *window_id {
-                    found = Some(w);
-                    break;
-                }
-            }
-            let win =
-                found.ok_or_else(|| format!("Window ID {window_id} is no longer available"))?;
-            let frame = unsafe { win.frame() };
-            let filter = unsafe {
-                SCContentFilter::initWithDesktopIndependentWindow(SCContentFilter::alloc(), &win)
-            };
-            let scale = unsafe { f64::from(filter.pointPixelScale()).max(1.0) };
-            let pw = even_usize((frame.size.width * scale).round());
-            let ph = even_usize((frame.size.height * scale).round());
-            Ok((filter, pw, ph, None))
-        }
-        CaptureTarget::Display {
-            display_id,
-            scale_factor,
-        } => {
-            let display = find_display(content, *display_id)?;
-            let filter = build_display_filter(content, &display, &config.excluded_window_ids);
-            let scale = if *scale_factor > 0.5 {
-                *scale_factor
-            } else {
-                unsafe { f64::from(filter.pointPixelScale()).max(1.0) }
-            };
-            let dw = unsafe { display.width().max(2) as f64 };
-            let dh = unsafe { display.height().max(2) as f64 };
-            let pw = even_usize((dw * scale).round());
-            let ph = even_usize((dh * scale).round());
-            Ok((filter, pw, ph, None))
-        }
-        CaptureTarget::Region {
-            display_id,
-            rect_points,
-            scale_factor,
-        } => {
-            let display = find_display(content, *display_id)?;
-            let filter = build_display_filter(content, &display, &config.excluded_window_ids);
-            let scale = if *scale_factor > 0.5 {
-                *scale_factor
-            } else {
-                unsafe { f64::from(filter.pointPixelScale()).max(1.0) }
-            };
-            let dw = unsafe { display.width().max(32) as f64 };
-            let dh = unsafe { display.height().max(32) as f64 };
-            let clamped = rect_points
-                .clamp_and_align_for_scale(crate::geometry::Rect::new(0.0, 0.0, dw, dh), scale);
-            let cg_rect = CGRect::new(
-                CGPoint::new(clamped.x, clamped.y),
-                CGSize::new(clamped.width, clamped.height),
-            );
-            let pw = even_usize((clamped.width * scale).round());
-            let ph = even_usize((clamped.height * scale).round());
-            Ok((filter, pw, ph, Some(cg_rect)))
-        }
-    }
-}
-
-fn find_display(
-    content: &objc2_screen_capture_kit::SCShareableContent,
-    display_id: u32,
-) -> Result<Retained<SCDisplay>, String> {
-    let displays = unsafe { content.displays() };
-    if displays.count() == 0 {
-        return Err("No active displays detected".to_string());
-    }
-    if display_id == 0 {
-        return Ok(displays.objectAtIndex(0));
-    }
-    for i in 0..displays.count() {
-        let d = displays.objectAtIndex(i);
-        if unsafe { d.displayID() } == display_id {
-            return Ok(d);
-        }
-    }
-    Err(format!(
-        "Selected display (ID {display_id}) is no longer connected"
-    ))
-}
-
-fn build_display_filter(
-    content: &objc2_screen_capture_kit::SCShareableContent,
-    display: &SCDisplay,
-    extra_window_ids: &[u32],
-) -> Retained<SCContentFilter> {
-    let current_pid = std::process::id() as i32;
-    let apps = unsafe { content.applications() };
-    let mut own_apps: Vec<Retained<SCRunningApplication>> = Vec::new();
-    for i in 0..apps.count() {
-        let app = apps.objectAtIndex(i);
-        if unsafe { app.processID() } == current_pid {
-            own_apps.push(app);
-            break;
-        }
-    }
-    if !own_apps.is_empty() {
-        let excluded_apps = NSArray::from_retained_slice(&own_apps);
-        let empty_except: Retained<NSArray<SCWindow>> = NSArray::from_retained_slice(&[]);
-        return unsafe {
-            SCContentFilter::initWithDisplay_excludingApplications_exceptingWindows(
-                SCContentFilter::alloc(),
-                display,
-                &excluded_apps,
-                &empty_except,
-            )
-        };
-    }
-
-    let excluded = collect_excluded_windows(content, extra_window_ids);
-    unsafe {
-        SCContentFilter::initWithDisplay_excludingWindows(
-            SCContentFilter::alloc(),
-            display,
-            &excluded,
-        )
-    }
-}
-
-fn collect_excluded_windows(
-    content: &objc2_screen_capture_kit::SCShareableContent,
-    extra_window_ids: &[u32],
-) -> Retained<NSArray<SCWindow>> {
-    let current_pid = std::process::id() as i32;
-    let sc_windows = unsafe { content.windows() };
-    let mut vec_win: Vec<Retained<SCWindow>> = Vec::new();
-    for i in 0..sc_windows.count() {
-        let w = sc_windows.objectAtIndex(i);
-        let wid = unsafe { w.windowID() };
-        let own_pid = unsafe { w.owningApplication().map(|a| a.processID()).unwrap_or(-1) };
-        if own_pid == current_pid || extra_window_ids.contains(&wid) {
-            vec_win.push(w);
-        }
-    }
-    NSArray::from_retained_slice(&vec_win)
-}
-
-fn even_usize(v: f64) -> usize {
-    let n = (v.max(32.0) as usize) & !1;
-    n.max(32)
 }

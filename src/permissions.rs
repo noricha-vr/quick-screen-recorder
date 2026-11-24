@@ -7,6 +7,8 @@ use crate::export::ffmpeg::detect_ffmpeg_binary;
 
 pub const SCREEN_RECORDING_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
+pub const MICROPHONE_SETTINGS_URL: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -31,6 +33,15 @@ pub fn open_screen_recording_settings() -> bool {
         let _ = request_screen_capture_permission();
     }
     let url_str = NSString::from_str(SCREEN_RECORDING_SETTINGS_URL);
+    let Some(url) = NSURL::URLWithString(&url_str) else {
+        return false;
+    };
+    NSWorkspace::sharedWorkspace().openURL(&url)
+}
+
+/// Opens System Settings directly to Privacy & Security > Microphone (used only when mic access was previously denied).
+pub fn open_microphone_settings() -> bool {
+    let url_str = NSString::from_str(MICROPHONE_SETTINGS_URL);
     let Some(url) = NSURL::URLWithString(&url_str) else {
         return false;
     };

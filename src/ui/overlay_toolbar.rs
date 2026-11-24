@@ -3,12 +3,16 @@ use objc2::runtime::AnyObject;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSBox, NSBoxType, NSButton, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSFont,
-    NSPopUpButton, NSSegmentSwitchTracking, NSSegmentedControl, NSTextField, NSView,
+    NSPopUpButton, NSSegmentSwitchTracking, NSSegmentedControl, NSTextAlignment, NSTextField,
+    NSView,
 };
 use objc2_foundation::{NSArray, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
-use crate::capture::AudioCaptureMode;
+use crate::capture::audio_devices::MicMenuItem;
 use crate::config::Preferences;
+
+pub const TOOLBAR_W: f64 = 600.0;
+pub const TOOLBAR_H: f64 = 88.0;
 
 pub struct ToolbarActionIvars {
     pub on_mode: Box<dyn Fn(isize)>,
@@ -16,7 +20,8 @@ pub struct ToolbarActionIvars {
     pub on_size_commit: Box<dyn Fn()>,
     pub on_target_pick: Box<dyn Fn(isize)>,
     pub on_fps: Box<dyn Fn(isize)>,
-    pub on_audio: Box<dyn Fn(isize)>,
+    pub on_sys_audio: Box<dyn Fn(bool)>,
+    pub on_mic: Box<dyn Fn(isize)>,
     pub on_cursor: Box<dyn Fn(bool)>,
     pub on_clicks: Box<dyn Fn(bool)>,
     pub on_record: Box<dyn Fn()>,
@@ -53,9 +58,13 @@ define_class!(
         fn fps_changed(&self, sender: &NSPopUpButton) {
             (self.ivars().on_fps)(sender.indexOfSelectedItem());
         }
-        #[unsafe(method(audioChanged:))]
-        fn audio_changed(&self, sender: &NSPopUpButton) {
-            (self.ivars().on_audio)(sender.indexOfSelectedItem());
+        #[unsafe(method(sysAudioToggled:))]
+        fn sys_audio_toggled(&self, sender: &NSButton) {
+            (self.ivars().on_sys_audio)(sender.state() == NSControlStateValueOn);
+        }
+        #[unsafe(method(micChanged:))]
+        fn mic_changed(&self, sender: &NSPopUpButton) {
+            (self.ivars().on_mic)(sender.indexOfSelectedItem());
         }
         #[unsafe(method(cursorToggled:))]
         fn cursor_toggled(&self, sender: &NSButton) {
@@ -90,22 +99,87 @@ pub fn populate_toolbar_controls(
     actions: &OverlayToolbarActions,
     aspect_popup: &NSPopUpButton,
     w_field: &NSTextField,
+    x_lbl: &NSTextField,
     h_field: &NSTextField,
     target_popup: &NSPopUpButton,
+    mic_items: &[MicMenuItem],
+    selected_mic_idx: usize,
     prefs: &Preferences,
 ) {
-    let bg_box = NSBox::initWithFrame(NSBox::alloc(mtm), bar.bounds());
-    bg_box.setBoxType(NSBoxType::Custom);
-    bg_box.setCornerRadius(12.0);
-    bg_box.setBorderWidth(1.0);
-    bg_box.setBorderColor(&NSColor::colorWithSRGBRed_green_blue_alpha(
-        1.0, 1.0, 1.0, 0.16,
-    ));
-    bg_box.setFillColor(&NSColor::colorWithSRGBRed_green_blue_alpha(
-        0.09, 0.10, 0.14, 0.94,
-    ));
-    bar.addSubview(&bg_box);
+    build_elevated_shell(mtm, bar);
+    build_row_one(
+        mtm,
+        bar,
+        actions,
+        aspect_popup,
+        w_field,
+        x_lbl,
+        h_field,
+        target_popup,
+    );
+    build_row_two(mtm, bar, actions, mic_items, selected_mic_idx, prefs);
+}
 
+fn build_elevated_shell(mtm: MainThreadMarker, bar: &NSView) {
+    let bounds = bar.bounds();
+    // Outer dark hairline keeps contrast sharp against bright/white screens.
+    let outer_box = NSBox::initWithFrame(NSBox::alloc(mtm), bounds);
+    outer_box.setBoxType(NSBoxType::Custom);
+    outer_box.setCornerRadius(14.0);
+    outer_box.setBorderWidth(1.0);
+    outer_box.setBorderColor(&NSColor::colorWithSRGBRed_green_blue_alpha(
+        0.0, 0.0, 0.0, 0.80,
+    ));
+    outer_box.setFillColor(&NSColor::colorWithSRGBRed_green_blue_alpha(
+        0.17, 0.20, 0.27, 0.97,
+    ));
+    bar.addSubview(&outer_box);
+
+    // Bright inner rim gives crisp separation against black/dark backgrounds.
+    let inner_rect = NSRect::new(
+        NSPoint::new(1.0, 1.0),
+        NSSize::new(
+            (bounds.size.width - 2.0).max(2.0),
+            (bounds.size.height - 2.0).max(2.0),
+        ),
+    );
+    let inner_rim = NSBox::initWithFrame(NSBox::alloc(mtm), inner_rect);
+    inner_rim.setBoxType(NSBoxType::Custom);
+    inner_rim.setCornerRadius(13.0);
+    inner_rim.setBorderWidth(1.25);
+    inner_rim.setBorderColor(&NSColor::colorWithSRGBRed_green_blue_alpha(
+        1.0, 1.0, 1.0, 0.42,
+    ));
+    inner_rim.setFillColor(&NSColor::clearColor());
+    bar.addSubview(&inner_rim);
+
+    // Row divider separating capture target/action row from audio/settings row.
+    let row_div = NSBox::initWithFrame(
+        NSBox::alloc(mtm),
+        NSRect::new(
+            NSPoint::new(12.0, 43.0),
+            NSSize::new(bounds.size.width - 24.0, 1.0),
+        ),
+    );
+    row_div.setBoxType(NSBoxType::Custom);
+    row_div.setBorderWidth(0.0);
+    row_div.setFillColor(&NSColor::colorWithSRGBRed_green_blue_alpha(
+        1.0, 1.0, 1.0, 0.18,
+    ));
+    bar.addSubview(&row_div);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_row_one(
+    mtm: MainThreadMarker,
+    bar: &NSView,
+    actions: &OverlayToolbarActions,
+    aspect_popup: &NSPopUpButton,
+    w_field: &NSTextField,
+    x_lbl: &NSTextField,
+    h_field: &NSTextField,
+    target_popup: &NSPopUpButton,
+) {
     let labels = NSArray::from_retained_slice(&[
         NSString::from_str("Area"),
         NSString::from_str("Window"),
@@ -122,14 +196,14 @@ pub fn populate_toolbar_controls(
     };
     seg.setSelectedSegment(0);
     seg.setFrame(NSRect::new(
-        NSPoint::new(12.0, 12.0),
+        NSPoint::new(12.0, 49.0),
         NSSize::new(178.0, 28.0),
     ));
     bar.addSubview(&seg);
 
     aspect_popup.setFrame(NSRect::new(
-        NSPoint::new(198.0, 12.0),
-        NSSize::new(82.0, 28.0),
+        NSPoint::new(198.0, 49.0),
+        NSSize::new(80.0, 28.0),
     ));
     unsafe {
         aspect_popup.setTarget(Some(actions));
@@ -138,8 +212,8 @@ pub fn populate_toolbar_controls(
     bar.addSubview(aspect_popup);
 
     w_field.setFrame(NSRect::new(
-        NSPoint::new(286.0, 14.0),
-        NSSize::new(54.0, 24.0),
+        NSPoint::new(284.0, 51.0),
+        NSSize::new(52.0, 24.0),
     ));
     unsafe {
         w_field.setTarget(Some(actions));
@@ -147,17 +221,19 @@ pub fn populate_toolbar_controls(
     }
     bar.addSubview(w_field);
 
-    let x_lbl = NSTextField::labelWithString(&NSString::from_str("×"), mtm);
-    x_lbl.setTextColor(Some(&NSColor::lightGrayColor()));
+    x_lbl.setTextColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
+        0.78, 0.84, 0.94, 1.0,
+    )));
+    x_lbl.setAlignment(NSTextAlignment::Center);
     x_lbl.setFrame(NSRect::new(
-        NSPoint::new(342.0, 15.0),
+        NSPoint::new(338.0, 52.0),
         NSSize::new(14.0, 20.0),
     ));
-    bar.addSubview(&x_lbl);
+    bar.addSubview(x_lbl);
 
     h_field.setFrame(NSRect::new(
-        NSPoint::new(356.0, 14.0),
-        NSSize::new(54.0, 24.0),
+        NSPoint::new(352.0, 51.0),
+        NSSize::new(52.0, 24.0),
     ));
     unsafe {
         h_field.setTarget(Some(actions));
@@ -166,81 +242,14 @@ pub fn populate_toolbar_controls(
     bar.addSubview(h_field);
 
     target_popup.setFrame(NSRect::new(
-        NSPoint::new(198.0, 12.0),
-        NSSize::new(212.0, 28.0),
+        NSPoint::new(198.0, 49.0),
+        NSSize::new(214.0, 28.0),
     ));
     unsafe {
         target_popup.setTarget(Some(actions));
         target_popup.setAction(Some(sel!(targetPicked:)));
     }
     bar.addSubview(target_popup);
-
-    let fps_popup = NSPopUpButton::new(mtm);
-    fps_popup.addItemWithTitle(&NSString::from_str("30 fps"));
-    fps_popup.addItemWithTitle(&NSString::from_str("60 fps"));
-    fps_popup.selectItemAtIndex(if prefs.fps >= 60 { 1 } else { 0 });
-    fps_popup.setFrame(NSRect::new(
-        NSPoint::new(418.0, 12.0),
-        NSSize::new(76.0, 28.0),
-    ));
-    unsafe {
-        fps_popup.setTarget(Some(actions));
-        fps_popup.setAction(Some(sel!(fpsChanged:)));
-    }
-    bar.addSubview(&fps_popup);
-
-    let audio_popup = NSPopUpButton::new(mtm);
-    for m in AudioCaptureMode::ALL {
-        audio_popup.addItemWithTitle(&NSString::from_str(m.label()));
-    }
-    audio_popup.selectItemAtIndex(prefs.audio_mode.index() as isize);
-    audio_popup.setFrame(NSRect::new(
-        NSPoint::new(500.0, 12.0),
-        NSSize::new(112.0, 28.0),
-    ));
-    unsafe {
-        audio_popup.setTarget(Some(actions));
-        audio_popup.setAction(Some(sel!(audioChanged:)));
-    }
-    bar.addSubview(&audio_popup);
-
-    let cursor_chk = unsafe {
-        NSButton::checkboxWithTitle_target_action(
-            &NSString::from_str("Cursor"),
-            Some(actions),
-            Some(sel!(cursorToggled:)),
-            mtm,
-        )
-    };
-    cursor_chk.setState(if prefs.show_cursor {
-        NSControlStateValueOn
-    } else {
-        NSControlStateValueOff
-    });
-    cursor_chk.setFrame(NSRect::new(
-        NSPoint::new(618.0, 26.0),
-        NSSize::new(68.0, 18.0),
-    ));
-    bar.addSubview(&cursor_chk);
-
-    let clicks_chk = unsafe {
-        NSButton::checkboxWithTitle_target_action(
-            &NSString::from_str("Clicks"),
-            Some(actions),
-            Some(sel!(clicksToggled:)),
-            mtm,
-        )
-    };
-    clicks_chk.setState(if prefs.highlight_clicks {
-        NSControlStateValueOn
-    } else {
-        NSControlStateValueOff
-    });
-    clicks_chk.setFrame(NSRect::new(
-        NSPoint::new(618.0, 8.0),
-        NSSize::new(68.0, 18.0),
-    ));
-    bar.addSubview(&clicks_chk);
 
     let cancel_btn = unsafe {
         NSButton::buttonWithTitle_target_action(
@@ -252,8 +261,8 @@ pub fn populate_toolbar_controls(
     };
     cancel_btn.setKeyEquivalent(&NSString::from_str("\u{1b}"));
     cancel_btn.setFrame(NSRect::new(
-        NSPoint::new(690.0, 12.0),
-        NSSize::new(64.0, 28.0),
+        NSPoint::new(430.0, 49.0),
+        NSSize::new(66.0, 28.0),
     ));
     bar.addSubview(&cancel_btn);
 
@@ -269,8 +278,142 @@ pub fn populate_toolbar_controls(
     rec_btn.setFont(Some(&NSFont::boldSystemFontOfSize(12.5)));
     rec_btn.setKeyEquivalent(&NSString::from_str("\r"));
     rec_btn.setFrame(NSRect::new(
-        NSPoint::new(756.0, 12.0),
-        NSSize::new(76.0, 28.0),
+        NSPoint::new(502.0, 49.0),
+        NSSize::new(86.0, 28.0),
     ));
     bar.addSubview(&rec_btn);
+}
+
+fn build_row_two(
+    mtm: MainThreadMarker,
+    bar: &NSView,
+    actions: &OverlayToolbarActions,
+    mic_items: &[MicMenuItem],
+    selected_mic_idx: usize,
+    prefs: &Preferences,
+) {
+    let sys_audio_chk = unsafe {
+        NSButton::checkboxWithTitle_target_action(
+            &NSString::from_str("System Audio"),
+            Some(actions),
+            Some(sel!(sysAudioToggled:)),
+            mtm,
+        )
+    };
+    sys_audio_chk.setFont(Some(&NSFont::systemFontOfSize_weight(12.0, 0.15)));
+    sys_audio_chk.setState(if prefs.capture_system_audio {
+        NSControlStateValueOn
+    } else {
+        NSControlStateValueOff
+    });
+    sys_audio_chk.setToolTip(Some(&NSString::from_str(
+        "Record macOS system audio output (you can mute it later when exporting)",
+    )));
+    sys_audio_chk.setFrame(NSRect::new(
+        NSPoint::new(14.0, 14.0),
+        NSSize::new(112.0, 20.0),
+    ));
+    bar.addSubview(&sys_audio_chk);
+
+    add_v_sep(mtm, bar, 132.0);
+
+    let mic_lbl = NSTextField::labelWithString(&NSString::from_str("Mic"), mtm);
+    mic_lbl.setFont(Some(&NSFont::systemFontOfSize_weight(11.5, 0.2)));
+    mic_lbl.setTextColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
+        0.76, 0.82, 0.92, 1.0,
+    )));
+    mic_lbl.setFrame(NSRect::new(
+        NSPoint::new(140.0, 14.0),
+        NSSize::new(26.0, 18.0),
+    ));
+    bar.addSubview(&mic_lbl);
+
+    let mic_popup = NSPopUpButton::new(mtm);
+    for item in mic_items {
+        mic_popup.addItemWithTitle(&NSString::from_str(&item.menu_title()));
+    }
+    if !mic_items.is_empty() {
+        mic_popup.selectItemAtIndex(selected_mic_idx.min(mic_items.len() - 1) as isize);
+    }
+    mic_popup.setToolTip(Some(&NSString::from_str(
+        "Select microphone input device (defaults to System default mic)",
+    )));
+    mic_popup.setFrame(NSRect::new(
+        NSPoint::new(168.0, 10.0),
+        NSSize::new(178.0, 28.0),
+    ));
+    unsafe {
+        mic_popup.setTarget(Some(actions));
+        mic_popup.setAction(Some(sel!(micChanged:)));
+    }
+    bar.addSubview(&mic_popup);
+
+    add_v_sep(mtm, bar, 354.0);
+
+    let fps_popup = NSPopUpButton::new(mtm);
+    fps_popup.addItemWithTitle(&NSString::from_str("30 fps"));
+    fps_popup.addItemWithTitle(&NSString::from_str("60 fps"));
+    fps_popup.selectItemAtIndex(if prefs.fps >= 60 { 1 } else { 0 });
+    fps_popup.setFrame(NSRect::new(
+        NSPoint::new(362.0, 10.0),
+        NSSize::new(78.0, 28.0),
+    ));
+    unsafe {
+        fps_popup.setTarget(Some(actions));
+        fps_popup.setAction(Some(sel!(fpsChanged:)));
+    }
+    bar.addSubview(&fps_popup);
+
+    let cursor_chk = unsafe {
+        NSButton::checkboxWithTitle_target_action(
+            &NSString::from_str("Cursor"),
+            Some(actions),
+            Some(sel!(cursorToggled:)),
+            mtm,
+        )
+    };
+    cursor_chk.setFont(Some(&NSFont::systemFontOfSize_weight(12.0, 0.1)));
+    cursor_chk.setState(if prefs.show_cursor {
+        NSControlStateValueOn
+    } else {
+        NSControlStateValueOff
+    });
+    cursor_chk.setFrame(NSRect::new(
+        NSPoint::new(452.0, 14.0),
+        NSSize::new(64.0, 20.0),
+    ));
+    bar.addSubview(&cursor_chk);
+
+    let clicks_chk = unsafe {
+        NSButton::checkboxWithTitle_target_action(
+            &NSString::from_str("Clicks"),
+            Some(actions),
+            Some(sel!(clicksToggled:)),
+            mtm,
+        )
+    };
+    clicks_chk.setFont(Some(&NSFont::systemFontOfSize_weight(12.0, 0.1)));
+    clicks_chk.setState(if prefs.highlight_clicks {
+        NSControlStateValueOn
+    } else {
+        NSControlStateValueOff
+    });
+    clicks_chk.setFrame(NSRect::new(
+        NSPoint::new(524.0, 14.0),
+        NSSize::new(64.0, 20.0),
+    ));
+    bar.addSubview(&clicks_chk);
+}
+
+fn add_v_sep(mtm: MainThreadMarker, bar: &NSView, x: f64) {
+    let sep = NSBox::initWithFrame(
+        NSBox::alloc(mtm),
+        NSRect::new(NSPoint::new(x, 15.0), NSSize::new(1.0, 18.0)),
+    );
+    sep.setBoxType(NSBoxType::Custom);
+    sep.setBorderWidth(0.0);
+    sep.setFillColor(&NSColor::colorWithSRGBRed_green_blue_alpha(
+        1.0, 1.0, 1.0, 0.16,
+    ));
+    bar.addSubview(&sep);
 }

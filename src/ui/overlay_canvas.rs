@@ -3,7 +3,10 @@ use std::rc::Rc;
 
 use objc2::rc::Retained;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
-use objc2_app_kit::{NSBezierPath, NSColor, NSCursor, NSEvent, NSPopUpButton, NSView};
+use objc2_app_kit::{
+    NSBezierPath, NSColor, NSCursor, NSEvent, NSGraphicsContext, NSPopUpButton, NSView,
+    NSWindingRule,
+};
 use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize};
 
 use crate::geometry::{DragMode, Rect, apply_drag, hit_test_selection};
@@ -12,6 +15,9 @@ use crate::ui::overlay::{ActiveDrag, OverlayState, SelectionMode};
 /// Minimum non-zero alpha (`0.06 > 0.05`) so macOS WindowServer delivers mouse clicks and drags
 /// inside the selection cutout instead of passing clicks through to underlying applications.
 const HIT_TEST_FILL_ALPHA: f64 = 0.06;
+
+/// Subtle previous-gen macOS window corner radius (Ventura/Sonoma 10pt style: crisp, not overly round).
+const SELECTION_CORNER_RADIUS: f64 = 10.0;
 
 pub struct CanvasIvars {
     pub state: Rc<RefCell<OverlayState>>,
@@ -49,19 +55,21 @@ define_class!(
             }
 
             let sel = st.selection;
-            draw_outer_dim_mask(view_bounds, sel);
+            let radius = effective_corner_radius(st.mode, sel);
+            draw_outer_dim_mask(view_bounds, sel, radius);
 
             let sel_rect = NSRect::new(
                 NSPoint::new(sel.x, sel.y),
                 NSSize::new(sel.width, sel.height),
             );
+            let sel_path = rounded_or_square_path(sel_rect, radius);
 
             // Paint interior above WindowServer's 0.05 alpha threshold so interior drag & window clicks never pass through
             if !st.demo_backdrop {
                 let hit_fill =
                     NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, HIT_TEST_FILL_ALPHA);
                 hit_fill.setFill();
-                NSBezierPath::fillRect(sel_rect);
+                sel_path.fill();
             }
 
             // In Window mode, highlight any hovered background window so the user sees it can be clicked
@@ -73,15 +81,16 @@ define_class!(
                                 NSPoint::new(hover_r.x, hover_r.y),
                                 NSSize::new(hover_r.width, hover_r.height),
                             );
+                            let h_rad = effective_corner_radius(SelectionMode::Window, hover_r);
+                            let hp = rounded_or_square_path(h_rect, h_rad);
                             let hover_fill =
                                 NSColor::colorWithSRGBRed_green_blue_alpha(0.28, 0.66, 1.0, 0.12);
                             hover_fill.setFill();
-                            NSBezierPath::fillRect(h_rect);
+                            hp.fill();
 
                             let hover_stroke =
                                 NSColor::colorWithSRGBRed_green_blue_alpha(0.42, 0.76, 1.0, 0.88);
                             hover_stroke.setStroke();
-                            let hp = NSBezierPath::bezierPathWithRect(h_rect);
                             hp.setLineWidth(2.0);
                             hp.stroke();
                         }
@@ -95,16 +104,15 @@ define_class!(
                 NSColor::colorWithSRGBRed_green_blue_alpha(0.98, 0.99, 1.0, 0.95)
             };
             border_color.setStroke();
-            let border = NSBezierPath::bezierPathWithRect(sel_rect);
-            border.setLineWidth(if st.mode == SelectionMode::Window {
+            sel_path.setLineWidth(if st.mode == SelectionMode::Window {
                 2.2
             } else {
-                1.5
+                1.75
             });
-            border.stroke();
+            sel_path.stroke();
 
             if st.mode == SelectionMode::Area {
-                draw_thirds_grid_and_handles(sel, &border_color);
+                draw_thirds_grid_and_handles(sel, &sel_path, radius, &border_color);
             }
         }
 
@@ -232,57 +240,68 @@ impl OverlayCanvasView {
     }
 }
 
+fn effective_corner_radius(mode: SelectionMode, sel: Rect) -> f64 {
+    if mode == SelectionMode::Screen {
+        0.0
+    } else {
+        SELECTION_CORNER_RADIUS
+            .min(sel.width * 0.25)
+            .min(sel.height * 0.25)
+    }
+}
+
+fn rounded_or_square_path(rect: NSRect, radius: f64) -> Retained<NSBezierPath> {
+    if radius > 0.0 {
+        NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(rect, radius, radius)
+    } else {
+        NSBezierPath::bezierPathWithRect(rect)
+    }
+}
+
 fn draw_demo_backdrop(view_bounds: NSRect) {
-    let bg = NSColor::colorWithSRGBRed_green_blue_alpha(0.11, 0.14, 0.20, 1.0);
+    // Dark desktop wallpaper + dark app window so the elevated floating toolbar's
+    // high-contrast visibility on dark screens is verified directly in screenshots.
+    let bg = NSColor::colorWithSRGBRed_green_blue_alpha(0.06, 0.08, 0.12, 1.0);
     bg.setFill();
     NSBezierPath::fillRect(view_bounds);
 
     let card = NSRect::new(
         NSPoint::new(
             view_bounds.size.width * 0.16,
-            view_bounds.size.height * 0.22,
+            view_bounds.size.height * 0.23,
         ),
         NSSize::new(
             view_bounds.size.width * 0.68,
-            view_bounds.size.height * 0.58,
+            view_bounds.size.height * 0.62,
         ),
     );
-    let card_bg = NSColor::colorWithSRGBRed_green_blue_alpha(0.16, 0.21, 0.30, 1.0);
+    let card_bg = NSColor::colorWithSRGBRed_green_blue_alpha(0.11, 0.14, 0.21, 1.0);
     card_bg.setFill();
-    NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(card, 14.0, 14.0).fill();
+    NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(card, 11.0, 11.0).fill();
 }
 
-fn draw_outer_dim_mask(view_bounds: NSRect, sel: Rect) {
-    let dim = NSColor::colorWithSRGBRed_green_blue_alpha(0.04, 0.05, 0.08, 0.56);
+fn draw_outer_dim_mask(view_bounds: NSRect, sel: Rect, radius: f64) {
+    let dim = NSColor::colorWithSRGBRed_green_blue_alpha(0.03, 0.04, 0.07, 0.56);
     dim.setFill();
 
-    let bw = view_bounds.size.width;
-    let bh = view_bounds.size.height;
-    let top_y = sel.top_y_up();
-    if top_y < bh {
-        NSBezierPath::fillRect(NSRect::new(
-            NSPoint::new(0.0, top_y),
-            NSSize::new(bw, bh - top_y),
-        ));
-    }
-    if sel.y > 0.0 {
-        NSBezierPath::fillRect(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(bw, sel.y)));
-    }
-    if sel.x > 0.0 {
-        NSBezierPath::fillRect(NSRect::new(
-            NSPoint::new(0.0, sel.y),
-            NSSize::new(sel.x, sel.height),
-        ));
-    }
-    if sel.right() < bw {
-        NSBezierPath::fillRect(NSRect::new(
-            NSPoint::new(sel.right(), sel.y),
-            NSSize::new(bw - sel.right(), sel.height),
-        ));
-    }
+    let mask = NSBezierPath::bezierPathWithRect(view_bounds);
+    let sel_rect = NSRect::new(
+        NSPoint::new(sel.x, sel.y),
+        NSSize::new(sel.width, sel.height),
+    );
+    mask.appendBezierPath(&rounded_or_square_path(sel_rect, radius));
+    mask.setWindingRule(NSWindingRule::EvenOdd);
+    mask.fill();
 }
 
-fn draw_thirds_grid_and_handles(sel: Rect, border_color: &NSColor) {
+fn draw_thirds_grid_and_handles(
+    sel: Rect,
+    sel_path: &NSBezierPath,
+    radius: f64,
+    border_color: &NSColor,
+) {
+    NSGraphicsContext::saveGraphicsState_class();
+    sel_path.addClip();
     let grid_color = NSColor::colorWithSRGBRed_green_blue_alpha(1.0, 1.0, 1.0, 0.18);
     grid_color.setStroke();
     for step in [1.0 / 3.0, 2.0 / 3.0] {
@@ -300,20 +319,29 @@ fn draw_thirds_grid_and_handles(sel: Rect, border_color: &NSColor) {
         hline.setLineWidth(1.0);
         hline.stroke();
     }
+    NSGraphicsContext::restoreGraphicsState_class();
 
-    border_color.setFill();
+    // Seat corner handles squarely on the 45-degree arc of the rounded corners,
+    // sized cleanly (7pt + dark halo) so the 10pt corner curve remains visible.
+    let corner_inset = radius * (1.0 - std::f64::consts::FRAC_1_SQRT_2);
+    let halo = NSColor::colorWithSRGBRed_green_blue_alpha(0.04, 0.05, 0.08, 0.72);
     let pts = [
-        (sel.x, sel.y),
+        (sel.x + corner_inset, sel.y + corner_inset),
         (sel.x + sel.width * 0.5, sel.y),
-        (sel.right(), sel.y),
+        (sel.right() - corner_inset, sel.y + corner_inset),
         (sel.right(), sel.y + sel.height * 0.5),
-        (sel.right(), sel.top_y_up()),
+        (sel.right() - corner_inset, sel.top_y_up() - corner_inset),
         (sel.x + sel.width * 0.5, sel.top_y_up()),
-        (sel.x, sel.top_y_up()),
+        (sel.x + corner_inset, sel.top_y_up() - corner_inset),
         (sel.x, sel.y + sel.height * 0.5),
     ];
     for (hx, hy) in pts {
-        let hrect = NSRect::new(NSPoint::new(hx - 4.5, hy - 4.5), NSSize::new(9.0, 9.0));
-        NSBezierPath::bezierPathWithOvalInRect(hrect).fill();
+        let hrect = NSRect::new(NSPoint::new(hx - 3.5, hy - 3.5), NSSize::new(7.0, 7.0));
+        let dot = NSBezierPath::bezierPathWithOvalInRect(hrect);
+        border_color.setFill();
+        dot.fill();
+        halo.setStroke();
+        dot.setLineWidth(1.0);
+        dot.stroke();
     }
 }

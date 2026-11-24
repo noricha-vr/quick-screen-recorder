@@ -23,10 +23,12 @@ pub struct OnboardingUi {
     pub perm_dot: Retained<NSBox>,
     pub perm_title: Retained<NSTextField>,
     pub perm_hint: Retained<NSTextField>,
+    pub perm_open_btn: Retained<NSButton>,
     pub visual: Retained<TutorialVisualView>,
     pub body_label: Retained<NSTextField>,
     pub secondary_btn: Retained<NSButton>,
     pub primary_btn: Retained<NSButton>,
+    pub waiting_label: Retained<NSTextField>,
 }
 
 pub fn build_onboarding_ui(mtm: MainThreadMarker, initial_step: OnboardingStep) -> OnboardingUi {
@@ -95,8 +97,8 @@ pub fn build_onboarding_ui(mtm: MainThreadMarker, initial_step: OnboardingStep) 
     let perm_card = NSBox::initWithFrame(
         NSBox::alloc(mtm),
         NSRect::new(
-            NSPoint::new(24.0, 376.0),
-            NSSize::new(ONBOARDING_WIN_W - 48.0, 44.0),
+            NSPoint::new(24.0, 374.0),
+            NSSize::new(ONBOARDING_WIN_W - 48.0, 48.0),
         ),
     );
     perm_card.setBoxType(NSBoxType::Custom);
@@ -117,7 +119,7 @@ pub fn build_onboarding_ui(mtm: MainThreadMarker, initial_step: OnboardingStep) 
     perm_title.setFont(Some(&NSFont::systemFontOfSize_weight(13.0, 0.3)));
     perm_title.setFrame(NSRect::new(
         NSPoint::new(58.0, 388.0),
-        NSSize::new(260.0, 20.0),
+        NSSize::new(326.0, 20.0),
     ));
     root.addSubview(&perm_title);
 
@@ -125,10 +127,27 @@ pub fn build_onboarding_ui(mtm: MainThreadMarker, initial_step: OnboardingStep) 
     perm_hint.setFont(Some(&NSFont::systemFontOfSize_weight(11.5, 0.15)));
     perm_hint.setAlignment(NSTextAlignment::Right);
     perm_hint.setFrame(NSRect::new(
-        NSPoint::new(324.0, 389.0),
-        NSSize::new(218.0, 18.0),
+        NSPoint::new(340.0, 389.0),
+        NSSize::new(202.0, 18.0),
     ));
     root.addSubview(&perm_hint);
+
+    let perm_open_btn = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            &NSString::from_str("Open Settings →"),
+            None,
+            None,
+            mtm,
+        )
+    };
+    perm_open_btn.setBezelColor(Some(&NSColor::systemBlueColor()));
+    perm_open_btn.setFont(Some(&NSFont::boldSystemFontOfSize(12.5)));
+    perm_open_btn.setFrame(NSRect::new(
+        NSPoint::new(398.0, 384.0),
+        NSSize::new(144.0, 28.0),
+    ));
+    perm_open_btn.setHidden(true);
+    root.addSubview(&perm_open_btn);
 
     let visual = TutorialVisualView::new(
         mtm,
@@ -175,6 +194,22 @@ pub fn build_onboarding_ui(mtm: MainThreadMarker, initial_step: OnboardingStep) 
     ));
     root.addSubview(&primary_btn);
 
+    let waiting_label = NSTextField::labelWithString(
+        &NSString::from_str("Waiting for Screen Recording permission..."),
+        mtm,
+    );
+    waiting_label.setFont(Some(&NSFont::systemFontOfSize_weight(12.0, 0.1)));
+    waiting_label.setTextColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
+        0.72, 0.78, 0.88, 0.90,
+    )));
+    waiting_label.setAlignment(NSTextAlignment::Right);
+    waiting_label.setFrame(NSRect::new(
+        NSPoint::new(176.0, 27.0),
+        NSSize::new(ONBOARDING_WIN_W - 200.0, 20.0),
+    ));
+    waiting_label.setHidden(true);
+    root.addSubview(&waiting_label);
+
     OnboardingUi {
         window,
         title_label,
@@ -183,10 +218,12 @@ pub fn build_onboarding_ui(mtm: MainThreadMarker, initial_step: OnboardingStep) 
         perm_dot,
         perm_title,
         perm_hint,
+        perm_open_btn,
         visual,
         body_label,
         secondary_btn,
         primary_btn,
+        waiting_label,
     }
 }
 
@@ -274,6 +311,9 @@ pub fn apply_step_ui(
             )));
         ui.perm_hint
             .setStringValue(&NSString::from_str("Ready to capture"));
+        ui.perm_hint.setHidden(false);
+        ui.perm_open_btn.setHidden(true);
+        ui.perm_open_btn.setKeyEquivalent(&NSString::from_str(""));
     } else {
         ui.perm_card
             .setFillColor(&NSColor::colorWithSRGBRed_green_blue_alpha(
@@ -281,7 +321,7 @@ pub fn apply_step_ui(
             ));
         ui.perm_card
             .setBorderColor(&NSColor::colorWithSRGBRed_green_blue_alpha(
-                0.96, 0.66, 0.18, 0.52,
+                0.96, 0.66, 0.18, 0.58,
             ));
         ui.perm_dot
             .setFillColor(&NSColor::colorWithSRGBRed_green_blue_alpha(
@@ -293,12 +333,9 @@ pub fn apply_step_ui(
             )));
         ui.perm_title
             .setStringValue(&NSString::from_str("Screen Recording: Not Enabled"));
-        ui.perm_hint
-            .setTextColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
-                0.94, 0.74, 0.44, 0.95,
-            )));
-        ui.perm_hint
-            .setStringValue(&NSString::from_str("Required by macOS"));
+        ui.perm_hint.setHidden(true);
+        ui.perm_open_btn.setHidden(false);
+        ui.perm_open_btn.setKeyEquivalent(&NSString::from_str("\r"));
     }
 
     ui.visual.set_step(step, phase);
@@ -317,15 +354,18 @@ pub fn apply_step_ui(
     match step {
         OnboardingStep::Permission => {
             ui.body_label.setStringValue(&NSString::from_str(
-                "Click the button below to open System Settings, toggle Quick Screen Recorder ON, then click \"Quit & Reopen\" when macOS prompts.",
+                "Click \"Open Settings →\" in the banner above, toggle Quick Screen Recorder ON, then click \"Quit & Reopen\" when macOS prompts.",
             ));
             ui.secondary_btn
                 .setTitle(&NSString::from_str("Skip Tutorial"));
-            ui.primary_btn
-                .setTitle(&NSString::from_str("Open Screen Recording Settings"));
-            ui.primary_btn
-                .setBezelColor(Some(&NSColor::systemBlueColor()));
-            ui.primary_btn.setKeyEquivalent(&NSString::from_str("\r"));
+            ui.primary_btn.setKeyEquivalent(&NSString::from_str(""));
+            ui.primary_btn.setHidden(!permission_granted);
+            ui.waiting_label.setHidden(permission_granted);
+            if permission_granted {
+                ui.primary_btn
+                    .setTitle(&NSString::from_str("Open Selector (⇧⌘6)"));
+                ui.primary_btn.setBezelColor(None);
+            }
         }
         OnboardingStep::StartRecording => {
             ui.body_label.setStringValue(&NSString::from_str(
@@ -333,6 +373,8 @@ pub fn apply_step_ui(
             ));
             ui.secondary_btn
                 .setTitle(&NSString::from_str("Skip Tutorial"));
+            ui.primary_btn.setHidden(false);
+            ui.waiting_label.setHidden(true);
             ui.primary_btn
                 .setTitle(&NSString::from_str("Open Selector (⇧⌘6)"));
             ui.primary_btn.setBezelColor(None);
@@ -344,6 +386,8 @@ pub fn apply_step_ui(
             ));
             ui.secondary_btn
                 .setTitle(&NSString::from_str("Skip Tutorial"));
+            ui.primary_btn.setHidden(false);
+            ui.waiting_label.setHidden(true);
             ui.primary_btn
                 .setTitle(&NSString::from_str("Stop Recording"));
             ui.primary_btn
@@ -356,6 +400,8 @@ pub fn apply_step_ui(
             ));
             ui.secondary_btn
                 .setTitle(&NSString::from_str("Show in Finder"));
+            ui.primary_btn.setHidden(false);
+            ui.waiting_label.setHidden(true);
             ui.primary_btn.setTitle(&NSString::from_str("Done"));
             ui.primary_btn
                 .setBezelColor(Some(&NSColor::systemBlueColor()));

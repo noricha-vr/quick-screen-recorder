@@ -386,6 +386,50 @@ pub fn window_frame_to_overlay_rect(
     Some(Rect::new(cx0, appkit_y, vis_w, vis_h))
 }
 
+/// Computes the AppKit bottom-left origin `(x, y)` for the floating capture toolbar so it follows
+/// directly below `sel_local` (12pt gap), flips above when the bottom edge or Dock interferes,
+/// and floats safely above the Dock inside the selection when neither outside edge has room
+/// (e.g., Full Screen or maximized window).
+///
+/// `screen_frame` and `visible_frame` must be in the same AppKit coordinate space (global screen
+/// points for a floating `NSWindow`, or local `0..W, 0..H` for an embedded preview).
+pub fn compute_toolbar_origin(
+    sel_local: Rect,
+    screen_frame: Rect,
+    visible_frame: Rect,
+    bar_w: f64,
+    bar_h: f64,
+) -> (f64, f64) {
+    const GAP: f64 = 12.0;
+    const EDGE_MARGIN: f64 = 12.0;
+    const INSET_BOTTOM: f64 = 20.0;
+
+    let sel_x = screen_frame.x + sel_local.x;
+    let sel_y = screen_frame.y + sel_local.y;
+    let sel_top = sel_y + sel_local.height;
+    let sel_cx = sel_x + sel_local.width * 0.5;
+
+    let min_x = visible_frame.x + EDGE_MARGIN;
+    let max_x = (visible_frame.right() - bar_w - EDGE_MARGIN).max(min_x);
+    let x = (sel_cx - bar_w * 0.5).clamp(min_x, max_x).round();
+
+    let min_y = visible_frame.y + EDGE_MARGIN;
+    let max_y = (visible_frame.top_y_up() - bar_h - EDGE_MARGIN).max(min_y);
+
+    let below_y = sel_y - GAP - bar_h;
+    let above_y = sel_top + GAP;
+    let y = if below_y >= min_y {
+        below_y.min(max_y)
+    } else if above_y <= max_y {
+        above_y.max(min_y)
+    } else {
+        (visible_frame.y + INSET_BOTTOM)
+            .max(sel_y + INSET_BOTTOM)
+            .clamp(min_y, max_y)
+    };
+    (x, y.round())
+}
+
 fn round_down_even(v: f64) -> f64 {
     let n = v.floor() as i64;
     (n & !1).max(2) as f64

@@ -109,3 +109,43 @@ fn window_hit_test_and_overhang_projection() {
         None
     );
 }
+
+#[test]
+fn toolbar_follows_below_flips_above_and_respects_dock_and_multi_display() {
+    let screen = Rect::new(0.0, 0.0, 1440.0, 900.0);
+    // 70pt Dock at bottom, 25pt Menu Bar at top -> visible y: 70..875
+    let visible = Rect::new(0.0, 70.0, 1440.0, 805.0);
+    let (bw, bh) = (588.0, 88.0);
+
+    // 1. Centered selection with room below -> directly below by 12pt
+    let mid = Rect::new(320.0, 240.0, 800.0, 460.0);
+    let (x, y) = compute_toolbar_origin(mid, screen, visible, bw, bh);
+    assert_eq!(x, 426.0);
+    assert_eq!(y, 140.0);
+
+    // 2. Selection near bottom (Dock blocks below) -> flips cleanly above by 12pt
+    let low = Rect::new(320.0, 80.0, 800.0, 420.0);
+    let (x2, y2) = compute_toolbar_origin(low, screen, visible, bw, bh);
+    assert_eq!(x2, 426.0);
+    assert_eq!(y2, 512.0);
+
+    // 3. Fullscreen / maximized selection -> floats safely 20pt above Dock
+    let full = Rect::new(0.0, 0.0, 1440.0, 900.0);
+    let (x3, y3) = compute_toolbar_origin(full, screen, visible, bw, bh);
+    assert_eq!(x3, 426.0);
+    assert_eq!(y3, 90.0);
+
+    // 4. Narrow selection near far-left edge -> clamps X inside visible frame margin
+    let left_edge = Rect::new(10.0, 260.0, 200.0, 200.0);
+    let (x4, y4) = compute_toolbar_origin(left_edge, screen, visible, bw, bh);
+    assert_eq!(x4, 12.0);
+    assert_eq!(y4, 160.0);
+
+    // 5. Secondary display with non-zero global origin
+    let sec_screen = Rect::new(1440.0, 100.0, 1920.0, 1080.0);
+    let sec_visible = Rect::new(1440.0, 100.0, 1920.0, 1055.0);
+    let sec_sel = Rect::new(400.0, 300.0, 900.0, 500.0);
+    let (x5, y5) = compute_toolbar_origin(sec_sel, sec_screen, sec_visible, bw, bh);
+    assert_eq!(x5, 1440.0 + 850.0 - 294.0);
+    assert_eq!(y5, 100.0 + 300.0 - 12.0 - 88.0);
+}

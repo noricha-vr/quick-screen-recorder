@@ -113,6 +113,7 @@ pub struct ExportRequest {
     pub start_sec: Option<f64>,
     pub end_sec: Option<f64>,
     pub max_width: Option<u32>,
+    pub mute_audio: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +183,7 @@ pub fn run_export_with_options(
         start_sec: Some(start),
         end_sec: Some(end),
         max_width: req.max_width,
+        mute_audio: req.mute_audio,
     };
 
     let t0 = Instant::now();
