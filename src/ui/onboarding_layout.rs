@@ -51,7 +51,7 @@ pub fn build_onboarding_ui(mtm: MainThreadMarker, initial_step: OnboardingStep) 
     if let Some(dark) = NSAppearance::appearanceNamed(unsafe { NSAppearanceNameDarkAqua }) {
         window.setAppearance(Some(&dark));
     }
-    window.setTitle(&NSString::from_str("Quick Screen Recorder — Quick Start"));
+    window.setTitle(&NSString::from_str("AirRec — Quick Start"));
     window.setBackgroundColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
         0.09, 0.10, 0.14, 1.0,
     )));
@@ -354,7 +354,7 @@ pub fn apply_step_ui(
     match step {
         OnboardingStep::Permission => {
             ui.body_label.setStringValue(&NSString::from_str(
-                "Click \"Open Settings →\" in the banner above, toggle Quick Screen Recorder ON, then click \"Quit & Reopen\" when macOS prompts.",
+                "Click \"Open Settings →\" in the banner above, toggle AirRec ON, then click \"Quit & Reopen\" when macOS prompts.",
             ));
             ui.secondary_btn.setHidden(false);
             ui.secondary_btn

@@ -5,9 +5,9 @@ set -euo pipefail
 # (not a privilege boundary). System tools (codesign, tccutil, ps) resolve via PATH
 # so scripts/test-install-local.sh can test behavior with stubs without altering real TCC.
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
-APP_NAME="QuickScreenRecorder.app"
-BIN_NAME="quick-screen-recorder"
-EXPECTED_BUNDLE_ID="io.github.noricha-vr.quick-screen-recorder"
+APP_NAME="AirRec.app"
+BIN_NAME="airrec"
+EXPECTED_BUNDLE_ID="io.github.noricha-vr.airrec"
 TCC_SERVICES=("ScreenCapture" "Microphone")
 
 TARGET_DIR="/Applications"
@@ -22,7 +22,7 @@ usage() {
   cat << 'EOF'
 Usage: scripts/install-local.sh [options]
 
-Safely installs QuickScreenRecorder.app to /Applications and, when installed with an
+Safely installs AirRec.app to /Applications and, when installed with an
 ad-hoc signature whose Designated Requirement / CDHash changed, automatically resets
 stale macOS TCC entries for this app's explicit services (ScreenCapture, Microphone).
 
@@ -35,7 +35,7 @@ Options:
   --force-reset-tcc        Reset allowlisted TCC services for ad-hoc installs even if
                            DR/CDHash is unchanged (still refused for cert-signed apps)
   --no-reset-tcc           Skip automatic TCC reset
-  --skip-running-check     Skip checking whether quick-screen-recorder is running
+  --skip-running-check     Skip checking whether airrec is running
   -h, --help               Show this help
 EOF
 }
@@ -157,7 +157,7 @@ TARGET_APP="$REAL_TARGET_DIR/$APP_NAME"
 
 # Fail closed if the app is running OR if `ps` fails.
 # Uses `ps -axo comm=` (full executable path) rather than `pgrep -x`, because macOS `pgrep -x`
-# truncates process names to 15 chars (`MAXCOMLEN-1`) and misses 21-char `quick-screen-recorder`.
+# truncates process names to 15 chars (`MAXCOMLEN-1`).
 assert_app_not_running() {
   [[ "$SKIP_RUNNING_CHECK" -eq 1 ]] && return 0
   local ps_out

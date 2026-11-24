@@ -4,17 +4,13 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use quick_screen_recorder::capture::RecordingCodec;
-use quick_screen_recorder::export::av_writer::write_rgba_frames_to_mp4;
-use quick_screen_recorder::export::avfoundation::{
-    RgbaFrame, extract_rgba_frame, probe_video_metadata,
-};
-use quick_screen_recorder::export::ffmpeg::detect_ffmpeg_binary;
-use quick_screen_recorder::export::{
-    ExportFormat, ExportRequest, run_export, run_export_with_progress,
-};
-use quick_screen_recorder::fs_safety::next_unique_token;
-use quick_screen_recorder::observe::summarize_perf_log;
+use airrec::capture::RecordingCodec;
+use airrec::export::av_writer::write_rgba_frames_to_mp4;
+use airrec::export::avfoundation::{RgbaFrame, extract_rgba_frame, probe_video_metadata};
+use airrec::export::ffmpeg::detect_ffmpeg_binary;
+use airrec::export::{ExportFormat, ExportRequest, run_export, run_export_with_progress};
+use airrec::fs_safety::next_unique_token;
+use airrec::observe::summarize_perf_log;
 
 fn make_temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("qsr-it-{name}-{}", next_unique_token()));
@@ -360,7 +356,7 @@ fn end_to_end_native_exports_codec_resize_metadata_and_telemetry() {
     }
 
     let out_webm_or_same_in_src = src_mp4.clone();
-    let same_path_res = quick_screen_recorder::export::run_export_with_options(
+    let same_path_res = airrec::export::run_export_with_options(
         &ExportRequest {
             input: src_mp4.clone(),
             output: out_webm_or_same_in_src,

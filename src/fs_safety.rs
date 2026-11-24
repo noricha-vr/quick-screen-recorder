@@ -59,7 +59,7 @@ pub fn format_tilde_path(path: &Path) -> String {
     sanitize_terminal_text(&path.display().to_string(), false)
 }
 
-/// Generates a local-timestamped output path `YYYY-MM-DD_HH-MM-SS_Quick-Screen-Recorder.<ext>`
+/// Generates a local-timestamped output path `YYYY-MM-DD_HH-MM-SS_AirRec.<ext>`
 /// inside `dir` without overwriting any existing file or symlink.
 pub fn next_recording_output_path(dir: &Path, ext: &str) -> PathBuf {
     let clean_ext = ext.trim_start_matches('.');
@@ -134,10 +134,11 @@ pub fn ensure_private_dir(dir: &Path) -> Result<(), String> {
             }
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            DirBuilder::new()
-                .mode(0o700)
-                .create(dir)
-                .map_err(|e| format!("Failed creating private directory: {e}"))?;
+            match DirBuilder::new().mode(0o700).create(dir) {
+                Ok(()) => {}
+                Err(ce) if ce.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(ce) => return Err(format!("Failed creating private directory: {ce}")),
+            }
         }
         Err(e) => return Err(format!("Failed checking private directory: {e}")),
     }

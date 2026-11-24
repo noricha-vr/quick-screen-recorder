@@ -13,7 +13,7 @@ use crate::fs_safety::{
 };
 use crate::geometry::{AspectRatio, Rect};
 
-pub const APP_SUPPORT_DIR_NAME: &str = "QuickScreenRecorder";
+pub const APP_SUPPORT_DIR_NAME: &str = "AirRec";
 const MAX_PREFS_BYTES: u64 = 65_536;
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -91,7 +91,7 @@ impl Preferences {
         }
     }
 
-    /// Resolves the pre-selected persistent export destination directory, defaulting to `~/Movies/Quick Screen Recorder`.
+    /// Resolves the pre-selected persistent export destination directory, defaulting to `~/Movies/AirRec`.
     pub fn resolved_export_dir(&self) -> Option<PathBuf> {
         if let Some(dir) = &self.export_dir {
             if is_usable_export_dir(dir) {

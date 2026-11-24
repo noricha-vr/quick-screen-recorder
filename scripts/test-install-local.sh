@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INSTALLER="$ROOT_DIR/scripts/install-local.sh"
-BUNDLE_ID="io.github.noricha-vr.quick-screen-recorder"
+BUNDLE_ID="io.github.noricha-vr.airrec"
 
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/qsr-install-test.XXXXXX")"
 REAL_PROC_PID=""
@@ -78,11 +78,11 @@ case "${STUB_PS_MODE:-not_running}" in
     exit 0
     ;;
   running)
-    printf '/sbin/launchd\n/Applications/QuickScreenRecorder.app/Contents/MacOS/quick-screen-recorder\n'
+    printf '/sbin/launchd\n/Applications/AirRec.app/Contents/MacOS/airrec\n'
     exit 0
     ;;
   running_long)
-    printf '/Applications/QuickScreenRecorder.app/Contents/MacOS/quick-screen-recorder\n'
+    printf '/Applications/AirRec.app/Contents/MacOS/airrec\n'
     awk 'BEGIN { for (i = 0; i < 25000; i++) print "/usr/libexec/dummy-process-line-for-sigpipe-regression-" i }'
     exit 0
     ;;
@@ -91,7 +91,7 @@ case "${STUB_PS_MODE:-not_running}" in
     ;;
   running_on_second)
     if [[ "$count" -ge 2 ]]; then
-      printf '/Applications/QuickScreenRecorder.app/Contents/MacOS/quick-screen-recorder\n'
+      printf '/Applications/AirRec.app/Contents/MacOS/airrec\n'
     else
       printf '/sbin/launchd\n'
     fi
@@ -183,7 +183,7 @@ if run_inst --target-dir "$APPS_DIR" --source-app "$SRC_CORRUPT" >/dev/null 2>&1
   exit 1
 fi
 assert_log_lines 0
-rm -rf "$APPS_DIR/QuickScreenRecorder.app"
+rm -rf "$APPS_DIR/AirRec.app"
 
 # 4. Fresh ad-hoc install resets exact 2 allowlisted services with exact 3 args each.
 SRC_V1="$TMP_ROOT/v1.app"
@@ -237,13 +237,13 @@ printf '%s\n' "$OUT" | grep -q -- "--force-reset-tcc"
 
 # 11. Refuses to replace an existing app at target with a different CFBundleIdentifier.
 : > "$TCC_LOG"
-make_fake_app "$APPS_DIR/QuickScreenRecorder.app" "com.example.victim" "adhoc" "victimhash"
+make_fake_app "$APPS_DIR/AirRec.app" "com.example.victim" "adhoc" "victimhash"
 if run_inst --target-dir "$APPS_DIR" --source-app "$SRC_V4" >/dev/null 2>&1; then
   echo "FAIL: must refuse replacing an existing app with different bundle ID" >&2
   exit 1
 fi
 assert_log_lines 0
-rm -rf "$APPS_DIR/QuickScreenRecorder.app"
+rm -rf "$APPS_DIR/AirRec.app"
 
 # 12. Refuses to install when ps reports the 21-char binary is running.
 : > "$TCC_LOG"
@@ -278,10 +278,10 @@ if STUB_PS_MODE=running_on_second run_inst --target-dir "$APPS_DIR" --source-app
   exit 1
 fi
 assert_log_lines 0
-[[ ! -e "$APPS_DIR/QuickScreenRecorder.app" ]]
+[[ ! -e "$APPS_DIR/AirRec.app" ]]
 
 # 14b. Real macOS `/bin/ps -axo comm=` (only ps is real; codesign/tccutil stay stubbed)
-#      detects a real 21-char `quick-screen-recorder` process and prints the running error.
+#      detects a real 21-char `airrec` process and prints the running error.
 REAL_PS_BIN="$TMP_ROOT/bin-real-ps"
 mkdir -p "$REAL_PS_BIN"
 ln -s "$STUB_BIN/codesign" "$REAL_PS_BIN/codesign"
@@ -292,8 +292,8 @@ mkdir -p "$REAL_PROC_DIR"
 # Build a minimal native Mach-O sleeper rather than copying `/bin/sleep`, because copying an
 # Apple-signed system binary triggers AMFI `Killed: 9` on macOS 15+ even after re-signing.
 printf '#include <unistd.h>\nint main(void) { sleep(30); return 0; }\n' \
-  | /usr/bin/cc -x c - -o "$REAL_PROC_DIR/quick-screen-recorder"
-"$REAL_PROC_DIR/quick-screen-recorder" &
+  | /usr/bin/cc -x c - -o "$REAL_PROC_DIR/airrec"
+"$REAL_PROC_DIR/airrec" &
 REAL_PROC_PID=$!
 sleep 0.1
 if ! kill -0 "$REAL_PROC_PID" 2>/dev/null; then
@@ -310,7 +310,7 @@ OUT_REAL_PS="$(
 kill "$REAL_PROC_PID" 2>/dev/null || true
 wait "$REAL_PROC_PID" 2>/dev/null || true
 if [[ "$REAL_PS_FAILED" -ne 1 ]]; then
-  echo "FAIL: real macOS ps failed to detect 21-char quick-screen-recorder process" >&2
+  echo "FAIL: real macOS ps failed to detect 21-char airrec process" >&2
   exit 1
 fi
 if ! printf '%s\n' "$OUT_REAL_PS" | grep -q "is currently running"; then
@@ -363,7 +363,7 @@ run_inst --target-dir "$APPS_DIR" --source-app "$SRC_V3" >/dev/null
 # Make target fail verification ONLY when installed at target path (`--verify` checks sentinel):
 SRC_FAIL_POST="$TMP_ROOT/fail-post.app"
 make_fake_app "$SRC_FAIL_POST" "$BUNDLE_ID" "adhoc" "badpost"
-# Simulate post-swap verify failure by making codesign --verify fail ONLY for resolved $APPS_DIR/QuickScreenRecorder.app
+# Simulate post-swap verify failure by making codesign --verify fail ONLY for resolved $APPS_DIR/AirRec.app
 REAL_APPS_DIR="$(cd "$APPS_DIR" && pwd -P)"
 cat > "$STUB_BIN/codesign" << 'EOF'
 #!/usr/bin/env bash
@@ -387,11 +387,11 @@ exit 1
 EOF
 chmod +x "$STUB_BIN/codesign"
 : > "$TCC_LOG"
-if QSR_STUB_FAIL_TARGET_APP="$REAL_APPS_DIR/QuickScreenRecorder.app" run_inst --target-dir "$APPS_DIR" --source-app "$SRC_FAIL_POST" >/dev/null 2>&1; then
+if QSR_STUB_FAIL_TARGET_APP="$REAL_APPS_DIR/AirRec.app" run_inst --target-dir "$APPS_DIR" --source-app "$SRC_FAIL_POST" >/dev/null 2>&1; then
   echo "FAIL: post-swap verify failure should have failed" >&2
   exit 1
 fi
 assert_log_lines 0
-grep -q 'CDHash=hash3333' "$APPS_DIR/QuickScreenRecorder.app/.stub-dvvv"
+grep -q 'CDHash=hash3333' "$APPS_DIR/AirRec.app/.stub-dvvv"
 
 echo "INSTALL_LOCAL_STUB_TESTS_OK (20/20 cases passed)"

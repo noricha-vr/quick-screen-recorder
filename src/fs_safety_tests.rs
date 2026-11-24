@@ -130,7 +130,7 @@ fn default_export_dir_creates_movies_app_folder_and_preserves_custom_numeric_ste
     fs::set_permissions(&movies, fs::Permissions::from_mode(0o700)).expect("chmod movies");
 
     let resolved = default_export_dir_in_home(&mock_home).expect("default movies app dir");
-    assert_eq!(resolved, movies.join("Quick Screen Recorder"));
+    assert_eq!(resolved, movies.join("AirRec"));
     assert!(resolved.is_dir());
 
     // Numeric custom stems like `demo-2026` must become `demo-2026-2` on collision, not `demo-2`

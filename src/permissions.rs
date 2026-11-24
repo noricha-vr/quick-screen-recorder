@@ -63,7 +63,7 @@ pub fn doctor_report() -> String {
     let ffmpeg_available = detect_ffmpeg_binary().is_some();
 
     let mut lines = Vec::new();
-    lines.push("Quick Screen Recorder — Environment Check".to_string());
+    lines.push("AirRec — Environment Check".to_string());
     lines.push(format!(
         "  Screen Recording permission : {}",
         if screen_perm {

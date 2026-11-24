@@ -2,14 +2,14 @@ use std::path::{Path, PathBuf};
 
 use crate::observe::now_unix_secs;
 
-pub const APP_DISPLAY_NAME: &str = "Quick Screen Recorder";
-pub const DEFAULT_APP_FILE_TAG: &str = "Quick-Screen-Recorder";
+pub const APP_DISPLAY_NAME: &str = "AirRec";
+pub const DEFAULT_APP_FILE_TAG: &str = "AirRec";
 const MAX_EXPORT_STEM_BYTES: usize = 160;
 const MAX_APP_TAG_CHARS: usize = 28;
 
 /// Generates a chronological, Spotlight-friendly default export file stem:
-/// - Area / Screen / existing video: `YYYY-MM-DD_HH-MM-SS_Quick-Screen-Recorder`
-/// - Window capture (e.g. `Safari`): `YYYY-MM-DD_HH-MM-SS_Quick-Screen-Recorder_Safari`
+/// - Area / Screen / existing video: `YYYY-MM-DD_HH-MM-SS_AirRec`
+/// - Window capture (e.g. `Safari`): `YYYY-MM-DD_HH-MM-SS_AirRec_Safari`
 pub fn default_export_stem(unix_secs: u64, captured_app_name: Option<&str>) -> String {
     let ts = format_local_timestamp(unix_secs);
     if let Some(app_tag) = captured_app_name.and_then(sanitize_app_tag) {
@@ -26,7 +26,7 @@ pub fn default_export_stem_now(captured_app_name: Option<&str>) -> String {
 
 /// Sanitizes a user-edited export file stem so it cannot traverse directories, create hidden
 /// dotfiles, inject terminal/bidi control characters, duplicate the active extension, or exceed
-/// filesystem byte limits. Falls back to a sanitized `fallback_stem` (or `Quick-Screen-Recorder`)
+/// filesystem byte limits. Falls back to a sanitized `fallback_stem` (or `AirRec`)
 /// when the cleaned name is empty.
 pub fn sanitize_export_stem(raw: &str, ext: &str, fallback_stem: &str) -> String {
     let clean_ext = sanitize_export_extension(ext);
@@ -207,22 +207,19 @@ mod tests {
     #[test]
     fn default_stem_places_chronological_timestamp_first_and_app_name_after() {
         let base = default_export_stem(1_763_940_000, None);
-        assert!(base.ends_with("_Quick-Screen-Recorder"), "got {base}");
-        assert_eq!(
-            base.len(),
-            "YYYY-MM-DD_HH-MM-SS_Quick-Screen-Recorder".len()
-        );
+        assert!(base.ends_with("_AirRec"), "got {base}");
+        assert_eq!(base.len(), "YYYY-MM-DD_HH-MM-SS_AirRec".len());
 
         let with_win = default_export_stem(1_763_940_000, Some("Visual Studio Code"));
         assert!(
-            with_win.ends_with("_Quick-Screen-Recorder_Visual-Studio-Code"),
+            with_win.ends_with("_AirRec_Visual-Studio-Code"),
             "got {with_win}"
         );
 
         // Avoid repeating our own app tag if somehow captured
-        let dup = default_export_stem(1_763_940_000, Some("Quick Screen Recorder"));
-        assert!(dup.ends_with("_Quick-Screen-Recorder"), "got {dup}");
-        assert!(!dup.ends_with("_Quick-Screen-Recorder_Quick-Screen-Recorder"));
+        let dup = default_export_stem(1_763_940_000, Some("AirRec"));
+        assert!(dup.ends_with("_AirRec"), "got {dup}");
+        assert!(!dup.ends_with("_AirRec_AirRec"));
 
         // Lexicographical sort order matches chronological order
         let earlier = default_export_stem(1_763_940_000, None);
@@ -232,7 +229,7 @@ mod tests {
 
     #[test]
     fn sanitize_export_stem_blocks_traversal_dotfiles_bidi_and_duplicate_ext() {
-        let fb = "2026-11-24_04-00-00_Quick-Screen-Recorder";
+        let fb = "2026-11-24_04-00-00_AirRec";
         assert_eq!(
             sanitize_export_stem("  my-demo.MP4  ", "mp4", fb),
             "my-demo"

@@ -4,7 +4,7 @@ Development guide for contributors and coding agents working in `quick-screen-re
 
 ## Overview
 
-`quick-screen-recorder` is a macOS 15+ native screen recorder and GIF/MP4/HEVC/APNG/WebM/AV1 exporter written in Rust. It uses `objc2-screen-capture-kit`, `objc2-av-foundation`, and `objc2-app-kit` directly without Electron or WebViews.
+`AirRec` (`airrec`) is a macOS 15+ native screen recorder and GIF/MP4/HEVC/APNG/WebM/AV1 exporter written in Rust. It uses `objc2-screen-capture-kit`, `objc2-av-foundation`, and `objc2-app-kit` directly without Electron or WebViews.
 
 ## Repository Layout
 
@@ -12,7 +12,7 @@ Development guide for contributors and coding agents working in `quick-screen-re
 |------|----------------|
 | `src/main.rs`, `src/cli.rs` | Binary entry point and zero-dependency CLI flag parser |
 | `src/geometry.rs` | Pure coordinate conversion (AppKit Y-up <-> CoreGraphics Y-down), aspect-ratio locking, even-pixel alignment, 8-way resize hit-testing, and Dock-aware floating toolbar positioning |
-| `src/config.rs` | Local user preferences serialization (`~/Library/Application Support/QuickScreenRecorder/preferences.json`), including split system/mic audio defaults |
+| `src/config.rs` | Local user preferences serialization (`~/Library/Application Support/AirRec/preferences.json`), including split system/mic audio defaults |
 | `src/export_name.rs` | Chronological Spotlight-friendly export filename generation and user filename sanitization |
 | `src/observe.rs` | Local-only latency/size stats (`perf.jsonl`) with zero personal paths or titles |
 | `src/permissions.rs` | CoreGraphics Screen Recording permission checks, Screen Recording & Microphone System Settings deep links, Finder reveal, and `doctor` diagnostics |
@@ -20,13 +20,13 @@ Development guide for contributors and coding agents working in `quick-screen-re
 | `src/export/` | `AVAssetExportSession` MP4/HEVC trimming, `AVAssetImageGenerator` frame extraction, parallel Rust GIF/APNG encoders, and optional `ffmpeg` WebM/AV1 runner |
 | `src/ui/` | Native AppKit status-bar controller, first-run onboarding & animated tutorial, selection overlay, and Trim & Export editor window |
 | `tests/export_pipeline.rs` | End-to-end export and privacy-invariant integration tests |
-| `scripts/bundle-app.sh` | Packages `dist/QuickScreenRecorder.app` with generated `.icns` icon and ad-hoc signature |
+| `scripts/bundle-app.sh` | Packages `dist/AirRec.app` with generated `.icns` icon and ad-hoc signature |
 
 ## Verification Commands
 
 ```bash
 make check    # Runs cargo fmt --check, cargo clippy --locked -- -D warnings, and cargo test
-make bundle   # Builds release binary and packages dist/QuickScreenRecorder.app
+make bundle   # Builds release binary and packages dist/AirRec.app
 ```
 
 ## Design & Security Invariants

@@ -227,12 +227,12 @@ pub fn spawn_async_export(
                                 .output_path
                                 .file_name()
                                 .map(|n| sanitize_terminal_text(&n.to_string_lossy(), false))
-                                .unwrap_or_else(|| "Quick-Screen-Recorder".to_string());
+                                .unwrap_or_else(|| "AirRec".to_string());
                             let dir_lbl = res
                                 .output_path
                                 .parent()
                                 .map(format_tilde_path)
-                                .unwrap_or_else(|| "~/Movies/Quick Screen Recorder".to_string());
+                                .unwrap_or_else(|| "~/Movies/AirRec".to_string());
                             ui.status_label.setStringValue(&NSString::from_str(&format!(
                                 "Saved {fname} to {dir_lbl} ({} ms · {} KB)",
                                 res.elapsed_ms, kb

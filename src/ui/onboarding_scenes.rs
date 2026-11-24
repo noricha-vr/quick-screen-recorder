@@ -88,7 +88,7 @@ pub(crate) fn draw_permission_animation(bounds: NSRect, phase: f64) {
     .fill();
 
     draw_text(
-        "Quick Screen Recorder",
+        "AirRec",
         row.origin.x + 48.0,
         row.origin.y + 15.0,
         &NSFont::systemFontOfSize_weight(13.0, 0.25),

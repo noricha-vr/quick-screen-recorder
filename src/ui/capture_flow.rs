@@ -207,7 +207,7 @@ fn handle_mic_permission_denied(
     let alert = NSAlert::new(mtm);
     alert.setMessageText(&NSString::from_str("Microphone Access Denied"));
     alert.setInformativeText(&NSString::from_str(
-        "Microphone permission is turned off for Quick Screen Recorder. You can record without a microphone now, or open System Settings to enable it.",
+        "Microphone permission is turned off for AirRec. You can record without a microphone now, or open System Settings to enable it.",
     ));
     alert.addButtonWithTitle(&NSString::from_str("Record Without Mic"));
     alert.addButtonWithTitle(&NSString::from_str("Open Microphone Settings"));
