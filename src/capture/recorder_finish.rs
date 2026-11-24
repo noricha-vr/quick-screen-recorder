@@ -264,4 +264,93 @@ mod tests {
             (StopPollState::TimedOut, false)
         );
     }
+
+    #[test]
+    fn timelapse_stop_timeout_then_delayed_worker_completion_preserves_video() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::mpsc;
+        use std::thread;
+
+        use crate::capture::RecordingCodec;
+        use crate::capture::timelapse::{
+            PendingTimelapseStop, TimelapseWorkerDone, deliver_or_preserve_timelapse_outcome,
+        };
+        use crate::fs_safety::{prune_stale_cache_files_in, random_hex_token};
+
+        let base = std::env::temp_dir().join(format!("qsr-tl-timeout-{}", random_hex_token()));
+        let cache_dir = base.join("cache");
+        let rec_dir = base.join("recovered");
+        fs::create_dir_all(&cache_dir).expect("mkdir cache");
+        fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)).expect("chmod cache");
+
+        // 1. Primary recovery: caller times out and drops `done_rx` BEFORE worker finishes encoding.
+        let target = cache_dir.join("capture-timeout.mp4");
+        let staging =
+            ExclusiveStagingDir::create_in_cache_root(&cache_dir, &target, "mp4", false, true)
+                .expect("staging");
+        fs::write(staging.staged_file(), b"hours-of-delayed-timelapse").expect("write mp4");
+        let (done_tx, done_rx) = mpsc::sync_channel::<Result<TimelapseWorkerDone, String>>(1);
+        let pending = PendingTimelapseStop::new_for_test(done_rx, Duration::from_millis(15));
+        assert!(
+            pending
+                .finish_with_policy(true, Ok(rec_dir.clone()))
+                .is_err()
+        );
+
+        deliver_or_preserve_timelapse_outcome(
+            done_tx,
+            Ok(TimelapseWorkerDone::ReadyToCommit {
+                staging: Some(staging),
+                output_path: target,
+                partial_error: None,
+                codec: RecordingCodec::H264,
+                elapsed: Duration::from_secs(60),
+            }),
+            Ok(rec_dir.clone()),
+        );
+        let recovered_files: Vec<_> = fs::read_dir(&rec_dir)
+            .expect("read rec_dir")
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(recovered_files.len(), 1);
+        assert_eq!(
+            fs::read(&recovered_files[0]).expect("read rescued timelapse"),
+            b"hours-of-delayed-timelapse"
+        );
+
+        // 2. Double-failure fallback after timeout: recovery fails + cache_dir read-only ->
+        //    protected staging survives drop AND expired cache pruning!
+        let target2 = cache_dir.join("capture-timeout2.mp4");
+        let staging2 =
+            ExclusiveStagingDir::create_in_cache_root(&cache_dir, &target2, "mp4", false, true)
+                .expect("staging2");
+        let staged_path2 = staging2.staged_file().to_path_buf();
+        fs::write(&staged_path2, b"double-failure-delayed-timelapse").expect("write mp4 2");
+        let (done_tx2, done_rx2) = mpsc::sync_channel::<Result<TimelapseWorkerDone, String>>(1);
+        drop(done_rx2);
+        fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o500)).expect("chmod 0500");
+        let worker = thread::spawn(move || {
+            deliver_or_preserve_timelapse_outcome(
+                done_tx2,
+                Ok(TimelapseWorkerDone::ReadyToCommit {
+                    staging: Some(staging2),
+                    output_path: target2,
+                    partial_error: None,
+                    codec: RecordingCodec::H264,
+                    elapsed: Duration::from_secs(60),
+                }),
+                Err("EMFILE".to_string()),
+            );
+        });
+        worker.join().expect("join delayed worker");
+        fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+        prune_stale_cache_files_in(&cache_dir, Duration::ZERO);
+        assert_eq!(
+            fs::read(&staged_path2).expect("retained staging survives prune"),
+            b"double-failure-delayed-timelapse"
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
 }

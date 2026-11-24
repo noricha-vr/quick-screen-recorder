@@ -30,12 +30,52 @@ pub(crate) const TIMELAPSE_STOP_TIMEOUT: Duration =
 pub(crate) enum TimelapseWorkerDone {
     Committed(RecordingOutcome),
     ReadyToCommit {
-        staging: ExclusiveStagingDir,
+        staging: Option<ExclusiveStagingDir>,
         output_path: PathBuf,
         partial_error: Option<String>,
         codec: RecordingCodec,
         elapsed: Duration,
     },
+}
+
+impl Drop for TimelapseWorkerDone {
+    fn drop(&mut self) {
+        if let Self::ReadyToCommit {
+            staging,
+            partial_error,
+            ..
+        } = self
+        {
+            if let Some(mut stg) = staging.take() {
+                let _ = commit_staged_to_recovery_directly(
+                    &mut stg,
+                    partial_error.take(),
+                    private_recovery_dir(),
+                );
+            }
+        }
+    }
+}
+
+/// Sends the worker's finished result to `PendingTimelapseStop`, or—if the caller timed out and
+/// dropped `done_rx` before encoding finished—preserves any completed `ReadyToCommit` directly
+/// into `recovery_dir` (or protected staging on double failure) instead of dropping the recording.
+pub(crate) fn deliver_or_preserve_timelapse_outcome(
+    done_tx: mpsc::SyncSender<Result<TimelapseWorkerDone, String>>,
+    outcome: Result<TimelapseWorkerDone, String>,
+    recovery_dir: Result<PathBuf, String>,
+) {
+    if let Err(mpsc::SendError(Ok(TimelapseWorkerDone::ReadyToCommit {
+        ref mut staging,
+        ref mut partial_error,
+        ..
+    }))) = done_tx.send(outcome)
+    {
+        if let Some(mut stg) = staging.take() {
+            let _ =
+                commit_staged_to_recovery_directly(&mut stg, partial_error.take(), recovery_dir);
+        }
+    }
 }
 
 /// Long-running interval timelapse capture session backed by `SCScreenshotManager` and
@@ -112,7 +152,7 @@ impl TimelapseSession {
                 init_tx,
             );
             done_flag_worker.store(true, Ordering::Release);
-            let _ = done_tx.send(outcome);
+            deliver_or_preserve_timelapse_outcome(done_tx, outcome, private_recovery_dir());
         });
 
         let init_res = init_rx.recv_timeout(START_INIT_TIMEOUT);
@@ -184,6 +224,21 @@ impl Drop for TimelapseSession {
 }
 
 impl PendingTimelapseStop {
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        done_rx: mpsc::Receiver<Result<TimelapseWorkerDone, String>>,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            sync: SyncState::new(),
+            committing: Arc::new(AtomicBool::new(false)),
+            done_rx,
+            result: None,
+            stop_initiated_at: Instant::now(),
+            timeout,
+        }
+    }
+
     pub fn poll(&mut self) -> StopPollState {
         if self.result.is_some() {
             return StopPollState::Finished;
@@ -246,18 +301,25 @@ impl PendingTimelapseStop {
             }
         };
         match done {
-            TimelapseWorkerDone::Committed(outcome) => Ok(outcome),
-            TimelapseWorkerDone::ReadyToCommit {
-                mut staging,
-                output_path,
-                partial_error,
-                codec,
-                elapsed,
-            } => {
+            TimelapseWorkerDone::Committed(ref outcome) => Ok(outcome.clone()),
+            mut ready @ TimelapseWorkerDone::ReadyToCommit { .. } => {
+                let TimelapseWorkerDone::ReadyToCommit {
+                    ref mut staging,
+                    ref output_path,
+                    ref mut partial_error,
+                    codec,
+                    elapsed,
+                } = ready
+                else {
+                    unreachable!();
+                };
+                let mut stg = staging
+                    .take()
+                    .ok_or_else(|| "Timelapse staging already consumed".to_string())?;
                 let commit_res = if preserve_directly {
-                    commit_staged_to_recovery_directly(&mut staging, partial_error, recovery_dir)
+                    commit_staged_to_recovery_directly(&mut stg, partial_error.take(), recovery_dir)
                 } else {
-                    commit_or_recover_default(&mut staging, output_path, partial_error)
+                    commit_or_recover_default(&mut stg, output_path.clone(), partial_error.take())
                 };
                 let (final_path, size, final_warning) = match commit_res {
                     Ok(v) => v,
@@ -379,7 +441,7 @@ fn run_timelapse_worker(
     // never race with worker-thread commit destination choice.
     if defer_commit_to_finish {
         return Ok(TimelapseWorkerDone::ReadyToCommit {
-            staging,
+            staging: Some(staging),
             output_path,
             partial_error,
             codec: cfg.codec,

@@ -463,7 +463,7 @@ fn timelapse_deferred_commit_preserves_on_late_quit_even_after_double_failure() 
     let (done_tx, done_rx) = mpsc::sync_channel::<Result<TimelapseWorkerDone, String>>(1);
     done_tx
         .send(Ok(TimelapseWorkerDone::ReadyToCommit {
-            staging,
+            staging: Some(staging),
             output_path: gui_target.clone(),
             partial_error: None,
             codec: RecordingCodec::H264,
