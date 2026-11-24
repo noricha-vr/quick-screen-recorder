@@ -169,7 +169,7 @@ impl ActiveRecording {
         config: &CaptureConfig,
         output_path: &Path,
         interrupt_latch: Option<InterruptLatch>,
-        preserve_on_interrupt: bool,
+        defer_timelapse_commit: bool,
     ) -> Result<Self, String> {
         if let Some(reason) = interrupt_latch
             .as_ref()
@@ -190,15 +190,9 @@ impl ActiveRecording {
                     config,
                     output_path,
                     interrupt_latch,
-                    preserve_on_interrupt,
+                    defer_timelapse_commit,
                 )?))
             }
-        }
-    }
-
-    pub fn mark_preserve_to_recovery(&self) {
-        if let Self::Timelapse(s) = self {
-            s.mark_preserve_to_recovery();
         }
     }
 
@@ -248,12 +242,6 @@ impl ActiveRecording {
 }
 
 impl PendingStop {
-    pub fn mark_preserve_to_recovery(&self) {
-        if let Self::Timelapse(p) = self {
-            p.mark_preserve_to_recovery();
-        }
-    }
-
     pub fn poll(&mut self) -> StopPollState {
         match self {
             Self::RealTime(p) => p.poll(),
@@ -273,10 +261,7 @@ impl PendingStop {
     pub fn finish_to_recovery(self) -> Result<RecordingOutcome, String> {
         match self {
             Self::RealTime(p) => p.finish_to_recovery(),
-            Self::Timelapse(p) => {
-                p.mark_preserve_to_recovery();
-                p.finish()
-            }
+            Self::Timelapse(p) => p.finish_to_recovery(),
         }
     }
 }

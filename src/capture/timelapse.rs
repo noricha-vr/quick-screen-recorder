@@ -27,6 +27,17 @@ const START_INIT_TIMEOUT: Duration = Duration::from_secs(12);
 pub(crate) const TIMELAPSE_STOP_TIMEOUT: Duration =
     Duration::from_secs(WRITER_FINISH_TIMEOUT.as_secs() + FRAME_CAPTURE_TIMEOUT.as_secs() + 5);
 
+pub(crate) enum TimelapseWorkerDone {
+    Committed(RecordingOutcome),
+    ReadyToCommit {
+        staging: ExclusiveStagingDir,
+        output_path: PathBuf,
+        partial_error: Option<String>,
+        codec: RecordingCodec,
+        elapsed: Duration,
+    },
+}
+
 /// Long-running interval timelapse capture session backed by `SCScreenshotManager` and
 /// incremental `AVAssetWriter` encoding at 30 fps playback speed (0% idle CPU between ticks,
 /// O(1) memory across multi-hour recordings, audio automatically OFF).
@@ -35,17 +46,15 @@ pub struct TimelapseSession {
     frames_written: Arc<AtomicU64>,
     worker_done: Arc<AtomicBool>,
     committing: Arc<AtomicBool>,
-    preserve_directly: Arc<AtomicBool>,
-    done_rx: Option<mpsc::Receiver<Result<RecordingOutcome, String>>>,
+    done_rx: Option<mpsc::Receiver<Result<TimelapseWorkerDone, String>>>,
     started_at: Instant,
 }
 
 pub struct PendingTimelapseStop {
     sync: Arc<SyncState>,
     committing: Arc<AtomicBool>,
-    preserve_directly: Arc<AtomicBool>,
-    done_rx: mpsc::Receiver<Result<RecordingOutcome, String>>,
-    result: Option<Result<RecordingOutcome, String>>,
+    done_rx: mpsc::Receiver<Result<TimelapseWorkerDone, String>>,
+    result: Option<Result<TimelapseWorkerDone, String>>,
     stop_initiated_at: Instant,
     timeout: Duration,
 }
@@ -59,7 +68,7 @@ impl TimelapseSession {
         config: &CaptureConfig,
         output_path: &Path,
         interrupt_latch: Option<InterruptLatch>,
-        preserve_on_interrupt: bool,
+        defer_commit_to_finish: bool,
     ) -> Result<Self, String> {
         let interval_secs = config
             .cadence
@@ -81,13 +90,11 @@ impl TimelapseSession {
         let done_flag_worker = Arc::clone(&worker_done);
         let committing = Arc::new(AtomicBool::new(false));
         let committing_worker = Arc::clone(&committing);
-        let preserve_directly = Arc::new(AtomicBool::new(false));
-        let preserve_worker = Arc::clone(&preserve_directly);
 
         // Rendezvous channel (capacity 0): `init_tx.send(Ok(()))` succeeds if and only if
         // `init_rx.recv_timeout(...)` actually received the handoff, eliminating start/stop races.
         let (init_tx, init_rx) = mpsc::sync_channel::<Result<(), String>>(0);
-        let (done_tx, done_rx) = mpsc::sync_channel::<Result<RecordingOutcome, String>>(1);
+        let (done_tx, done_rx) = mpsc::sync_channel::<Result<TimelapseWorkerDone, String>>(1);
         let started_at = Instant::now();
 
         thread::spawn(move || {
@@ -99,8 +106,7 @@ impl TimelapseSession {
                 sync_worker,
                 frames_worker,
                 committing_worker,
-                preserve_worker,
-                preserve_on_interrupt,
+                defer_commit_to_finish,
                 interrupt_latch,
                 started_at,
                 init_tx,
@@ -117,7 +123,6 @@ impl TimelapseSession {
                 frames_written,
                 worker_done,
                 committing,
-                preserve_directly,
                 done_rx: Some(done_rx),
                 started_at,
             }),
@@ -130,10 +135,6 @@ impl TimelapseSession {
                 Err("Timed out starting timelapse capture".to_string())
             }
         }
-    }
-
-    pub fn mark_preserve_to_recovery(&self) {
-        self.preserve_directly.store(true, Ordering::Release);
     }
 
     pub fn elapsed(&self) -> Duration {
@@ -164,7 +165,6 @@ impl TimelapseSession {
         PendingTimelapseStop {
             sync: Arc::clone(&self.sync),
             committing: Arc::clone(&self.committing),
-            preserve_directly: Arc::clone(&self.preserve_directly),
             done_rx,
             result: None,
             stop_initiated_at: Instant::now(),
@@ -184,9 +184,6 @@ impl Drop for TimelapseSession {
 }
 
 impl PendingTimelapseStop {
-    pub fn mark_preserve_to_recovery(&self) {
-        self.preserve_directly.store(true, Ordering::Release);
-    }
     pub fn poll(&mut self) -> StopPollState {
         if self.result.is_some() {
             return StopPollState::Finished;
@@ -212,25 +209,68 @@ impl PendingTimelapseStop {
         }
     }
 
-    pub fn finish(mut self) -> Result<RecordingOutcome, String> {
+    pub fn finish(self) -> Result<RecordingOutcome, String> {
+        self.finish_with_policy(false, private_recovery_dir())
+    }
+
+    /// Finalizes and preserves directly from staging into permanent recovery (or protected staging
+    /// on double failure), even if `quit` arrived after the background worker finished encoding.
+    pub fn finish_to_recovery(self) -> Result<RecordingOutcome, String> {
+        self.finish_with_policy(true, private_recovery_dir())
+    }
+
+    pub(crate) fn finish_with_policy(
+        mut self,
+        preserve_directly: bool,
+        recovery_dir: Result<PathBuf, String>,
+    ) -> Result<RecordingOutcome, String> {
         self.sync.signal_stop();
-        if let Some(res) = self.result.take() {
-            return res;
-        }
-        loop {
-            match self.done_rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(res) => return res,
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err("Timelapse worker exited unexpectedly".to_string());
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // Never cut off an active cross-volume file commit once encoding has finished.
-                    if !self.committing.load(Ordering::Acquire)
-                        && self.stop_initiated_at.elapsed() >= self.timeout
-                    {
-                        return Err("Timed out finalizing timelapse MP4".to_string());
+        let done = if let Some(res) = self.result.take() {
+            res?
+        } else {
+            loop {
+                match self.done_rx.recv_timeout(Duration::from_millis(200)) {
+                    Ok(res) => break res?,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err("Timelapse worker exited unexpectedly".to_string());
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        // Never cut off an active cross-volume file commit once encoding has finished.
+                        if !self.committing.load(Ordering::Acquire)
+                            && self.stop_initiated_at.elapsed() >= self.timeout
+                        {
+                            return Err("Timed out finalizing timelapse MP4".to_string());
+                        }
                     }
                 }
+            }
+        };
+        match done {
+            TimelapseWorkerDone::Committed(outcome) => Ok(outcome),
+            TimelapseWorkerDone::ReadyToCommit {
+                mut staging,
+                output_path,
+                partial_error,
+                codec,
+                elapsed,
+            } => {
+                let commit_res = if preserve_directly {
+                    commit_staged_to_recovery_directly(&mut staging, partial_error, recovery_dir)
+                } else {
+                    commit_or_recover_default(&mut staging, output_path, partial_error)
+                };
+                let (final_path, size, final_warning) = match commit_res {
+                    Ok(v) => v,
+                    Err(err) => {
+                        record_timelapse_perf(codec, elapsed, 0, false);
+                        return Err(err);
+                    }
+                };
+                record_timelapse_perf(codec, elapsed, size, final_warning.is_none());
+                Ok(RecordingOutcome {
+                    output_path: final_path,
+                    partial_error: final_warning,
+                })
             }
         }
     }
@@ -245,12 +285,11 @@ fn run_timelapse_worker(
     sync: Arc<SyncState>,
     frames_written: Arc<AtomicU64>,
     committing: Arc<AtomicBool>,
-    preserve_directly: Arc<AtomicBool>,
-    preserve_on_interrupt: bool,
+    defer_commit_to_finish: bool,
     interrupt_latch: Option<InterruptLatch>,
     started_at: Instant,
     init_tx: mpsc::SyncSender<Result<(), String>>,
-) -> Result<RecordingOutcome, String> {
+) -> Result<TimelapseWorkerDone, String> {
     let is_session_interrupted = || {
         interrupt_latch
             .as_ref()
@@ -335,30 +374,36 @@ fn run_timelapse_worker(
             None => fin_err,
         });
     }
-    // Mark commit phase active so slow cross-volume copies (e.g. multi-GiB MP4 to USB/SMB)
+    // In GUI mode (`defer_commit_to_finish == true`), hand the finalized `ExclusiveStagingDir`
+    // back to `PendingTimelapseStop::finish*()` so main-thread `quit` / `auto_stop` decisions
+    // never race with worker-thread commit destination choice.
+    if defer_commit_to_finish {
+        return Ok(TimelapseWorkerDone::ReadyToCommit {
+            staging,
+            output_path,
+            partial_error,
+            codec: cfg.codec,
+            elapsed: started_at.elapsed(),
+        });
+    }
+    // Mark commit phase active so slow cross-volume CLI copies (e.g. multi-GiB MP4 to USB/SMB)
     // are never cut off by the capture/encoder finalization timeout.
     committing.store(true, Ordering::Release);
-    let direct_recovery = preserve_directly.load(Ordering::Acquire)
-        || (preserve_on_interrupt && is_session_interrupted());
-    let commit_res = if direct_recovery {
-        commit_staged_to_recovery_directly(&mut staging, partial_error, private_recovery_dir())
-    } else {
-        commit_or_recover_default(&mut staging, output_path, partial_error)
-    };
-    let (final_path, size, final_warning) = match commit_res {
-        Ok(v) => v,
-        Err(err) => {
-            record_timelapse_perf(cfg.codec, started_at.elapsed(), 0, false);
-            return Err(err);
-        }
-    };
+    let (final_path, size, final_warning) =
+        match commit_or_recover_default(&mut staging, output_path, partial_error) {
+            Ok(v) => v,
+            Err(err) => {
+                record_timelapse_perf(cfg.codec, started_at.elapsed(), 0, false);
+                return Err(err);
+            }
+        };
 
     let clean_ok = final_warning.is_none();
     record_timelapse_perf(cfg.codec, started_at.elapsed(), size, clean_ok);
-    Ok(RecordingOutcome {
+    Ok(TimelapseWorkerDone::Committed(RecordingOutcome {
         output_path: final_path,
         partial_error: final_warning,
-    })
+    }))
 }
 
 fn record_timelapse_perf(codec: RecordingCodec, elapsed: Duration, output_bytes: u64, ok: bool) {

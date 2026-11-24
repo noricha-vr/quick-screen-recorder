@@ -344,3 +344,58 @@ fn auto_stop_direct_recovery_double_failure_survives_cache_pruning() {
 
     let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn prune_checks_marker_after_flock_and_fails_closed_on_unreadable_marker() {
+    use std::thread;
+
+    let base = std::env::temp_dir().join(format!("qsr-flock-prune-{}", random_hex_token()));
+    let cache_dir = base.join("cache");
+    let dest_dir = base.join("dest");
+    fs::create_dir_all(&cache_dir).expect("mkdir cache");
+    fs::create_dir_all(&dest_dir).expect("mkdir dest");
+    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)).expect("chmod cache");
+
+    // 1. Lock-then-check ordering: while staging holds flock with marker='0', concurrent pruner
+    //    cannot delete it; once staging flips marker to '1' and drops (releasing flock), a
+    //    subsequent prune acquires flock, reads '1', and preserves the recording!
+    let target = dest_dir.join("long-rec.mp4");
+    let mut staging =
+        ExclusiveStagingDir::create_in_cache_root(&cache_dir, &target, "mp4", false).expect("stg");
+    let staged_path = staging.staged_file().to_path_buf();
+    fs::write(&staged_path, b"over-24h-recording").expect("write rec");
+
+    let cache_clone = cache_dir.clone();
+    let pruner = thread::spawn(move || {
+        prune_stale_cache_files_in(&cache_clone, Duration::ZERO);
+    });
+    pruner.join().expect("join concurrent pruner while locked");
+    assert!(staged_path.exists(), "locked staging must not be pruned");
+
+    staging.retain_staged_in_place();
+    drop(staging);
+    prune_stale_cache_files_in(&cache_dir, Duration::ZERO);
+    assert_eq!(
+        fs::read(&staged_path).expect("retained staging survives prune after unlock"),
+        b"over-24h-recording"
+    );
+
+    // 2. Unreadable `.qsr-keep` (EACCES, chmod 0o000): must fail CLOSED and NOT delete directory!
+    let unreadable_dir = cache_dir.join(format!(".qsr-work-unreadable-{}", random_hex_token()));
+    DirBuilder::new()
+        .mode(0o700)
+        .create(&unreadable_dir)
+        .unwrap();
+    let unreadable_marker = unreadable_dir.join(".qsr-keep");
+    fs::write(&unreadable_marker, b"1").unwrap();
+    fs::write(unreadable_dir.join("staged.mp4"), b"must-not-delete").unwrap();
+    fs::set_permissions(&unreadable_marker, fs::Permissions::from_mode(0o000)).unwrap();
+
+    prune_stale_cache_files_in(&cache_dir, Duration::ZERO);
+    assert!(
+        unreadable_dir.join("staged.mp4").exists(),
+        "unreadable .qsr-keep must fail closed and skip pruning"
+    );
+    fs::set_permissions(&unreadable_marker, fs::Permissions::from_mode(0o600)).unwrap();
+    let _ = fs::remove_dir_all(&base);
+}

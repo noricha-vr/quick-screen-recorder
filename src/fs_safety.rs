@@ -276,10 +276,13 @@ pub(crate) fn prune_stale_cache_files_in(dir: &Path, max_age: Duration) {
                     .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
                     .open(entry.path())
                 {
-                    if has_staged_keep_marker(dfd.as_raw_fd()) {
-                        continue;
-                    }
+                    // Acquire the exclusive lock FIRST, then inspect `.qsr-keep`, so a recorder
+                    // that flips `.qsr-keep` from `0` -> `1` before releasing its lock can never
+                    // race with a pruner that read stale `0` prior to locking.
                     if unsafe { libc::flock(dfd.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                        if has_staged_keep_marker(dfd.as_raw_fd()) {
+                            continue;
+                        }
                         let _ = fs::remove_dir_all(entry.path());
                     }
                 }
@@ -300,11 +303,22 @@ fn has_staged_keep_marker(dir_fd: libc::c_int) -> bool {
         )
     };
     if fd < 0 {
-        return false;
+        // Only definitively absent (`ENOENT`) is prunable; fail closed on EACCES/EMFILE/EIO/etc.
+        return io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT);
     }
     let mut byte = [0_u8; 1];
-    let n = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) };
+    let n = loop {
+        let rc = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) };
+        if rc < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        break rc;
+    };
     unsafe { libc::close(fd) };
+    if n < 0 {
+        // Read error (e.g. EIO): fail closed and skip pruning.
+        return true;
+    }
     // `b'0'` = active/unretained staging (prunable after crash + 24h once flock releases).
     // `b'1'` (explicitly retained) or 0-byte legacy marker = permanently exempt from pruning.
     n == 0 || (n == 1 && byte[0] != b'0')

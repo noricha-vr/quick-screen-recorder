@@ -426,3 +426,48 @@ fn stale_pre_start_stop_callback_cannot_complete_post_start_forced_stop() {
         Duration::from_millis(20)
     ));
 }
+
+#[test]
+fn delayed_finish_timeout_retains_staging_even_when_stream_stop_confirmed() {
+    let base = std::env::temp_dir().join(format!(
+        "qsr-delayed-fin-{}",
+        crate::fs_safety::random_hex_token()
+    ));
+    let cache_dir = base.join("cache");
+    let dest_dir = base.join("dest");
+    std::fs::create_dir_all(&cache_dir).expect("mkdir cache");
+    std::fs::create_dir_all(&dest_dir).expect("mkdir dest");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("chmod cache");
+    let target = dest_dir.join("delayed.mp4");
+
+    let mut staging =
+        ExclusiveStagingDir::create_in_cache_root(&cache_dir, &target, "mp4", false).expect("stg");
+    let staged_path = staging.staged_file().to_path_buf();
+    std::fs::write(&staged_path, b"unflushed-moov-pending").expect("write partial");
+
+    // Stream stop IS confirmed (`stop_issue == None`), yet `finished == false` timed out before
+    // macOS finished flushing the MP4 trailer -> staging MUST be retained untouched on disk!
+    let res = finalize_stop_staging_outcome(
+        &mut staging,
+        target,
+        false,
+        None,
+        None,
+        false,
+        Ok(base.join("Recovered")),
+    );
+    assert!(res.is_err());
+    assert!(res.unwrap_err().contains("retained untouched"));
+    drop(staging);
+
+    // Simulate delayed trailer flush completing after drop, then verify pruning does not delete it.
+    std::fs::write(&staged_path, b"delayed-trailer-flushed-mp4").expect("delayed flush write");
+    crate::fs_safety::prune_stale_cache_files_in(&cache_dir, Duration::ZERO);
+    assert_eq!(
+        std::fs::read(&staged_path).expect("delayed flush survives drop and prune"),
+        b"delayed-trailer-flushed-mp4"
+    );
+    let _ = std::fs::remove_dir_all(&base);
+}

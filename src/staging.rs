@@ -430,12 +430,13 @@ impl ExclusiveStagingDir {
         ))
     }
 
-    /// Disarms drop cleanup and flips the pre-opened `.qsr-keep` marker to `b"1"` via `pwrite`
-    /// (requires 0 new FDs and 0 directory writes, surviving EMFILE and read-only parent dirs).
+    /// Flips pre-opened `.qsr-keep` to `b"1"` (0 new FDs/dir writes, retrying EINTR) and disarms drop cleanup.
     pub fn retain_staged_in_place(&mut self) -> PathBuf {
         let _ = fs::set_permissions(&self.staged_file, fs::Permissions::from_mode(0o600));
-        let _ =
-            unsafe { libc::pwrite(self.keep_marker_fd.as_raw_fd(), b"1".as_ptr().cast(), 1, 0) };
+        while unsafe { libc::pwrite(self.keep_marker_fd.as_raw_fd(), b"1".as_ptr().cast(), 1, 0) }
+            < 0
+            && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+        {}
         self.keep_staged_on_drop = true;
         self.staged_file.clone()
     }

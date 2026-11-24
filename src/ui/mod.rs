@@ -300,8 +300,7 @@ fn cleanup_and_quit(mtm: MainThreadMarker, runtime: &Rc<RefCell<AppRuntime>>) {
         }
         // Defer termination while an asynchronous stop/commit is in flight so cross-volume
         // saves and local recovery always run to completion before the process exits.
-        if let Some(pending) = &rt.pending_stop {
-            pending.mark_preserve_to_recovery();
+        if rt.pending_stop.is_some() {
             rt.quit_after_stop = true;
             return;
         }

@@ -150,9 +150,14 @@ pub(super) fn finalize_stop_staging_outcome(
                     .to_string(),
             );
         } else {
-            return Err(
-                "Timed out waiting for MP4 recording output to flush container trailer".to_string(),
-            );
+            // Even when stream stop succeeded, macOS may still be flushing the MP4 trailer
+            // asynchronously after `finished` timed out — retain staging in place instead of
+            // deleting a potentially salvageable recording on drop.
+            let retained = staging.retain_staged_in_place();
+            return Err(format!(
+                "Timed out waiting for MP4 recording output to flush container trailer. Staging path retained untouched at {}",
+                format_tilde_path(&retained)
+            ));
         }
     }
 

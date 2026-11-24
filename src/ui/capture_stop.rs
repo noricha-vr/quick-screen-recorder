@@ -187,9 +187,6 @@ pub(crate) fn stop_active_recording_with_reason(
     if auto_stop_reason.is_some() {
         arm_fresh_unlock_monitor(runtime);
     }
-    if auto_stop_reason.is_some() || runtime.borrow().quit_after_stop {
-        session.mark_preserve_to_recovery();
-    }
     let prev_latch = prev_monitor.as_ref().map(|mon| mon.latch());
     let monitor_cell = RefCell::new(prev_monitor);
 
