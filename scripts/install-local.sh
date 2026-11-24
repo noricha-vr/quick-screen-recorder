@@ -152,17 +152,22 @@ if is_inside_dist_dir "$REAL_TARGET_DIR" "$DIST_DIR"; then
 fi
 TARGET_APP="$REAL_TARGET_DIR/$APP_NAME"
 
-# Fail closed if the app is running OR if `pgrep` itself fails (only exit code 1 means "not running").
+# Fail closed if the app is running OR if `ps` fails.
+# Uses `ps -axo comm=` (full executable path) rather than `pgrep -x`, because macOS `pgrep -x`
+# truncates process names to 15 chars (`MAXCOMLEN-1`) and misses 21-char `quick-screen-recorder`.
 assert_app_not_running() {
   [[ "$SKIP_RUNNING_CHECK" -eq 1 ]] && return 0
-  local rc=0
-  pgrep -x "$BIN_NAME" >/dev/null 2>&1 || rc=$?
-  if [[ "$rc" -eq 0 ]]; then
+  local ps_out
+  if ! ps_out="$(ps -axo comm= 2>/dev/null)"; then
+    echo "ERROR: Failed to verify running process state (ps failed); aborting safely." >&2
+    exit 1
+  fi
+  if printf '%s\n' "$ps_out" | awk -F/ -v bin="$BIN_NAME" '{
+      sub(/[[:space:]]+$/, "", $0);
+      if ($NF == bin) { found = 1; exit 0 }
+    } END { exit(found ? 0 : 1) }'; then
     echo "ERROR: $APP_NAME ($BIN_NAME) is currently running." >&2
     echo "Finish/save any active recording and quit the app cleanly before running make install." >&2
-    exit 1
-  elif [[ "$rc" -ne 1 ]]; then
-    echo "ERROR: Failed to verify running process state (pgrep exited $rc); aborting safely." >&2
     exit 1
   fi
 }

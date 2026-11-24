@@ -171,6 +171,33 @@ impl StopControl {
         }
     }
 
+    /// Emergency fallback ONLY when `removeRecordingOutput_error` itself has hung past the full
+    /// `finalize_deadline` (`RemovePhase::InFlight`): atomically marks `forced_stop_on_timeout`,
+    /// records `stop_capture_sent_at`, and returns a fresh generation so the caller can dispatch
+    /// `stopCaptureWithCompletionHandler:` off the stuck worker thread to halt screen/mic capture.
+    pub(super) fn claim_emergency_stop_if_remove_hung(
+        &self,
+        signal: &Arc<(Mutex<DelegateSignal>, Condvar)>,
+        now: Instant,
+    ) -> Option<u64> {
+        let Ok(mut st) = self.state.lock() else {
+            return None;
+        };
+        let deadline = st.finalize_deadline?;
+        if st.remove_phase != RemovePhase::InFlight
+            || st.stop_capture_sent_at.is_some()
+            || now < deadline
+        {
+            return None;
+        }
+        st.forced_stop_on_timeout = true;
+        let expected_gen = ensure_latest_stop_generation(signal, st.pending_late_start_gen.take());
+        st.stop_capture_sent_at = Some(now);
+        st.stop_capture_gen = Some(expected_gen);
+        self.cvar.notify_all();
+        Some(expected_gen)
+    }
+
     pub(super) fn snapshot(&self) -> StopSnapshot {
         self.state
             .lock()

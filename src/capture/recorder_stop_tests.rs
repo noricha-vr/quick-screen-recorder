@@ -423,6 +423,80 @@ fn late_start_generation_inversion_allocates_newer_gen_so_post_start_callback_su
 }
 
 #[test]
+fn hung_remove_past_deadline_claims_emergency_stop_once_and_protects_staging() {
+    let t0 = Instant::now();
+    let ctrl = Arc::new(StopControl::new(t0, false));
+    let signal = Arc::new((Mutex::new(DelegateSignal::default()), Condvar::new()));
+    let t_stop = t0 + Duration::from_secs(5);
+    assert!(ctrl.register_stop_request(StopMode::Normal, t_stop));
+
+    // Park a background worker inside `do_remove()` so `remove_phase == RemovePhase::InFlight`.
+    let gate = Arc::new((Mutex::new(false), Condvar::new()));
+    let ctrl_w = Arc::clone(&ctrl);
+    let sig_w = Arc::clone(&signal);
+    let gate_w = Arc::clone(&gate);
+    let worker_stop_calls = Arc::new(AtomicUsize::new(0));
+    let w_calls = Arc::clone(&worker_stop_calls);
+    let worker = thread::spawn(move || {
+        ctrl_w.run_serial_worker_loop(
+            &sig_w,
+            || {
+                let (l, c) = &*gate_w;
+                let g = l.lock().unwrap();
+                drop(c.wait_while(g, |open| !*open));
+                true
+            },
+            |_| {
+                w_calls.fetch_add(1, Ordering::SeqCst);
+            },
+            || t_stop,
+        );
+    });
+
+    // Wait briefly until `remove_phase == InFlight`.
+    for _ in 0..40 {
+        if ctrl.snapshot().remove_phase == RemovePhase::InFlight {
+            break;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(ctrl.snapshot().remove_phase, RemovePhase::InFlight);
+
+    let deadline = ctrl.snapshot().finalize_deadline.unwrap();
+    // Before deadline: emergency stop MUST NOT trigger.
+    assert!(
+        ctrl.claim_emergency_stop_if_remove_hung(&signal, deadline - Duration::from_secs(1))
+            .is_none()
+    );
+    // At deadline: emergency stop triggers ONCE, sets `forced_stop_on_timeout`, records `sent_at`.
+    let emg_gen = ctrl
+        .claim_emergency_stop_if_remove_hung(&signal, deadline)
+        .expect("must claim emergency stop once remove hung past deadline");
+    assert!(emg_gen >= 1);
+    assert!(ctrl.snapshot().forced_stop_on_timeout);
+    assert_eq!(ctrl.snapshot().stop_capture_sent_at, Some(deadline));
+    // Second claim is a no-op (at-most-once).
+    assert!(
+        ctrl.claim_emergency_stop_if_remove_hung(&signal, deadline + Duration::from_secs(1))
+            .is_none()
+    );
+
+    // Unblock worker so thread exits cleanly; worker MUST NOT double-send `stopCapture`.
+    {
+        let mut open = gate.0.lock().unwrap();
+        *open = true;
+        gate.1.notify_all();
+    }
+    {
+        let mut g = signal.0.lock().unwrap();
+        g.finished = true;
+        signal.1.notify_all();
+    }
+    worker.join().expect("join unblocked worker");
+    assert_eq!(worker_stop_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn forced_timeout_did_fail_retains_staging_untouched_even_when_stream_stop_confirmed() {
     use std::os::unix::fs::PermissionsExt;
 

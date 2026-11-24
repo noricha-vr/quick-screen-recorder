@@ -155,6 +155,25 @@ impl SendableStreamStop {
         wait_for_stream_stopped(&self.signal, confirm_timeout)
     }
 
+    /// If `removeRecordingOutput` itself has hung past `finalize_deadline`, dispatches an
+    /// emergency `stopCaptureWithCompletionHandler:` on a dedicated thread so screen/mic capture
+    /// actually stops even when `qsr-stop-worker` is wedged in `removeRecordingOutput_error`.
+    pub(super) fn trigger_emergency_stop_if_remove_hung(self: &Arc<Self>, now: Instant) {
+        if let Some(expected_gen) = self
+            .control
+            .claim_emergency_stop_if_remove_hung(&self.signal, now)
+        {
+            let stopper = Arc::clone(self);
+            if thread::Builder::new()
+                .name("qsr-emergency-stop".to_string())
+                .spawn(move || stopper.dispatch_stop_capture(expected_gen))
+                .is_err()
+            {
+                self.dispatch_stop_capture(expected_gen);
+            }
+        }
+    }
+
     fn spawn_serial_worker(self: &Arc<Self>) {
         let worker = Arc::clone(self);
         let spawned = thread::Builder::new()
@@ -163,6 +182,29 @@ impl SendableStreamStop {
         if spawned.is_err() {
             self.control.clear_worker_running_on_spawn_error();
         }
+    }
+
+    fn dispatch_stop_capture(&self, expected_gen: u64) {
+        autoreleasepool(|_| {
+            let sig = Arc::clone(&self.signal);
+            let stop_block = RcBlock::new(move |err: *mut NSError| {
+                let stop_err = if !err.is_null() {
+                    let ns_err = unsafe { &*err };
+                    if ns_err.code() == SCStreamErrorCode::AttemptToStopStreamState.0 {
+                        None
+                    } else {
+                        Some(ns_err.localizedDescription().to_string())
+                    }
+                } else {
+                    None
+                };
+                let _ = record_stop_callback_for_gen(&sig, expected_gen, stop_err);
+            });
+            unsafe {
+                self.stream
+                    .stopCaptureWithCompletionHandler(Some(&stop_block));
+            }
+        });
     }
 
     fn run_worker_in_autoreleasepool(&self) {
@@ -176,29 +218,7 @@ impl SendableStreamStop {
                             .is_ok()
                     })
                 },
-                |expected_gen| {
-                    autoreleasepool(|_| {
-                        let sig = Arc::clone(&self.signal);
-                        let stop_block = RcBlock::new(move |err: *mut NSError| {
-                            let stop_err = if !err.is_null() {
-                                let ns_err = unsafe { &*err };
-                                // `-3808` (AttemptToStopStreamState) means macOS already stopped the stream.
-                                if ns_err.code() == SCStreamErrorCode::AttemptToStopStreamState.0 {
-                                    None
-                                } else {
-                                    Some(ns_err.localizedDescription().to_string())
-                                }
-                            } else {
-                                None
-                            };
-                            let _ = record_stop_callback_for_gen(&sig, expected_gen, stop_err);
-                        });
-                        unsafe {
-                            self.stream
-                                .stopCaptureWithCompletionHandler(Some(&stop_block));
-                        }
-                    });
-                },
+                |expected_gen| self.dispatch_stop_capture(expected_gen),
                 Instant::now,
             );
         });

@@ -360,13 +360,16 @@ impl PendingRecordingStop {
     pub fn poll(&mut self) -> StopPollState {
         // Retry worker spawn automatically if an earlier spawn failed under transient thread pressure.
         self.stopper.request_stop_async(StopMode::Normal);
+        let now = Instant::now();
+        // If `removeRecordingOutput_error` wedged past `finalize_deadline`, dispatch emergency
+        // `stopCapture` on a separate thread so screen/mic capture actually halts before timing out.
+        self.stopper.trigger_emergency_stop_if_remove_hung(now);
         let (finished, stream_settled) = self
             .signal
             .0
             .lock()
             .map(|g| (g.finished, g.start_completed && g.stream_stopped))
             .unwrap_or((true, true));
-        let now = Instant::now();
         let snap = self.stopper.control().snapshot();
         let finalize_deadline = snap
             .finalize_deadline

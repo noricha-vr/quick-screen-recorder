@@ -11,7 +11,7 @@ trap 'rm -rf "$TMP_ROOT"' EXIT
 STUB_BIN="$TMP_ROOT/bin"
 mkdir -p "$STUB_BIN"
 TCC_LOG="$TMP_ROOT/tcc.log"
-PGREP_COUNT_FILE="$TMP_ROOT/pgrep.count"
+PS_COUNT_FILE="$TMP_ROOT/ps.count"
 
 cat > "$STUB_BIN/codesign" << 'EOF'
 #!/usr/bin/env bash
@@ -64,24 +64,37 @@ exit 0
 EOF
 chmod +x "$STUB_BIN/tccutil"
 
-cat > "$STUB_BIN/pgrep" << EOF
+cat > "$STUB_BIN/ps" << EOF
 #!/usr/bin/env bash
 set -euo pipefail
 count=0
-[[ -f "$PGREP_COUNT_FILE" ]] && count="\$(cat "$PGREP_COUNT_FILE")"
+[[ -f "$PS_COUNT_FILE" ]] && count="\$(cat "$PS_COUNT_FILE")"
 count=\$((count + 1))
-echo "\$count" > "$PGREP_COUNT_FILE"
-case "\${STUB_PGREP_MODE:-not_running}" in
-  not_running) exit 1 ;;
-  running) exit 0 ;;
-  error) exit 3 ;;
+echo "\$count" > "$PS_COUNT_FILE"
+case "\${STUB_PS_MODE:-not_running}" in
+  not_running)
+    printf '/sbin/launchd\n/usr/bin/zsh\n'
+    exit 0
+    ;;
+  running)
+    printf '/sbin/launchd\n/Applications/QuickScreenRecorder.app/Contents/MacOS/quick-screen-recorder\n'
+    exit 0
+    ;;
+  error)
+    exit 1
+    ;;
   running_on_second)
-    if [[ "\$count" -ge 2 ]]; then exit 0; else exit 1; fi
+    if [[ "\$count" -ge 2 ]]; then
+      printf '/Applications/QuickScreenRecorder.app/Contents/MacOS/quick-screen-recorder\n'
+    else
+      printf '/sbin/launchd\n'
+    fi
+    exit 0
     ;;
 esac
-exit 1
+exit 0
 EOF
-chmod +x "$STUB_BIN/pgrep"
+chmod +x "$STUB_BIN/ps"
 
 make_fake_app() {
   local dir="$1"
@@ -117,7 +130,7 @@ PLIST
 }
 
 run_inst() {
-  rm -f "$PGREP_COUNT_FILE"
+  rm -f "$PS_COUNT_FILE"
   PATH="$STUB_BIN:$PATH" bash "$INSTALLER" "$@"
 }
 
@@ -223,30 +236,46 @@ fi
 assert_log_lines 0
 rm -rf "$APPS_DIR/QuickScreenRecorder.app"
 
-# 12. Refuses to install when pgrep reports the app is running (exit 0).
+# 12. Refuses to install when ps reports the 21-char binary is running.
 : > "$TCC_LOG"
-if STUB_PGREP_MODE=running run_inst --target-dir "$APPS_DIR" --source-app "$SRC_V4" >/dev/null 2>&1; then
+if STUB_PS_MODE=running run_inst --target-dir "$APPS_DIR" --source-app "$SRC_V4" >/dev/null 2>&1; then
   echo "FAIL: must refuse install while app is running" >&2
   exit 1
 fi
 assert_log_lines 0
 
-# 13. Fails closed when pgrep encounters an internal error (exit 3 != 1).
+# 13. Fails closed when ps encounters an error.
 : > "$TCC_LOG"
-if STUB_PGREP_MODE=error run_inst --target-dir "$APPS_DIR" --source-app "$SRC_V4" >/dev/null 2>&1; then
-  echo "FAIL: must fail closed when pgrep exits with error 3" >&2
+if STUB_PS_MODE=error run_inst --target-dir "$APPS_DIR" --source-app "$SRC_V4" >/dev/null 2>&1; then
+  echo "FAIL: must fail closed when ps exits non-zero" >&2
   exit 1
 fi
 assert_log_lines 0
 
 # 14. Re-checks running status right before swap (catches app launched mid-build/staging).
 : > "$TCC_LOG"
-if STUB_PGREP_MODE=running_on_second run_inst --target-dir "$APPS_DIR" --source-app "$SRC_V4" >/dev/null 2>&1; then
+if STUB_PS_MODE=running_on_second run_inst --target-dir "$APPS_DIR" --source-app "$SRC_V4" >/dev/null 2>&1; then
   echo "FAIL: must re-check running app before swap" >&2
   exit 1
 fi
 assert_log_lines 0
 [[ ! -e "$APPS_DIR/QuickScreenRecorder.app" ]]
+
+# 14b. Real macOS `ps -axo comm=` (no stub!) detects a real 21-char `quick-screen-recorder` process.
+REAL_PROC_DIR="$TMP_ROOT/real-proc"
+mkdir -p "$REAL_PROC_DIR"
+cp /bin/sleep "$REAL_PROC_DIR/quick-screen-recorder"
+"$REAL_PROC_DIR/quick-screen-recorder" 30 &
+REAL_PROC_PID=$!
+sleep 0.1
+if bash -c "PATH=/usr/bin:/bin:\"$STUB_BIN\" bash \"$INSTALLER\" --target-dir \"$APPS_DIR\" --source-app \"$SRC_V4\"" >/dev/null 2>&1; then
+  kill "$REAL_PROC_PID" 2>/dev/null || true
+  wait "$REAL_PROC_PID" 2>/dev/null || true
+  echo "FAIL: real macOS ps failed to detect 21-char quick-screen-recorder process" >&2
+  exit 1
+fi
+kill "$REAL_PROC_PID" 2>/dev/null || true
+wait "$REAL_PROC_PID" 2>/dev/null || true
 
 # 15. Refuses installing into dist/ (including dist/., dist/../dist, and case-insensitive DIST aliases).
 mkdir -p "$ROOT_DIR/dist"
