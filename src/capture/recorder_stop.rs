@@ -428,3 +428,7 @@ impl StopControl {
 #[cfg(test)]
 #[path = "recorder_stop_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "recorder_stop_recovery_tests.rs"]
+mod recovery_tests;

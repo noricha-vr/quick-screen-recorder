@@ -289,10 +289,11 @@ ln -s "$STUB_BIN/tccutil" "$REAL_PS_BIN/tccutil"
 ln -s /bin/ps "$REAL_PS_BIN/ps"
 REAL_PROC_DIR="$TMP_ROOT/real-proc"
 mkdir -p "$REAL_PROC_DIR"
-cp /bin/sleep "$REAL_PROC_DIR/quick-screen-recorder"
-# Ad-hoc re-sign copied Mach-O so Apple Silicon AMFI allows execution from TMPDIR.
-/usr/bin/codesign --force --sign - "$REAL_PROC_DIR/quick-screen-recorder" >/dev/null 2>&1
-"$REAL_PROC_DIR/quick-screen-recorder" 30 &
+# Build a minimal native Mach-O sleeper rather than copying `/bin/sleep`, because copying an
+# Apple-signed system binary triggers AMFI `Killed: 9` on macOS 15+ even after re-signing.
+printf '#include <unistd.h>\nint main(void) { sleep(30); return 0; }\n' \
+  | /usr/bin/cc -x c - -o "$REAL_PROC_DIR/quick-screen-recorder"
+"$REAL_PROC_DIR/quick-screen-recorder" &
 REAL_PROC_PID=$!
 sleep 0.1
 if ! kill -0 "$REAL_PROC_PID" 2>/dev/null; then
