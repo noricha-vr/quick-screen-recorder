@@ -14,16 +14,19 @@ use crate::fs_safety::{
 
 #[path = "staging_io.rs"]
 mod io_helpers;
+#[path = "staging_recovery.rs"]
+mod recovery;
 
 use io_helpers::{
-    XdevTempGuard, copy_into_pinned_dir_overwrite, create_initial_keep_marker,
-    fstatat_overwrite_mode, rename_excl_within_dir, stage_once_on_dest_volume,
+    XdevTempGuard, copy_into_pinned_dir_overwrite, fstatat_overwrite_mode, rename_excl_within_dir,
+    stage_once_on_dest_volume,
 };
-pub use io_helpers::{
+pub use recovery::{
     commit_or_recover_default, commit_or_recover_salvaged_default, commit_or_recover_staging,
     commit_or_recover_staging_with_policy, preserve_capture_to_recovery,
     preserve_recording_on_quit, preserve_staged_permanently, private_recovery_dir,
 };
+use recovery::{rename_work_dir_to_preserved, write_keep_marker_durable};
 
 /// Exclusively created (`0700`) staging directory inside our private cache directory, paired with
 /// a pinned `O_DIRECTORY | O_NOFOLLOW` descriptor for the verified destination directory.
@@ -31,7 +34,7 @@ pub use io_helpers::{
 pub struct ExclusiveStagingDir {
     stage_dir_path: PathBuf,
     stage_dir_fd: OwnedFd,
-    keep_marker_fd: OwnedFd,
+    keep_marker_preallocated: bool,
     staged_name_c: CString,
     staged_file: PathBuf,
     dest_dir_fd: OwnedFd,
@@ -42,8 +45,17 @@ pub struct ExclusiveStagingDir {
 }
 
 impl ExclusiveStagingDir {
+    /// Creates staging for reconstructible exports (no pre-allocated `.qsr-keep`, so crashed
+    /// exports prune cleanly after 24h).
     pub fn create_for_target(target: &Path, ext: &str) -> Result<Self, String> {
         Self::create_for_target_with_policy(target, ext, false)
+    }
+
+    /// Creates staging for irreplaceable live recordings, pre-allocating and `fsync`ing `.qsr-keep`
+    /// (`b"1"`) before Frame 0 so later retention requires zero writes/FDs under ENOSPC/EIO/EMFILE.
+    pub fn create_for_recording(target: &Path, ext: &str) -> Result<Self, String> {
+        let cache_root = private_cache_dir()?;
+        Self::create_in_cache_root(&cache_root, target, ext, false, true)
     }
 
     pub fn create_for_target_with_policy(
@@ -52,7 +64,7 @@ impl ExclusiveStagingDir {
         prevent_overwrite: bool,
     ) -> Result<Self, String> {
         let cache_root = private_cache_dir()?;
-        Self::create_in_cache_root(&cache_root, target, ext, prevent_overwrite)
+        Self::create_in_cache_root(&cache_root, target, ext, prevent_overwrite, false)
     }
 
     pub(crate) fn create_in_cache_root(
@@ -60,6 +72,7 @@ impl ExclusiveStagingDir {
         target: &Path,
         ext: &str,
         prevent_overwrite: bool,
+        preallocate_keep: bool,
     ) -> Result<Self, String> {
         let file_name = target
             .file_name()
@@ -154,15 +167,12 @@ impl ExclusiveStagingDir {
             return Err("Staging directory ownership, 0700 mode, or ACL check failed".to_string());
         }
         let stage_dir_fd = OwnedFd::from(stage_dir_file);
-        // Pre-open `.qsr-keep` initialized to `b"0"` (crash-prunable) so `retain_staged_in_place()`
-        // can flip it to `b"1"` with 0 new FDs and 0 dir writes even under EMFILE/read-only dir.
-        let keep_marker_fd = match create_initial_keep_marker(stage_dir_fd.as_raw_fd()) {
-            Ok(fd) => fd,
-            Err(err) => {
+        if preallocate_keep {
+            if let Err(err) = write_keep_marker_durable(stage_dir_fd.as_raw_fd(), true) {
                 let _ = fs::remove_dir_all(&stage_dir_path);
                 return Err(format!("Failed pre-allocating staging keep marker: {err}"));
             }
-        };
+        }
 
         let clean_ext = ext.trim_start_matches('.');
         let staged_name = format!("staged.{clean_ext}");
@@ -173,7 +183,7 @@ impl ExclusiveStagingDir {
         Ok(Self {
             stage_dir_path,
             stage_dir_fd,
-            keep_marker_fd,
+            keep_marker_preallocated: preallocate_keep,
             staged_name_c,
             staged_file,
             dest_dir_fd,
@@ -430,52 +440,35 @@ impl ExclusiveStagingDir {
         ))
     }
 
-    /// Flips pre-opened `.qsr-keep` to `b"1"` (0 new FDs/dir writes, retrying EINTR) and disarms drop cleanup.
-    pub fn retain_staged_in_place(&mut self) -> PathBuf {
+    /// Disarms drop cleanup and guarantees `.qsr-keep = "1"` is persisted. Infallible for
+    /// recording staging (`create_for_recording`, where `.qsr-keep` was already durably synced at
+    /// creation time); propagates marker write errors explicitly for non-preallocated staging.
+    pub fn try_retain_staged_in_place(&mut self) -> Result<PathBuf, (String, PathBuf)> {
         let _ = fs::set_permissions(&self.staged_file, fs::Permissions::from_mode(0o600));
-        while unsafe { libc::pwrite(self.keep_marker_fd.as_raw_fd(), b"1".as_ptr().cast(), 1, 0) }
-            < 0
-            && io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
-        {}
         self.keep_staged_on_drop = true;
-        self.staged_file.clone()
+        if self.keep_marker_preallocated {
+            return Ok(self.staged_file.clone());
+        }
+        match write_keep_marker_durable(self.stage_dir_fd.as_raw_fd(), false) {
+            Ok(()) => Ok(self.staged_file.clone()),
+            Err(err) => Err((
+                format!("Failed persisting .qsr-keep marker: {err}"),
+                self.staged_file.clone(),
+            )),
+        }
     }
 
-    /// Disarms drop cleanup, marks `.qsr-keep`, and renames `.qsr-work-*` -> `qsr-preserved-*`.
+    /// Disarms drop cleanup while keeping the staging directory in place.
+    pub fn retain_staged_in_place(&mut self) -> PathBuf {
+        match self.try_retain_staged_in_place() {
+            Ok(path) | Err((_, path)) => path,
+        }
+    }
+
+    /// Disarms drop cleanup, ensures `.qsr-keep`, and renames `.qsr-work-*` -> `qsr-preserved-*`.
     pub fn retain_staged_file(&mut self) -> PathBuf {
         self.retain_staged_in_place();
-        if let (Some(parent), Some(old_name), Some(file_name)) = (
-            self.stage_dir_path.parent(),
-            self.stage_dir_path.file_name().and_then(|s| s.to_str()),
-            self.staged_file.file_name(),
-        ) {
-            if let Some(suffix) = old_name.strip_prefix(".qsr-work-") {
-                let preserved_dir = parent.join(format!("qsr-preserved-{suffix}"));
-                if let (Ok(parent_fd), Ok(old_c), Ok(new_c)) = (
-                    OpenOptions::new()
-                        .read(true)
-                        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                        .open(parent),
-                    CString::new(old_name.as_bytes()),
-                    CString::new(format!("qsr-preserved-{suffix}").as_bytes()),
-                ) {
-                    let rc = unsafe {
-                        libc::renameatx_np(
-                            parent_fd.as_raw_fd(),
-                            old_c.as_ptr(),
-                            parent_fd.as_raw_fd(),
-                            new_c.as_ptr(),
-                            libc::RENAME_EXCL,
-                        )
-                    };
-                    if rc == 0 {
-                        let new_staged = preserved_dir.join(file_name);
-                        self.stage_dir_path = preserved_dir;
-                        self.staged_file = new_staged;
-                    }
-                }
-            }
-        }
+        rename_work_dir_to_preserved(&mut self.stage_dir_path, &mut self.staged_file);
         self.staged_file.clone()
     }
 }

@@ -97,7 +97,7 @@ impl RecordingSession {
         if let Some(msg) = check_interrupted() {
             return Err(msg);
         }
-        let staging = ExclusiveStagingDir::create_for_target(output_path, "mp4")?;
+        let staging = ExclusiveStagingDir::create_for_recording(output_path, "mp4")?;
 
         let snapshot = query_shareable_content_for_capture()?;
         if let Some(msg) = check_interrupted() {

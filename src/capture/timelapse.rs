@@ -74,7 +74,7 @@ impl TimelapseSession {
             .cadence
             .timelapse_interval_secs()
             .ok_or("TimelapseSession requires a timelapse CaptureCadence")?;
-        let staging = ExclusiveStagingDir::create_for_target(output_path, "mp4")?;
+        let staging = ExclusiveStagingDir::create_for_recording(output_path, "mp4")?;
         let out_path = output_path.to_path_buf();
         let cfg = config.clone();
 

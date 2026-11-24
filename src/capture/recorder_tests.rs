@@ -323,7 +323,7 @@ fn unconfirmed_stop_handoff_retains_staging_on_disk_after_finish_timeout() {
     ));
     std::fs::create_dir_all(&dir).expect("create temp test dir");
     let target = dir.join("capture.mp4");
-    let mut staging = ExclusiveStagingDir::create_for_target(&target, "mp4").expect("staging");
+    let mut staging = ExclusiveStagingDir::create_for_recording(&target, "mp4").expect("staging");
     let staged_path = staging.staged_file().to_path_buf();
     let stage_dir = staged_path.parent().expect("stage dir").to_path_buf();
     std::fs::write(&staged_path, b"in-progress-unflushed-bytes").expect("write staged bytes");
@@ -443,7 +443,8 @@ fn delayed_finish_timeout_retains_staging_even_when_stream_stop_confirmed() {
     let target = dest_dir.join("delayed.mp4");
 
     let mut staging =
-        ExclusiveStagingDir::create_in_cache_root(&cache_dir, &target, "mp4", false).expect("stg");
+        ExclusiveStagingDir::create_in_cache_root(&cache_dir, &target, "mp4", false, true)
+            .expect("stg");
     let staged_path = staging.staged_file().to_path_buf();
     std::fs::write(&staged_path, b"unflushed-moov-pending").expect("write partial");
 

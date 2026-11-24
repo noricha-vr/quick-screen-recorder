@@ -454,8 +454,9 @@ fn timelapse_deferred_commit_preserves_on_late_quit_even_after_double_failure() 
     fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)).expect("chmod cache");
     let gui_target = cache_dir.join("capture-gui-tl.mp4");
 
-    let staging = ExclusiveStagingDir::create_in_cache_root(&cache_dir, &gui_target, "mp4", false)
-        .expect("staging");
+    let staging =
+        ExclusiveStagingDir::create_in_cache_root(&cache_dir, &gui_target, "mp4", false, true)
+            .expect("staging");
     fs::write(staging.staged_file(), b"encoded-timelapse-bytes").expect("write mp4");
 
     // Worker has ALREADY finished encoding and sent `ReadyToCommit` BEFORE user clicks Quit!
