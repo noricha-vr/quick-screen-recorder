@@ -2,20 +2,20 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use objc2::rc::Retained;
-use objc2::runtime::AnyObject;
-use objc2::{MainThreadMarker, MainThreadOnly, define_class, msg_send};
+use objc2::{MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAppearance, NSAppearanceCustomization, NSAppearanceNameDarkAqua, NSBackingStoreType, NSColor,
+    NSAppearance, NSAppearanceCustomization, NSAppearanceNameDarkAqua, NSButton, NSColor,
     NSFloatingWindowLevel, NSFont, NSPopUpButton, NSScreen, NSStatusWindowLevel, NSTextField,
-    NSView, NSWindow, NSWindowStyleMask,
+    NSView, NSWindow,
 };
-use objc2_foundation::{NSNumber, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
 use crate::capture::audio_devices::{
     MicDeviceInfo, MicMenuItem, build_mic_menu_model, list_microphone_devices,
 };
+use crate::capture::cadence::{CadenceMenuItem, build_cadence_menu_model};
 use crate::capture::shareable::{DisplayInfo, WindowInfo};
-use crate::capture::{CaptureConfig, MicInputPreference};
+use crate::capture::{CaptureCadence, CaptureConfig, MicInputPreference};
 use crate::config::Preferences;
 use crate::fs_safety::sanitize_terminal_text;
 use crate::geometry::{
@@ -26,6 +26,9 @@ use crate::ui::overlay_actions::build_toolbar_actions;
 use crate::ui::overlay_canvas::{CanvasIvars, OverlayCanvasView};
 use crate::ui::overlay_toolbar::{
     OverlayToolbarActions, TOOLBAR_H, TOOLBAR_W, populate_toolbar_controls,
+};
+pub use crate::ui::overlay_window::{
+    KeyableOverlayWindow, extract_nsscreen_display_id, nsrect_to_rect,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +57,8 @@ pub struct OverlayState {
     pub screen_display_id: u32,
     pub scale_factor: f64,
     pub aspect: AspectRatio,
-    pub fps: u32,
+    pub cadence: CaptureCadence,
+    pub cadence_items: Vec<CadenceMenuItem>,
     pub show_cursor: bool,
     pub highlight_clicks: bool,
     pub capture_system_audio: bool,
@@ -128,42 +132,6 @@ impl OverlayState {
         } else {
             false
         }
-    }
-}
-
-define_class!(
-    #[unsafe(super(NSWindow))]
-    #[thread_kind = MainThreadOnly]
-    #[name = "QSRKeyableOverlayWindow"]
-    pub struct KeyableOverlayWindow;
-
-    unsafe impl NSObjectProtocol for KeyableOverlayWindow {}
-
-    impl KeyableOverlayWindow {
-        #[unsafe(method(canBecomeKeyWindow))]
-        fn can_become_key(&self) -> bool {
-            true
-        }
-
-        #[unsafe(method(canBecomeMainWindow))]
-        fn can_become_main(&self) -> bool {
-            true
-        }
-    }
-);
-
-impl KeyableOverlayWindow {
-    pub fn new_borderless(mtm: MainThreadMarker, frame: NSRect, defer: bool) -> Retained<NSWindow> {
-        let win: Retained<Self> = unsafe {
-            msg_send![
-                Self::alloc(mtm),
-                initWithContentRect: frame,
-                styleMask: NSWindowStyleMask::Borderless,
-                backing: NSBackingStoreType::Buffered,
-                defer: defer
-            ]
-        };
-        Retained::into_super(win)
     }
 }
 
@@ -245,6 +213,11 @@ impl SelectorOverlay {
             .get(selected_mic_idx)
             .map(MicMenuItem::to_preference)
             .unwrap_or_default();
+        let (cadence_items, selected_cadence_idx) = build_cadence_menu_model(prefs.capture_cadence);
+        let initial_cadence = match cadence_items.get(selected_cadence_idx) {
+            Some(CadenceMenuItem::Option { cadence, .. }) => *cadence,
+            _ => prefs.capture_cadence.normalized(),
+        };
 
         let state = Rc::new(RefCell::new(OverlayState {
             mode: SelectionMode::Area,
@@ -256,7 +229,8 @@ impl SelectorOverlay {
             screen_display_id: matched_display_id,
             scale_factor,
             aspect: prefs.aspect_ratio,
-            fps: if prefs.fps >= 60 { 60 } else { 30 },
+            cadence: initial_cadence,
+            cadence_items: cadence_items.clone(),
             show_cursor: prefs.show_cursor,
             highlight_clicks: prefs.highlight_clicks,
             capture_system_audio: prefs.capture_system_audio,
@@ -409,6 +383,16 @@ impl SelectorOverlay {
         canvas_window.setContentView(Some(&canvas_view));
         let _ = canvas_window.makeFirstResponder(Some(&canvas_view));
 
+        let sys_audio_chk = unsafe {
+            NSButton::checkboxWithTitle_target_action(
+                &NSString::from_str("System Audio"),
+                None,
+                None,
+                mtm,
+            )
+        };
+        let mic_popup = NSPopUpButton::new(mtm);
+
         let canvas_nsview: Retained<NSView> = Retained::into_super(canvas_view.clone());
         let actions = build_toolbar_actions(
             mtm,
@@ -421,6 +405,8 @@ impl SelectorOverlay {
             &x_lbl,
             &h_field,
             &target_popup,
+            &sys_audio_chk,
+            &mic_popup,
             &sync_fields,
             prefs,
             on_start,
@@ -436,8 +422,12 @@ impl SelectorOverlay {
             &x_lbl,
             &h_field,
             &target_popup,
+            &sys_audio_chk,
+            &mic_popup,
             &mic_items,
             selected_mic_idx,
+            &cadence_items,
+            selected_cadence_idx,
             prefs,
         );
 
@@ -471,17 +461,4 @@ impl SelectorOverlay {
         self.toolbar_window.close();
         self.canvas_window.close();
     }
-}
-
-pub fn nsrect_to_rect(r: NSRect) -> Rect {
-    Rect::new(r.origin.x, r.origin.y, r.size.width, r.size.height)
-}
-
-pub fn extract_nsscreen_display_id(screen: &NSScreen) -> Option<u32> {
-    let desc = screen.deviceDescription();
-    let key = NSString::from_str("NSScreenNumber");
-    let val: Option<Retained<AnyObject>> = desc.objectForKey(&key);
-    let obj = val?;
-    let num: &NSNumber = unsafe { &*(Retained::as_ptr(&obj) as *const NSNumber) };
-    Some(num.unsignedIntValue())
 }

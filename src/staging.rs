@@ -1,15 +1,43 @@
 use std::ffi::CString;
-use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::fs::{self, DirBuilder, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use crate::config::APP_SUPPORT_DIR_NAME;
+use crate::export_name::sanitize_export_stem;
 use crate::fs_safety::{
-    clear_fd_extended_acl, has_only_safe_acls, is_usable_export_dir, private_cache_dir,
-    random_hex_token, verify_pre_canonical_target_parent,
+    clear_fd_extended_acl, ensure_private_dir, has_only_safe_acls, is_usable_export_dir,
+    private_cache_dir, random_hex_token, valid_home_dir, verify_pre_canonical_target_parent,
 };
+
+#[path = "staging_io.rs"]
+mod io_helpers;
+
+pub use io_helpers::preserve_recording_on_quit;
+use io_helpers::{
+    XdevTempGuard, copy_into_pinned_dir_overwrite, fstatat_overwrite_mode, rename_excl_within_dir,
+    stage_once_on_dest_volume,
+};
+
+/// Returns a private (`0700`, non-auto-pruned) local recovery directory inside Application Support
+/// so finished recordings are never lost if a removable/network destination disconnects mid-capture.
+pub fn private_recovery_dir() -> Result<PathBuf, String> {
+    let base = if let Some(home) = valid_home_dir() {
+        let app_support = home
+            .join("Library")
+            .join("Application Support")
+            .join(APP_SUPPORT_DIR_NAME);
+        ensure_private_dir(&app_support)?;
+        app_support.join("Recovered")
+    } else {
+        private_cache_dir()?.join("Recovered")
+    };
+    ensure_private_dir(&base)?;
+    Ok(base)
+}
 
 /// Exclusively created (`0700`) staging directory inside our private cache directory, paired with
 /// a pinned `O_DIRECTORY | O_NOFOLLOW` descriptor for the verified destination directory.
@@ -23,6 +51,7 @@ pub struct ExclusiveStagingDir {
     dest_parent_dev: u64,
     dest_parent_ino: u64,
     canon_dest: PathBuf,
+    keep_staged_on_drop: bool,
 }
 
 impl ExclusiveStagingDir {
@@ -145,6 +174,7 @@ impl ExclusiveStagingDir {
             dest_parent_dev,
             dest_parent_ino,
             canon_dest,
+            keep_staged_on_drop: false,
         })
     }
 
@@ -307,186 +337,160 @@ impl ExclusiveStagingDir {
             _ => Err(format!("Atomic exclusive rename failed: {err}")),
         }
     }
+
+    /// Preserves a completed staged file into a verified private local recovery directory (`0700`
+    /// dir, `0600` file, `O_NOFOLLOW`, `RENAME_EXCL`) when committing to the original destination
+    /// fails (for example, an external drive disconnected during a multi-hour timelapse).
+    pub fn preserve_to_recovery_dir(&self, recovery_dir: &Path) -> Result<(PathBuf, u64), String> {
+        let euid = unsafe { libc::geteuid() };
+        let staged_meta = fs::symlink_metadata(&self.staged_file)
+            .map_err(|e| format!("Staged output file missing: {e}"))?;
+        if staged_meta.file_type().is_symlink()
+            || !staged_meta.is_file()
+            || staged_meta.uid() != euid
+            || staged_meta.len() == 0
+        {
+            return Err("Staged output file is empty or invalid".to_string());
+        }
+
+        ensure_private_dir(recovery_dir)?;
+        let canon_rec = fs::canonicalize(recovery_dir)
+            .map_err(|e| format!("Failed resolving recovery directory: {e}"))?;
+        let rec_dir_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&canon_rec)
+            .map_err(|e| format!("Failed pinning recovery directory descriptor: {e}"))?;
+        let rec_meta = rec_dir_file
+            .metadata()
+            .map_err(|e| format!("Failed inspecting recovery directory: {e}"))?;
+        if !rec_meta.is_dir()
+            || rec_meta.uid() != euid
+            || (rec_meta.permissions().mode() & 0o077 != 0)
+        {
+            return Err("Recovery directory failed 0700 ownership check".to_string());
+        }
+
+        fs::set_permissions(&self.staged_file, fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("Failed setting 0600 permissions on recovered file: {e}"))?;
+
+        let ext = self
+            .canon_dest
+            .extension()
+            .and_then(|e| e.to_str())
+            .filter(|e| !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric()))
+            .unwrap_or("mp4");
+        let raw_stem = self
+            .canon_dest
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("recording");
+        let stem = sanitize_export_stem(raw_stem, ext, "recording");
+        let rec_name = format!("{stem}-recovered-{}.{ext}", &random_hex_token()[..12]);
+        let rec_name_c = CString::new(rec_name.as_bytes()).map_err(|_| "Invalid recovery name")?;
+
+        let rc = unsafe {
+            libc::renameatx_np(
+                self.stage_dir_fd.as_raw_fd(),
+                self.staged_name_c.as_ptr(),
+                rec_dir_file.as_raw_fd(),
+                rec_name_c.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        };
+        if rc == 0 {
+            return Ok((canon_rec.join(rec_name), staged_meta.len()));
+        }
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EXDEV) {
+            let tmp_c = stage_once_on_dest_volume(&self.staged_file, rec_dir_file.as_raw_fd())?;
+            let mut guard = XdevTempGuard {
+                dir_fd: rec_dir_file.as_raw_fd(),
+                name_c: Some(tmp_c),
+            };
+            let published = rename_excl_within_dir(
+                rec_dir_file.as_raw_fd(),
+                guard.name_c.as_ref().unwrap(),
+                &rec_name_c,
+            )?;
+            if published {
+                guard.name_c = None;
+                return Ok((canon_rec.join(rec_name), staged_meta.len()));
+            }
+            return Err("Recovery filename unexpectedly collided".to_string());
+        }
+        Err(format!(
+            "Failed moving staged file to recovery directory: {err}"
+        ))
+    }
+
+    /// Disarms automatic cleanup on drop AND exempts the preserved staging directory from
+    /// 24-hour startup cache pruning by writing a `.qsr-keep` marker via `stage_dir_fd` and
+    /// renaming `.qsr-work-*` to `qsr-preserved-*` inside our private `0700` cache directory.
+    pub fn retain_staged_file(&mut self) -> PathBuf {
+        let _ = fs::set_permissions(&self.staged_file, fs::Permissions::from_mode(0o600));
+        // Create `.qsr-keep` via pinned `stage_dir_fd` so startup pruning skips this directory
+        // even if renaming the parent entry fails.
+        let marker_fd = unsafe {
+            libc::openat(
+                self.stage_dir_fd.as_raw_fd(),
+                c".qsr-keep".as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600_u32,
+            )
+        };
+        if marker_fd >= 0 {
+            unsafe {
+                libc::close(marker_fd);
+            }
+        }
+        self.keep_staged_on_drop = true;
+
+        // Also rename `.qsr-work-*` -> `qsr-preserved-*` so it is permanently outside prune globs.
+        if let (Some(parent), Some(old_name), Some(file_name)) = (
+            self.stage_dir_path.parent(),
+            self.stage_dir_path.file_name().and_then(|s| s.to_str()),
+            self.staged_file.file_name(),
+        ) {
+            if let Some(suffix) = old_name.strip_prefix(".qsr-work-") {
+                let preserved_dir = parent.join(format!("qsr-preserved-{suffix}"));
+                if let (Ok(parent_fd), Ok(old_c), Ok(new_c)) = (
+                    OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                        .open(parent),
+                    CString::new(old_name.as_bytes()),
+                    CString::new(format!("qsr-preserved-{suffix}").as_bytes()),
+                ) {
+                    let rc = unsafe {
+                        libc::renameatx_np(
+                            parent_fd.as_raw_fd(),
+                            old_c.as_ptr(),
+                            parent_fd.as_raw_fd(),
+                            new_c.as_ptr(),
+                            libc::RENAME_EXCL,
+                        )
+                    };
+                    if rc == 0 {
+                        let new_staged = preserved_dir.join(file_name);
+                        self.stage_dir_path = preserved_dir;
+                        self.staged_file = new_staged;
+                    }
+                }
+            }
+        }
+        self.staged_file.clone()
+    }
 }
 
 impl Drop for ExclusiveStagingDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.stage_dir_path);
-    }
-}
-
-fn fstatat_overwrite_mode(dir_fd: libc::c_int, name_c: &CString, euid: u32) -> Result<u32, String> {
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::fstatat(dir_fd, name_c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
-    if rc == 0 {
-        let ftype = st.st_mode & libc::S_IFMT;
-        if ftype != libc::S_IFREG || st.st_uid != euid {
-            return Err(
-                "Refusing to overwrite symlink, non-regular file, or file owned by another user"
-                    .to_string(),
-            );
-        }
-        Ok(u32::from(st.st_mode) & 0o777)
-    } else {
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::ENOENT) {
-            Ok(0o600)
-        } else {
-            Err(format!("Failed inspecting destination entry: {err}"))
+        if !self.keep_staged_on_drop {
+            let _ = fs::remove_dir_all(&self.stage_dir_path);
         }
     }
 }
 
-fn stage_once_on_dest_volume(staged: &Path, dest_dir_fd: libc::c_int) -> Result<CString, String> {
-    let tmp_name = format!(".qsr-xdev-{}", random_hex_token());
-    let tmp_c = CString::new(tmp_name.as_bytes()).unwrap();
-    let mut src = File::open(staged).map_err(|e| format!("Failed opening staged file: {e}"))?;
-    let fd = unsafe {
-        libc::openat(
-            dest_dir_fd,
-            tmp_c.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600_u32,
-        )
-    };
-    if fd < 0 {
-        return Err(format!(
-            "Failed creating cross-volume staging file: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    if let Err(e) = clear_fd_extended_acl(fd) {
-        unsafe {
-            libc::close(fd);
-            libc::unlinkat(dest_dir_fd, tmp_c.as_ptr(), 0);
-        }
-        return Err(e);
-    }
-    if unsafe { libc::fchmod(fd, 0o600 as libc::mode_t) } != 0 {
-        let err = io::Error::last_os_error();
-        unsafe {
-            libc::close(fd);
-            libc::unlinkat(dest_dir_fd, tmp_c.as_ptr(), 0);
-        }
-        return Err(format!(
-            "Failed setting 0600 permissions on cross-volume staging file: {err}"
-        ));
-    }
-    let mut out_file = unsafe { File::from_owned_fd_compat(fd) };
-    if let Err(e) = io::copy(&mut src, &mut out_file).and_then(|_| out_file.sync_all()) {
-        drop(out_file);
-        unsafe { libc::unlinkat(dest_dir_fd, tmp_c.as_ptr(), 0) };
-        return Err(format!("Failed writing cross-volume output file: {e}"));
-    }
-    Ok(tmp_c)
-}
-
-fn rename_excl_within_dir(
-    dir_fd: libc::c_int,
-    tmp_c: &CString,
-    name_c: &CString,
-) -> Result<bool, String> {
-    let rc = unsafe {
-        libc::renameatx_np(
-            dir_fd,
-            tmp_c.as_ptr(),
-            dir_fd,
-            name_c.as_ptr(),
-            libc::RENAME_EXCL,
-        )
-    };
-    if rc == 0 {
-        return Ok(true);
-    }
-    let err = io::Error::last_os_error();
-    if matches!(
-        err.raw_os_error(),
-        Some(libc::EEXIST | libc::EISDIR | libc::ENOTEMPTY)
-    ) {
-        Ok(false)
-    } else {
-        Err(format!("Failed publishing cross-volume output file: {err}"))
-    }
-}
-
-struct XdevTempGuard {
-    dir_fd: libc::c_int,
-    name_c: Option<CString>,
-}
-
-impl Drop for XdevTempGuard {
-    fn drop(&mut self) {
-        if let Some(ref tmp_c) = self.name_c {
-            unsafe {
-                libc::unlinkat(self.dir_fd, tmp_c.as_ptr(), 0);
-            }
-        }
-    }
-}
-
-fn copy_into_pinned_dir_overwrite(
-    staged: &Path,
-    dest_dir_fd: libc::c_int,
-    name_c: &CString,
-    mode: u32,
-) -> Result<(), String> {
-    let tmp_name = format!(".qsr-xdev-{}", random_hex_token());
-    let tmp_c = CString::new(tmp_name.as_bytes()).unwrap();
-    let mut src = File::open(staged).map_err(|e| format!("Failed opening staged file: {e}"))?;
-    let fd = unsafe {
-        libc::openat(
-            dest_dir_fd,
-            tmp_c.as_ptr(),
-            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            mode,
-        )
-    };
-    if fd < 0 {
-        return Err(format!(
-            "Failed creating cross-volume temp file: {}",
-            io::Error::last_os_error()
-        ));
-    }
-    if let Err(e) = clear_fd_extended_acl(fd) {
-        unsafe {
-            libc::close(fd);
-            libc::unlinkat(dest_dir_fd, tmp_c.as_ptr(), 0);
-        }
-        return Err(e);
-    }
-    if unsafe { libc::fchmod(fd, mode as libc::mode_t) } != 0 {
-        let err = io::Error::last_os_error();
-        unsafe {
-            libc::close(fd);
-            libc::unlinkat(dest_dir_fd, tmp_c.as_ptr(), 0);
-        }
-        return Err(format!(
-            "Failed preserving permissions on cross-volume file: {err}"
-        ));
-    }
-    let mut out_file = unsafe { File::from_owned_fd_compat(fd) };
-    if let Err(e) = io::copy(&mut src, &mut out_file).and_then(|_| out_file.sync_all()) {
-        drop(out_file);
-        unsafe { libc::unlinkat(dest_dir_fd, tmp_c.as_ptr(), 0) };
-        return Err(format!("Failed copying cross-volume output file: {e}"));
-    }
-    drop(out_file);
-    let rc = unsafe { libc::renameat(dest_dir_fd, tmp_c.as_ptr(), dest_dir_fd, name_c.as_ptr()) };
-    if rc != 0 {
-        let err = io::Error::last_os_error();
-        unsafe { libc::unlinkat(dest_dir_fd, tmp_c.as_ptr(), 0) };
-        return Err(format!("Failed committing cross-volume output file: {err}"));
-    }
-    Ok(())
-}
-
-trait FromRawFdCompat {
-    unsafe fn from_owned_fd_compat(fd: libc::c_int) -> Self;
-}
-
-impl FromRawFdCompat for File {
-    unsafe fn from_owned_fd_compat(fd: libc::c_int) -> Self {
-        use std::os::fd::FromRawFd;
-        unsafe { Self::from_raw_fd(fd) }
-    }
-}
+#[cfg(test)]
+#[path = "staging_tests.rs"]
+mod tests;

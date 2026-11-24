@@ -27,7 +27,8 @@ Unlike Electron-based recorders that keep a full Chromium runtime resident in me
   - **Window mode**: Hover and click any on-screen window to switch the capture target on the fly (overlapping windows are excluded automatically during capture).
   - **Screen mode**: Full-display capture across multi-monitor setups.
   - **Split Audio Controls (Persisted)**: Independent **System Audio** toggle (ON by default) and **Mic** input device dropdown (`Off`, `System (<default mic>)` ON by default, or any specific connected microphone), automatically remembered across launches. Microphone access is requested natively on demand when recording with a mic.
-  - Toggle **FPS** (`30` / `60`), **cursor visibility**, and **native click highlights** right from the floating bar.
+  - **Flexible Frame Rates & Interval Timelapse**: Choose real-time capture from **`60 / 30 / 15 / 5 / 1 fps`** (with full audio support and matching default FPS in the Trim & Export editor so low-FPS recordings stay tiny via instant passthrough), or switch to **Interval Timelapse** (**`1f/5s · TL`**, **`1f/10s · TL`**, **`1f/30s · TL`**, **`1f/1m · TL`**) for near-zero idle CPU multi-hour recording automatically assembled into a smooth **30 fps** fast-forward MP4 (audio auto-muted, menu bar shows `● TL MM:SS · Nf`).
+  - Toggle **cursor visibility** and **native click highlights** right from the floating bar.
 - **Instant Trim & Multi-Format Export Editor**
   - **Dual-bracket `IN` / `OUT` timeline**: Drag rectangular start/end trim brackets or scrub the playhead with live hardware-decoded frame preview.
   - **One-Click `Mute audio` on Export**: Strip audio tracks cleanly from MP4 / HEVC / WebM / AV1 exports (also available in CLI via `convert --mute`) when you captured audio by default and want a silent clip.
@@ -69,7 +70,7 @@ On first launch, the **Quick Start** window checks **Screen & System Audio Recor
 
 1. Launch `QuickScreenRecorder.app` (or run `cargo run --release`). On first launch, follow the **Quick Start** window (or reopen it anytime from **`◉ Rec` → `Quick Start Guide...`**).
 2. Click **`◉ Rec` → `New Recording...`** or press **`Cmd + Shift + 6`** anywhere to open the selection overlay (`Esc` cancels).
-3. Choose **Area**, **Window**, or **Screen**, adjust aspect ratio / dimensions / FPS (`30` or `60`) / audio / cursor / click highlights, and click **`● Record`**.
+3. Choose **Area**, **Window**, or **Screen**, adjust aspect ratio / dimensions / frame rate (`60`–`1 fps` real-time or `1f/5s`–`1f/1m` timelapse) / audio / cursor / click highlights, and click **`● Record`**.
 4. During recording, the menu bar displays elapsed time (`● 00:08`). Click **`Stop Recording`** in the menu bar or press **`Cmd + Shift + 6`** again to finish.
 5. In the **Trim & Export** window, drag the **`IN` / `OUT`** trim brackets if needed, pick your format (**MP4**, **HEVC**, **GIF**, **APNG**, **WebM**, **AV1**), resolution preset, **`Save to`** folder (defaults to `~/Movies/Quick Screen Recorder`, also configurable from **`◉ Rec` → `Save Folder`**), and optionally customize the **`Name`** field (pre-filled with `YYYY-MM-DD_HH-MM-SS_Quick-Screen-Recorder` + window app name when capturing a window), then click **`Copy`** or **`Save`**.
 
@@ -87,8 +88,11 @@ quick-screen-recorder --select
 # Open an existing video in the Trim & Export editor
 quick-screen-recorder --edit ./demo.mp4
 
-# Headless timed capture (e.g. 5s of a 1280x720 region at 60fps)
+# Headless timed capture (e.g. 5s of a 1280x720 region at 60fps, or 1 fps low-bandwidth)
 quick-screen-recorder record --output ./capture.mp4 --duration 5 --region 100,100,1280,720 --fps 60
+
+# Headless interval timelapse (e.g. 1 frame every 60s for 1 hour -> smooth 30fps MP4)
+quick-screen-recorder record --output ./timelapse.mp4 --duration 3600 --interval 60
 
 # Fast format conversion & trimming (e.g. MP4 -> optimized 30fps GIF, max width 800px; add --mute to strip audio)
 quick-screen-recorder convert --input ./capture.mp4 --output ./clip.gif --format gif --fps 30 --start 0.5 --end 4.0 --max-width 800

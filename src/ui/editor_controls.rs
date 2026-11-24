@@ -8,6 +8,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
+use crate::capture::cadence::closest_editor_fps_preset;
 use crate::config::Preferences;
 use crate::export::ExportFormat;
 use crate::export::avfoundation::extract_rgba_frame;
@@ -49,6 +50,7 @@ pub fn build_editor_controls(
     initial_export_dir: Option<&Path>,
     default_stem: &str,
     has_audio: bool,
+    source_nominal_fps: f32,
     demo_showcase: bool,
     tutorial_hint: bool,
 ) -> EditorControls {
@@ -66,7 +68,7 @@ pub fn build_editor_controls(
     root.addSubview(&divider);
 
     let (format_popup, initial_fmt) = build_format_popup(mtm, root, prefs, demo_showcase);
-    let (fps_popup, initial_fps) = build_fps_popup(mtm, root, initial_fmt);
+    let (fps_popup, initial_fps) = build_fps_popup(mtm, root, initial_fmt, source_nominal_fps);
     let (size_popup, initial_max_width) = build_size_popup(mtm, root, prefs);
 
     let save_to_lbl = NSTextField::labelWithString(&NSString::from_str("Save to"), mtm);
@@ -207,20 +209,18 @@ fn build_fps_popup(
     mtm: MainThreadMarker,
     root: &NSView,
     initial_fmt: ExportFormat,
+    source_nominal_fps: f32,
 ) -> (Retained<NSPopUpButton>, u32) {
     let fps_popup = NSPopUpButton::new(mtm);
     for fps in FPS_PRESETS {
         fps_popup.addItemWithTitle(&NSString::from_str(&format!("{fps} fps")));
     }
-    let initial_fps = if matches!(initial_fmt, ExportFormat::Gif | ExportFormat::Apng) {
-        30
-    } else {
-        60
-    };
+    let is_anim = matches!(initial_fmt, ExportFormat::Gif | ExportFormat::Apng);
+    let initial_fps = closest_editor_fps_preset(source_nominal_fps, is_anim);
     let fps_idx = FPS_PRESETS
         .iter()
         .position(|&f| f == initial_fps)
-        .unwrap_or(1);
+        .unwrap_or(FPS_PRESETS.len() - 1);
     fps_popup.selectItemAtIndex(fps_idx as isize);
     fps_popup.setFrame(NSRect::new(
         NSPoint::new(180.0, 130.0),

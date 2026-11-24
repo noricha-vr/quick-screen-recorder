@@ -3,9 +3,10 @@ use std::rc::Rc;
 
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
-use objc2_app_kit::{NSPopUpButton, NSScreen, NSTextField, NSView, NSWindow};
+use objc2_app_kit::{NSButton, NSPopUpButton, NSScreen, NSTextField, NSView, NSWindow};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 
+use crate::capture::cadence::CadenceMenuItem;
 use crate::capture::{AudioCaptureMode, CaptureConfig, CaptureTarget};
 use crate::config::Preferences;
 use crate::geometry::{AspectRatio, Rect, apply_aspect_to_rect, compute_toolbar_origin};
@@ -28,6 +29,8 @@ pub fn build_toolbar_actions(
     x_lbl: &Retained<NSTextField>,
     h_field: &Retained<NSTextField>,
     target_popup: &Retained<NSPopUpButton>,
+    sys_audio_chk: &Retained<NSButton>,
+    mic_popup: &Retained<NSPopUpButton>,
     sync_fields: &Rc<dyn Fn()>,
     prefs: &Preferences,
     on_start: StartCaptureCallback,
@@ -64,6 +67,8 @@ pub fn build_toolbar_actions(
     let sf_pick = Rc::clone(sync_fields);
 
     let st_fps = Rc::clone(state);
+    let sys_chk_fps = sys_audio_chk.clone();
+    let mic_pop_fps = mic_popup.clone();
     let st_sys_audio = Rc::clone(state);
     let st_mic = Rc::clone(state);
     let st_cursor = Rc::clone(state);
@@ -213,7 +218,18 @@ pub fn build_toolbar_actions(
                 }
             }),
             on_fps: Box::new(move |idx| {
-                st_fps.borrow_mut().fps = if idx == 0 { 30 } else { 60 };
+                if idx < 0 {
+                    return;
+                }
+                let mut st = st_fps.borrow_mut();
+                if let Some(CadenceMenuItem::Option { cadence, .. }) =
+                    st.cadence_items.get(idx as usize).cloned()
+                {
+                    st.cadence = cadence;
+                    let audio_allowed = !cadence.is_timelapse();
+                    sys_chk_fps.setEnabled(audio_allowed);
+                    mic_pop_fps.setEnabled(audio_allowed);
+                }
             }),
             on_sys_audio: Box::new(move |on| {
                 st_sys_audio.borrow_mut().capture_system_audio = on;
@@ -267,29 +283,37 @@ pub fn build_toolbar_actions(
                         None,
                     ),
                 };
-                let audio_mode = AudioCaptureMode::from_split(
+                let raw_audio_mode = AudioCaptureMode::from_split(
                     st.capture_system_audio,
                     st.mic_input.is_enabled(),
                 );
-                let microphone_device_id = st.mic_input.explicit_device_id().map(ToOwned::to_owned);
+                let effective_audio_mode = st.cadence.effective_audio_mode(raw_audio_mode);
+                let microphone_device_id = if effective_audio_mode.captures_mic() {
+                    st.mic_input.explicit_device_id().map(ToOwned::to_owned)
+                } else {
+                    None
+                };
                 let mut updated = base_prefs.clone();
-                updated.fps = st.fps;
+                if let Some(rt_fps) = st.cadence.realtime_fps() {
+                    updated.fps = rt_fps;
+                }
+                updated.capture_cadence = st.cadence;
                 updated.show_cursor = st.show_cursor;
                 updated.highlight_clicks = st.highlight_clicks;
                 updated.capture_system_audio = st.capture_system_audio;
                 updated.mic_input = st.mic_input.clone();
-                updated.audio_mode = audio_mode;
+                updated.audio_mode = raw_audio_mode;
                 updated.aspect_ratio = st.aspect;
                 if st.mode == SelectionMode::Area {
                     updated.last_region = st.selection;
                 }
                 let cfg = CaptureConfig {
                     target,
-                    fps: st.fps,
+                    cadence: st.cadence,
                     codec: updated.recording_codec,
                     show_cursor: st.show_cursor,
                     highlight_clicks: st.highlight_clicks,
-                    audio_mode,
+                    audio_mode: effective_audio_mode,
                     microphone_device_id,
                     excluded_window_ids: vec![cwin_num, twin_num],
                     source_app_name,

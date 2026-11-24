@@ -175,6 +175,7 @@ impl EditorWindow {
             initial_export_dir.as_deref(),
             &default_stem,
             meta.has_audio,
+            meta.nominal_fps,
             demo_showcase,
             tutorial_hint,
         );
@@ -266,7 +267,9 @@ impl EditorWindow {
                     ext_lbl_f.setStringValue(&NSString::from_str(&format!(".{}", fmt.extension())));
                     if matches!(fmt, ExportFormat::Gif | ExportFormat::Apng) && st.fps > 30 {
                         st.fps = 30;
-                        fps_pop_f.selectItemAtIndex(1);
+                        if let Some(idx30) = FPS_PRESETS.iter().position(|&f| f == 30) {
+                            fps_pop_f.selectItemAtIndex(idx30 as isize);
+                        }
                     }
                     let can_mute =
                         st.meta.has_audio && !matches!(fmt, ExportFormat::Gif | ExportFormat::Apng);

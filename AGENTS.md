@@ -16,7 +16,7 @@ Development guide for contributors and coding agents working in `quick-screen-re
 | `src/export_name.rs` | Chronological Spotlight-friendly export filename generation and user filename sanitization |
 | `src/observe.rs` | Local-only latency/size stats (`perf.jsonl`) with zero personal paths or titles |
 | `src/permissions.rs` | CoreGraphics Screen Recording permission checks, Screen Recording & Microphone System Settings deep links, Finder reveal, and `doctor` diagnostics |
-| `src/capture/` | `SCShareableContent` enumeration, `AVCaptureDevice` microphone discovery/permission helpers, `SCContentFilter` builders, and non-blocking `SCStream` + `SCRecordingOutput` hardware capture session |
+| `src/capture/` | `SCShareableContent` enumeration, `AVCaptureDevice` microphone discovery/permission helpers, `CaptureCadence` presets, `SCContentFilter` builders, non-blocking `SCStream` + `SCRecordingOutput` real-time capture, and `SCScreenshotManager` interval timelapse session |
 | `src/export/` | `AVAssetExportSession` MP4/HEVC trimming, `AVAssetImageGenerator` frame extraction, parallel Rust GIF/APNG encoders, and optional `ffmpeg` WebM/AV1 runner |
 | `src/ui/` | Native AppKit status-bar controller, first-run onboarding & animated tutorial, selection overlay, and Trim & Export editor window |
 | `tests/export_pipeline.rs` | End-to-end export and privacy-invariant integration tests |

@@ -23,8 +23,210 @@ use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString, NSURL};
 use crate::capture::RecordingCodec;
 use crate::export::avfoundation::RgbaFrame;
 
+/// Maximum time [`StreamingMp4Writer::finish`] waits for `AVAssetWriter` container finalization.
+pub const WRITER_FINISH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Incremental hardware H.264 / HEVC `.mp4` writer backed by `AVAssetWriter`.
+/// Keeps memory bounded to a single frame even across multi-hour timelapses or 4K transcodes.
+pub struct StreamingMp4Writer {
+    writer: Retained<AVAssetWriter>,
+    input: Retained<AVAssetWriterInput>,
+    adaptor: Retained<AVAssetWriterInputPixelBufferAdaptor>,
+    width: usize,
+    height: usize,
+    timescale: i32,
+    frames_written: u64,
+}
+
+impl StreamingMp4Writer {
+    pub fn new(
+        width: u32,
+        height: u32,
+        fps: u32,
+        codec: RecordingCodec,
+        output_path: &Path,
+    ) -> Result<Self, String> {
+        let w = (width.max(2) & !1) as usize;
+        let h = (height.max(2) & !1) as usize;
+
+        if output_path.exists() {
+            std::fs::remove_file(output_path)
+                .map_err(|e| format!("Failed removing existing staged target: {e}"))?;
+        }
+
+        let path_str = output_path
+            .to_str()
+            .ok_or("Output path contains invalid UTF-8")?;
+        let url = NSURL::fileURLWithPath(&NSString::from_str(path_str));
+        let mp4_type = unsafe { AVFileTypeMPEG4 }.ok_or("AVFileTypeMPEG4 unavailable")?;
+        let video_media = unsafe { AVMediaTypeVideo }.ok_or("AVMediaTypeVideo unavailable")?;
+
+        let writer = unsafe {
+            AVAssetWriter::assetWriterWithURL_fileType_error(&url, mp4_type)
+                .map_err(|e| format!("AVAssetWriter init failed: {}", e.localizedDescription()))?
+        };
+
+        let codec_key = unsafe { AVVideoCodecKey }.ok_or("AVVideoCodecKey unavailable")?;
+        let width_key = unsafe { AVVideoWidthKey }.ok_or("AVVideoWidthKey unavailable")?;
+        let height_key = unsafe { AVVideoHeightKey }.ok_or("AVVideoHeightKey unavailable")?;
+        let codec_val = match codec {
+            RecordingCodec::H264 => unsafe { AVVideoCodecTypeH264 }.ok_or("H264 unavailable")?,
+            RecordingCodec::Hevc => unsafe { AVVideoCodecTypeHEVC }.ok_or("HEVC unavailable")?,
+        };
+
+        let keys: [&NSString; 3] = [codec_key, width_key, height_key];
+        let w_num = NSNumber::new_usize(w);
+        let h_num = NSNumber::new_usize(h);
+        let vals: [&AnyObject; 3] = [codec_val.as_ref(), w_num.as_ref(), h_num.as_ref()];
+        let settings: Retained<NSDictionary<NSString, AnyObject>> =
+            NSDictionary::from_slices(&keys, &vals);
+
+        let input = unsafe {
+            AVAssetWriterInput::assetWriterInputWithMediaType_outputSettings(
+                video_media,
+                Some(&settings),
+            )
+        };
+        let adaptor = unsafe {
+            AVAssetWriterInputPixelBufferAdaptor::assetWriterInputPixelBufferAdaptorWithAssetWriterInput_sourcePixelBufferAttributes(
+                &input,
+                None,
+            )
+        };
+
+        let timescale = fps.clamp(1, 120) as i32;
+        unsafe {
+            let empty_meta = NSArray::new();
+            writer.setMetadata(&empty_meta);
+            writer.setShouldOptimizeForNetworkUse(true);
+            if !writer.canAddInput(&input) {
+                return Err("AVAssetWriter rejected video input settings".to_string());
+            }
+            writer.addInput(&input);
+            if !writer.startWriting() {
+                let detail = writer
+                    .error()
+                    .map(|e| e.localizedDescription().to_string())
+                    .unwrap_or_else(|| "unknown error".to_string());
+                return Err(format!("AVAssetWriter failed starting: {detail}"));
+            }
+            writer.startSessionAtSourceTime(CMTime {
+                value: 0,
+                timescale,
+                flags: CMTimeFlags(1),
+                epoch: 0,
+            });
+        }
+
+        Ok(Self {
+            writer,
+            input,
+            adaptor,
+            width: w,
+            height: h,
+            timescale,
+            frames_written: 0,
+        })
+    }
+
+    pub fn frames_written(&self) -> u64 {
+        self.frames_written
+    }
+
+    pub fn append_rgba_frame(&mut self, frame: &RgbaFrame) -> Result<(), String> {
+        let mut spins = 0_u32;
+        while !unsafe { self.input.isReadyForMoreMediaData() } {
+            thread::sleep(Duration::from_millis(2));
+            spins += 1;
+            if spins > 2500 {
+                return Err("Timed out waiting for hardware video encoder input queue".to_string());
+            }
+        }
+        let pb = rgba_to_bgra_pixel_buffer(frame, self.width, self.height)?;
+        let pts = CMTime {
+            value: self.frames_written as i64,
+            timescale: self.timescale,
+            flags: CMTimeFlags(1),
+            epoch: 0,
+        };
+        let ok = unsafe {
+            self.adaptor
+                .appendPixelBuffer_withPresentationTime(&pb, pts)
+        };
+        if !ok {
+            let detail = unsafe {
+                self.writer
+                    .error()
+                    .map(|e| e.localizedDescription().to_string())
+                    .unwrap_or_else(|| "appendPixelBuffer failed".to_string())
+            };
+            return Err(format!(
+                "AVAssetWriter frame {} error: {detail}",
+                self.frames_written
+            ));
+        }
+        self.frames_written += 1;
+        Ok(())
+    }
+
+    pub fn finish(self) -> Result<(), String> {
+        self.finish_with_duration(None)
+    }
+
+    /// Finalizes the MP4 container. When `target_duration_secs` is provided, sets
+    /// `endSessionAtSourceTime` to preserve trimmed clip duration (even at low FPS where
+    /// `frames_written / fps` would otherwise round up or extend the clip).
+    pub fn finish_with_duration(self, target_duration_secs: Option<f64>) -> Result<(), String> {
+        if self.frames_written == 0 {
+            return Err("Cannot finalize MP4 with zero frames".to_string());
+        }
+        let end_pts = match target_duration_secs {
+            Some(secs) if secs.is_finite() && secs > 0.0 => {
+                let last_pts_secs = ((self.frames_written - 1) as f64) / f64::from(self.timescale);
+                let min_end_ticks = (last_pts_secs * 6000.0).floor() as i64 + 1;
+                let requested_ticks = (secs * 6000.0).round() as i64;
+                CMTime {
+                    value: requested_ticks.max(min_end_ticks),
+                    timescale: 6000,
+                    flags: CMTimeFlags(1),
+                    epoch: 0,
+                }
+            }
+            _ => CMTime {
+                value: self.frames_written as i64,
+                timescale: self.timescale,
+                flags: CMTimeFlags(1),
+                epoch: 0,
+            },
+        };
+        let (tx, rx) = mpsc::sync_channel::<()>(1);
+        let block = RcBlock::new(move || {
+            let _ = tx.send(());
+        });
+        unsafe {
+            self.input.markAsFinished();
+            self.writer.endSessionAtSourceTime(end_pts);
+            self.writer.finishWritingWithCompletionHandler(&block);
+        }
+        rx.recv_timeout(WRITER_FINISH_TIMEOUT)
+            .map_err(|_| "Timed out finalizing MP4 with AVAssetWriter".to_string())?;
+
+        let status = unsafe { self.writer.status() };
+        if status == AVAssetWriterStatus::Completed {
+            Ok(())
+        } else {
+            let detail = unsafe {
+                self.writer
+                    .error()
+                    .map(|e| e.localizedDescription().to_string())
+                    .unwrap_or_else(|| format!("status={}", status.0))
+            };
+            Err(format!("AVAssetWriter finalization failed: {detail}"))
+        }
+    }
+}
+
 /// Streams generated RGBA frames one-by-one into a metadata-free H.264 or HEVC `.mp4` via `AVAssetWriter`.
-/// Keeps peak memory bounded to a single frame regardless of clip duration or 4K resolution.
 pub fn stream_rgba_frames_to_mp4<F>(
     width: u32,
     height: u32,
@@ -40,130 +242,12 @@ where
     if frame_count == 0 {
         return Err("Cannot write MP4 with zero frames".to_string());
     }
-    let w = (width.max(2) & !1) as usize;
-    let h = (height.max(2) & !1) as usize;
-
-    if output_path.exists() {
-        std::fs::remove_file(output_path)
-            .map_err(|e| format!("Failed removing existing staged target: {e}"))?;
-    }
-
-    let path_str = output_path
-        .to_str()
-        .ok_or("Output path contains invalid UTF-8")?;
-    let url = NSURL::fileURLWithPath(&NSString::from_str(path_str));
-    let mp4_type = unsafe { AVFileTypeMPEG4 }.ok_or("AVFileTypeMPEG4 unavailable")?;
-    let video_media = unsafe { AVMediaTypeVideo }.ok_or("AVMediaTypeVideo unavailable")?;
-
-    let writer = unsafe {
-        AVAssetWriter::assetWriterWithURL_fileType_error(&url, mp4_type)
-            .map_err(|e| format!("AVAssetWriter init failed: {}", e.localizedDescription()))?
-    };
-
-    let codec_key = unsafe { AVVideoCodecKey }.ok_or("AVVideoCodecKey unavailable")?;
-    let width_key = unsafe { AVVideoWidthKey }.ok_or("AVVideoWidthKey unavailable")?;
-    let height_key = unsafe { AVVideoHeightKey }.ok_or("AVVideoHeightKey unavailable")?;
-    let codec_val = match codec {
-        RecordingCodec::H264 => unsafe { AVVideoCodecTypeH264 }.ok_or("H264 unavailable")?,
-        RecordingCodec::Hevc => unsafe { AVVideoCodecTypeHEVC }.ok_or("HEVC unavailable")?,
-    };
-
-    let keys: [&NSString; 3] = [codec_key, width_key, height_key];
-    let w_num = NSNumber::new_usize(w);
-    let h_num = NSNumber::new_usize(h);
-    let vals: [&AnyObject; 3] = [codec_val.as_ref(), w_num.as_ref(), h_num.as_ref()];
-    let settings: Retained<NSDictionary<NSString, AnyObject>> =
-        NSDictionary::from_slices(&keys, &vals);
-
-    let input = unsafe {
-        AVAssetWriterInput::assetWriterInputWithMediaType_outputSettings(
-            video_media,
-            Some(&settings),
-        )
-    };
-    let adaptor = unsafe {
-        AVAssetWriterInputPixelBufferAdaptor::assetWriterInputPixelBufferAdaptorWithAssetWriterInput_sourcePixelBufferAttributes(
-            &input,
-            None,
-        )
-    };
-
-    let timescale = fps.clamp(1, 120) as i32;
-    unsafe {
-        let empty_meta = NSArray::new();
-        writer.setMetadata(&empty_meta);
-        writer.setShouldOptimizeForNetworkUse(true);
-        if !writer.canAddInput(&input) {
-            return Err("AVAssetWriter rejected video input settings".to_string());
-        }
-        writer.addInput(&input);
-        if !writer.startWriting() {
-            let detail = writer
-                .error()
-                .map(|e| e.localizedDescription().to_string())
-                .unwrap_or_else(|| "unknown error".to_string());
-            return Err(format!("AVAssetWriter failed starting: {detail}"));
-        }
-        writer.startSessionAtSourceTime(CMTime {
-            value: 0,
-            timescale,
-            flags: CMTimeFlags(1),
-            epoch: 0,
-        });
-    }
-
+    let mut writer = StreamingMp4Writer::new(width, height, fps, codec, output_path)?;
     for idx in 0..frame_count {
         let frame = next_frame(idx)?;
-        let mut spins = 0_u32;
-        while !unsafe { input.isReadyForMoreMediaData() } {
-            thread::sleep(Duration::from_millis(2));
-            spins += 1;
-            if spins > 2500 {
-                return Err("Timed out waiting for hardware video encoder input queue".to_string());
-            }
-        }
-        let pb = rgba_to_bgra_pixel_buffer(&frame, w, h)?;
-        let pts = CMTime {
-            value: idx as i64,
-            timescale,
-            flags: CMTimeFlags(1),
-            epoch: 0,
-        };
-        let ok = unsafe { adaptor.appendPixelBuffer_withPresentationTime(&pb, pts) };
-        if !ok {
-            let detail = unsafe {
-                writer
-                    .error()
-                    .map(|e| e.localizedDescription().to_string())
-                    .unwrap_or_else(|| "appendPixelBuffer failed".to_string())
-            };
-            return Err(format!("AVAssetWriter frame {idx} error: {detail}"));
-        }
+        writer.append_rgba_frame(&frame)?;
     }
-
-    let (tx, rx) = mpsc::sync_channel::<()>(1);
-    let block = RcBlock::new(move || {
-        let _ = tx.send(());
-    });
-    unsafe {
-        input.markAsFinished();
-        writer.finishWritingWithCompletionHandler(&block);
-    }
-    rx.recv_timeout(Duration::from_secs(60))
-        .map_err(|_| "Timed out finalizing MP4 with AVAssetWriter".to_string())?;
-
-    let status = unsafe { writer.status() };
-    if status == AVAssetWriterStatus::Completed {
-        Ok(())
-    } else {
-        let detail = unsafe {
-            writer
-                .error()
-                .map(|e| e.localizedDescription().to_string())
-                .unwrap_or_else(|| format!("status={}", status.0))
-        };
-        Err(format!("AVAssetWriter finalization failed: {detail}"))
-    }
+    writer.finish()
 }
 
 pub fn write_rgba_frames_to_mp4(

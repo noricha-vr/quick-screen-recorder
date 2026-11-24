@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::capture::{AudioCaptureMode, RecordingCodec};
+use crate::capture::{AudioCaptureMode, CaptureCadence, RecordingCodec};
 use crate::export::ExportFormat;
 use crate::geometry::Rect;
 
@@ -25,7 +25,7 @@ pub enum Command {
         output: PathBuf,
         duration_sec: f64,
         region: Option<Rect>,
-        fps: u32,
+        cadence: CaptureCadence,
         codec: RecordingCodec,
         show_cursor: bool,
         highlight_clicks: bool,
@@ -268,7 +268,8 @@ fn parse_record_flags(args: &[String]) -> Result<Command, String> {
     let mut output: Option<PathBuf> = None;
     let mut duration_sec: f64 = 5.0;
     let mut region: Option<Rect> = None;
-    let mut fps: u32 = 60;
+    let mut explicit_fps: Option<u32> = None;
+    let mut interval_secs: Option<u32> = None;
     let mut codec = RecordingCodec::H264;
     let mut show_cursor = true;
     let mut highlight_clicks = true;
@@ -290,8 +291,8 @@ fn parse_record_flags(args: &[String]) -> Result<Command, String> {
                     .ok_or("--duration requires seconds")?
                     .parse::<f64>()
                     .map_err(|_| "Invalid --duration value")?;
-                if !duration_sec.is_finite() || !(0.2..=3600.0).contains(&duration_sec) {
-                    return Err("--duration must be between 0.2 and 3600 seconds".to_string());
+                if !duration_sec.is_finite() || !(0.2..=86400.0).contains(&duration_sec) {
+                    return Err("--duration must be between 0.2 and 86400 seconds".to_string());
                 }
             }
             "--region" => {
@@ -302,7 +303,7 @@ fn parse_record_flags(args: &[String]) -> Result<Command, String> {
             }
             "--fps" => {
                 i += 1;
-                fps = args
+                let fps = args
                     .get(i)
                     .ok_or("--fps requires a number")?
                     .parse::<u32>()
@@ -310,6 +311,19 @@ fn parse_record_flags(args: &[String]) -> Result<Command, String> {
                 if !(1..=120).contains(&fps) {
                     return Err("--fps must be between 1 and 120".to_string());
                 }
+                explicit_fps = Some(fps);
+            }
+            "--interval" => {
+                i += 1;
+                let secs = args
+                    .get(i)
+                    .ok_or("--interval requires seconds per frame (1..=3600)")?
+                    .parse::<u32>()
+                    .map_err(|_| "Invalid --interval value")?;
+                if !(1..=3600).contains(&secs) {
+                    return Err("--interval must be between 1 and 3600 seconds".to_string());
+                }
+                interval_secs = Some(secs);
             }
             "--codec" => {
                 i += 1;
@@ -336,12 +350,32 @@ fn parse_record_flags(args: &[String]) -> Result<Command, String> {
         i += 1;
     }
 
+    if explicit_fps.is_some() && interval_secs.is_some() {
+        return Err("Use either --fps (real-time) or --interval (timelapse), not both".to_string());
+    }
+    let cadence = match interval_secs {
+        Some(secs) => {
+            if audio != AudioCaptureMode::None {
+                return Err(
+                    "Audio capture is not supported with --interval timelapse recording"
+                        .to_string(),
+                );
+            }
+            CaptureCadence::Timelapse {
+                interval_secs: secs,
+            }
+        }
+        None => CaptureCadence::RealTime {
+            fps: explicit_fps.unwrap_or(60),
+        },
+    };
+
     let output = output.ok_or("Missing --output <path.mp4>")?;
     Ok(Command::Record {
         output,
         duration_sec,
         region,
-        fps,
+        cadence,
         codec,
         show_cursor,
         highlight_clicks,
@@ -367,7 +401,7 @@ Quick Screen Recorder — Fast native screen recorder for macOS (ScreenCaptureKi
 
 USAGE:
   quick-screen-recorder [--select | --edit <video.mp4>]
-  quick-screen-recorder record --output <out.mp4> [--duration <sec>] [--region x,y,w,h] [--fps 60] [--codec h264|hevc] [--audio none|system|mic|both] [--no-cursor] [--no-clicks]
+  quick-screen-recorder record --output <out.mp4> [--duration <sec>] [--region x,y,w,h] [--fps 1..120 | --interval <sec>] [--codec h264|hevc] [--audio none|system|mic|both] [--no-cursor] [--no-clicks]
   quick-screen-recorder convert --input <in.mp4> --output <out.ext> [--format mp4|hevc|gif|apng|webm|av1] [--fps 30] [--start <sec>] [--end <sec>] [--max-width <px>] [--mute]
   quick-screen-recorder doctor
   quick-screen-recorder stats
@@ -375,68 +409,5 @@ USAGE:
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_launches_menubar_gui_and_ignores_finder_psn() {
-        let cmd = parse_args(["-psn_0_12345"]).expect("parse psn");
-        assert_eq!(
-            cmd,
-            Command::Gui {
-                open_selector: false,
-                open_editor: None,
-                demo_mode: None,
-            }
-        );
-    }
-
-    #[test]
-    fn parse_convert_infers_gif_and_validates_trim() {
-        let cmd = parse_args([
-            "convert",
-            "--input",
-            "/tmp/in.mp4",
-            "--output",
-            "/tmp/out.gif",
-            "--fps",
-            "24",
-            "--start",
-            "0.5",
-            "--end",
-            "2.5",
-            "--max-width",
-            "640",
-        ])
-        .expect("parse convert");
-
-        assert_eq!(
-            cmd,
-            Command::Convert {
-                input: PathBuf::from("/tmp/in.mp4"),
-                output: PathBuf::from("/tmp/out.gif"),
-                format: ExportFormat::Gif,
-                fps: 24,
-                start_sec: Some(0.5),
-                end_sec: Some(2.5),
-                max_width: Some(640),
-                mute_audio: false,
-            }
-        );
-
-        assert!(
-            parse_args([
-                "convert",
-                "-i",
-                "/tmp/in.mp4",
-                "-o",
-                "/tmp/out.gif",
-                "--start",
-                "3.0",
-                "--end",
-                "1.0",
-            ])
-            .is_err()
-        );
-    }
-}
+#[path = "cli_tests.rs"]
+mod tests;

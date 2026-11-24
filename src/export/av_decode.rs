@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::ptr;
 
+use objc2::rc::autoreleasepool;
 use objc2_av_foundation::AVAssetImageGenerator;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
@@ -10,6 +11,7 @@ use objc2_core_graphics::{
 
 use crate::export::avfoundation::{
     MAX_ANIMATED_FRAMES, open_restricted_asset, probe_video_metadata, secs_to_cmtime,
+    transcode_frame_count,
 };
 use crate::geometry::scaled_even_dimensions;
 
@@ -69,8 +71,8 @@ where
     let (target_w, target_h) = scaled_even_dimensions(meta.width, meta.height, capped_max);
     let clamped_fps = fps.clamp(1, 60);
     let frame_step = 1.0 / f64::from(clamped_fps);
-    let duration = (end_sec - start_sec).max(frame_step);
-    let requested_count = ((duration * f64::from(clamped_fps)).round() as usize).max(1);
+    let duration = (end_sec - start_sec).max(0.02);
+    let requested_count = transcode_frame_count(duration, clamped_fps);
 
     if requested_count > MAX_ANIMATED_FRAMES {
         return Err(format!(
@@ -94,25 +96,26 @@ where
 
     let mut last_good: Option<RgbaFrame> = None;
     for idx in 0..requested_count {
-        let t = (start_sec + (idx as f64) * frame_step).min(meta.duration_sec);
-        let req_time = secs_to_cmtime(t);
-        #[allow(deprecated)]
-        let cg_res =
-            unsafe { generator.copyCGImageAtTime_actualTime_error(req_time, ptr::null_mut()) };
-        let frame = match cg_res {
-            Ok(cg_img) => {
-                let decoded = cgimage_to_rgba_sized(&cg_img, target_w as usize, target_h as usize)?;
-                last_good = Some(decoded.clone());
-                decoded
-            }
-            Err(_) if last_good.is_some() => last_good.clone().unwrap(),
-            Err(e) => {
-                return Err(format!(
+        let frame = autoreleasepool(|_| {
+            let t = (start_sec + (idx as f64) * frame_step).min(meta.duration_sec);
+            let req_time = secs_to_cmtime(t);
+            #[allow(deprecated)]
+            let cg_res =
+                unsafe { generator.copyCGImageAtTime_actualTime_error(req_time, ptr::null_mut()) };
+            match cg_res {
+                Ok(cg_img) => {
+                    let decoded =
+                        cgimage_to_rgba_sized(&cg_img, target_w as usize, target_h as usize)?;
+                    last_good = Some(decoded.clone());
+                    Ok(decoded)
+                }
+                Err(_) if last_good.is_some() => Ok(last_good.clone().unwrap()),
+                Err(e) => Err(format!(
                     "Failed to decode initial video frame: {}",
                     e.localizedDescription()
-                ));
+                )),
             }
-        };
+        })?;
         on_frame(idx, requested_count, frame)?;
     }
     Ok((target_w, target_h, requested_count))

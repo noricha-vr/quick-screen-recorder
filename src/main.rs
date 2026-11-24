@@ -1,10 +1,9 @@
 use std::process::ExitCode;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use quick_screen_recorder::capture::recorder::RecordingSession;
 use quick_screen_recorder::capture::shareable::query_shareable_content;
-use quick_screen_recorder::capture::{CaptureConfig, CaptureTarget};
+use quick_screen_recorder::capture::{ActiveRecording, CaptureConfig, CaptureTarget};
 use quick_screen_recorder::cli::{Command, parse_args, usage_text};
 use quick_screen_recorder::export::{ExportRequest, run_export};
 use quick_screen_recorder::fs_safety::sanitize_terminal_text;
@@ -88,7 +87,7 @@ fn execute(command: Command) -> Result<(), String> {
             output,
             duration_sec,
             region,
-            fps,
+            cadence,
             codec,
             show_cursor,
             highlight_clicks,
@@ -113,19 +112,28 @@ fn execute(command: Command) -> Result<(), String> {
             };
             let cfg = CaptureConfig {
                 target,
-                fps,
+                cadence,
                 codec,
                 show_cursor,
                 highlight_clicks,
-                audio_mode: audio,
+                audio_mode: cadence.effective_audio_mode(audio),
                 microphone_device_id: None,
                 excluded_window_ids: Vec::new(),
                 source_app_name: None,
             };
-            let session = RecordingSession::start(&cfg, &output)?;
-            thread::sleep(Duration::from_secs_f64(duration_sec));
-            let saved = session.stop()?;
-            let safe_saved = sanitize_terminal_text(&saved.display().to_string(), false);
+            let session = ActiveRecording::start(&cfg, &output)?;
+            let deadline = Instant::now() + Duration::from_secs_f64(duration_sec);
+            while Instant::now() < deadline && !session.has_ended_unexpectedly() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                thread::sleep(remaining.min(Duration::from_millis(250)));
+            }
+            let outcome = session.stop()?;
+            let safe_saved =
+                sanitize_terminal_text(&outcome.output_path.display().to_string(), false);
+            if let Some(partial_err) = outcome.partial_error {
+                println!("Saved recording -> {safe_saved}");
+                return Err(partial_err);
+            }
             println!("Recorded -> {safe_saved}");
             Ok(())
         }

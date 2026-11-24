@@ -12,9 +12,9 @@ use objc2_foundation::{NSRunLoop, NSRunLoopCommonModes, NSString, NSTimer};
 use crate::capture::audio_devices::{
     MicPermissionStatus, microphone_permission_status, request_microphone_permission_channel,
 };
-use crate::capture::recorder::{RecordingSession, StopPollState};
+use crate::capture::recorder::StopPollState;
 use crate::capture::shareable::query_shareable_content;
-use crate::capture::{AudioCaptureMode, CaptureConfig};
+use crate::capture::{ActiveRecording, AudioCaptureMode, CaptureConfig};
 use crate::config::Preferences;
 use crate::permissions::{has_screen_capture_permission, open_microphone_settings};
 use crate::ui::editor::{EditorOpenOptions, EditorWindow};
@@ -239,14 +239,15 @@ fn launch_recording_session(
         }
     };
     let source_app = cfg.source_app_name.clone();
-    match RecordingSession::start(&cfg, &raw_out) {
+    match ActiveRecording::start(&cfg, &raw_out) {
         Ok(session) => {
             {
                 let mut rt = runtime.borrow_mut();
                 rt.temp_files.push(raw_out);
                 rt.active_capture_app = source_app;
+                let init_tl_frames = session.timelapse_frames();
                 if let Some(sb) = &rt.status_bar {
-                    sb.set_recording_elapsed(mtm, 0);
+                    sb.set_recording_elapsed(mtm, 0, init_tl_frames);
                 }
                 rt.session = Some(session);
                 let rt_tick = Rc::clone(runtime);
@@ -254,9 +255,21 @@ fn launch_recording_session(
                     let Some(m) = MainThreadMarker::new() else {
                         return;
                     };
-                    let r = rt_tick.borrow();
-                    if let (Some(sess), Some(sb)) = (&r.session, &r.status_bar) {
-                        sb.set_recording_elapsed(m, sess.elapsed().as_secs());
+                    let worker_aborted = {
+                        let r = rt_tick.borrow();
+                        if let (Some(sess), Some(sb)) = (&r.session, &r.status_bar) {
+                            sb.set_recording_elapsed(
+                                m,
+                                sess.elapsed().as_secs(),
+                                sess.timelapse_frames(),
+                            );
+                            sess.has_ended_unexpectedly()
+                        } else {
+                            false
+                        }
+                    };
+                    if worker_aborted {
+                        stop_active_recording(m, &rt_tick);
                     }
                 });
                 rt.rec_timer = Some(unsafe {
@@ -340,15 +353,54 @@ pub(crate) fn stop_active_recording(mtm: MainThreadMarker, runtime: &Rc<RefCell<
             return;
         };
         let app_name = captured_cell.borrow_mut().take();
+        let should_quit = rt_poll.borrow().quit_after_stop;
         match pending.finish() {
-            Ok(saved_path) => {
+            Ok(outcome) => {
+                if should_quit {
+                    let rescued = crate::staging::preserve_recording_on_quit(
+                        &outcome.output_path,
+                        &mut rt_poll.borrow_mut().temp_files,
+                        crate::staging::private_recovery_dir(),
+                    );
+                    let notice = match (rescued, outcome.partial_error) {
+                        (Ok(saved), Some(warn)) => format!(
+                            "Your recording was preserved at {} before quitting (warning: {warn}).",
+                            crate::fs_safety::format_tilde_path(&saved)
+                        ),
+                        (Ok(saved), None) => format!(
+                            "Your recording was preserved at {} before quitting.",
+                            crate::fs_safety::format_tilde_path(&saved)
+                        ),
+                        (Err((rec_err, kept)), _) => format!(
+                            "Could not move recording to recovery ({rec_err}); file was preserved at {}.",
+                            crate::fs_safety::format_tilde_path(&kept)
+                        ),
+                    };
+                    show_error_alert(m, "Recording Saved Before Quit", &notice);
+                    crate::ui::finish_app_termination(m, &rt_poll);
+                    return;
+                }
                 if let Err(err) =
-                    open_editor_for_file(m, &rt_poll, &saved_path, app_name, tutorial_gen)
+                    open_editor_for_file(m, &rt_poll, &outcome.output_path, app_name, tutorial_gen)
                 {
                     show_error_alert(m, "Failed Opening Editor", &err);
                 }
+                if let Some(partial_err) = outcome.partial_error {
+                    show_error_alert(
+                        m,
+                        "Recording Saved With Warning",
+                        &format!(
+                            "The recording was saved and opened in the editor, with a warning: {partial_err}"
+                        ),
+                    );
+                }
             }
-            Err(err) => show_error_alert(m, "Recording Error", &err),
+            Err(err) => {
+                show_error_alert(m, "Recording Error", &err);
+                if should_quit {
+                    crate::ui::finish_app_termination(m, &rt_poll);
+                }
+            }
         }
     });
 

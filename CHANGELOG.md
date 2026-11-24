@@ -5,6 +5,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-24
+
+### Added
+
+- **Low-FPS real-time capture (`1 / 5 / 15 / 30 / 60 fps`)**:
+  - Expanded the overlay frame-rate selector to **`60 / 30 / 15 / 5 / 1 fps`** real-time capture (persisted across launches via `capture_cadence` in `preferences.json`) with full System Audio + Microphone support.
+  - Expanded Trim & Export editor FPS presets to **`1 / 5 / 15 / 30 / 60 fps`** and defaulted the editor FPS to the closest preset matching the source clip so `1 fps` / `5 fps` recordings preserve instant hardware passthrough without inflating frame rate.
+- **Interval Timelapse capture (`1f/5s`, `1f/10s`, `1f/30s`, `1f/1m` -> 30 fps fast-forward MP4)**:
+  - Added `TimelapseSession` (`SCScreenshotManager` periodic sampling + incremental `StreamingMp4Writer` hardware H.264/HEVC encoding at **30 fps** playback) for multi-hour recordings with near-zero idle CPU and O(1) memory, aspect-fit handling for resized windows, and non-blocking stop finalization.
+  - Automatically mutes and disables `System Audio` / `Mic` toolbar controls while a timelapse preset is selected (restoring the user's saved audio settings immediately when switching back to real-time FPS) and displays elapsed time + frame count (`● TL MM:SS · Nf`) in the menu bar.
+- **CLI `--interval <sec>` timelapse flag**:
+  - Added `quick-screen-recorder record --interval <1..=3600>` (and extended `--duration` up to `86400` seconds / 24 hours) for scriptable headless timelapse capture.
+
 ## [0.4.0] - 2026-11-24
 
 ### Added

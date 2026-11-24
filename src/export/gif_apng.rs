@@ -8,6 +8,7 @@ use rayon::prelude::*;
 
 use crate::export::avfoundation::{
     MAX_ANIMATED_FRAMES, RgbaFrame, VideoMetadata, extract_rgba_frame, stream_rgba_sequence,
+    transcode_frame_count,
 };
 use crate::export::{ExportRequest, SharedExportProgress, set_progress_permille};
 use crate::geometry::scaled_even_dimensions;
@@ -27,8 +28,8 @@ pub fn export_gif(
     let capped_max = Some(req.max_width.unwrap_or(1920).min(1920));
     let (target_w, target_h) = scaled_even_dimensions(meta.width, meta.height, capped_max);
 
-    let frame_step = 1.0 / f64::from(fps);
-    let total_est = (((end - start).max(frame_step) * f64::from(fps)).round() as usize).max(1);
+    let duration = (end - start).max(0.02);
+    let total_est = transcode_frame_count(duration, fps);
     if total_est > MAX_ANIMATED_FRAMES {
         return Err(format!(
             "Clip has {total_est} frames at {fps} fps (maximum is {MAX_ANIMATED_FRAMES} frames). Trim a shorter clip, lower FPS, or export as MP4/HEVC."
@@ -88,7 +89,7 @@ pub fn export_gif(
                 .par_chunks_exact(4)
                 .map(|px| (nq.index_of(px) as u8).min(254))
                 .collect();
-            let delay_cs = frame_delay_centiseconds(idx, fps);
+            let delay_cs = frame_delay_centiseconds_for_duration(idx, total, duration, fps);
             let gif_frame = match &prev_indexed {
                 None => {
                     let mut f =
@@ -131,8 +132,8 @@ pub fn export_apng(
     let capped_max = Some(req.max_width.unwrap_or(1920).min(1920));
     let (target_w, target_h) = scaled_even_dimensions(meta.width, meta.height, capped_max);
 
-    let frame_step = 1.0 / f64::from(fps);
-    let total_frames = (((end - start).max(frame_step) * f64::from(fps)).round() as usize).max(1);
+    let duration = (end - start).max(0.02);
+    let total_frames = transcode_frame_count(duration, fps);
     if total_frames > MAX_ANIMATED_FRAMES {
         return Err(format!(
             "Clip has {total_frames} frames at {fps} fps (maximum is {MAX_ANIMATED_FRAMES} frames). Trim a shorter clip, lower FPS, or export as MP4/HEVC."
@@ -149,8 +150,9 @@ pub fn export_apng(
     encoder
         .set_animated(total_frames as u32, 0)
         .map_err(|e| format!("APNG animation setup error: {e}"))?;
+    let (init_num, init_den) = apng_frame_delay_for_duration(0, total_frames, duration, fps);
     encoder
-        .set_frame_delay(1, fps as u16)
+        .set_frame_delay(init_num, init_den)
         .map_err(|e| format!("APNG delay error: {e}"))?;
 
     let mut png_writer = encoder
@@ -164,6 +166,10 @@ pub fn export_apng(
         fps,
         capped_max,
         |idx, total, frame| {
+            let (delay_num, delay_den) = apng_frame_delay_for_duration(idx, total, duration, fps);
+            png_writer
+                .set_frame_delay(delay_num, delay_den)
+                .map_err(|e| format!("APNG delay error on frame {idx}: {e}"))?;
             png_writer
                 .write_image_data(&frame.pixels)
                 .map_err(|e| format!("Failed writing APNG frame {idx}: {e}"))?;
@@ -186,6 +192,44 @@ pub fn frame_delay_centiseconds(frame_index: usize, fps: u32) -> u16 {
     let t0 = ((frame_index as f64) * 100.0 / clamped).round() as u64;
     let t1 = (((frame_index + 1) as f64) * 100.0 / clamped).round() as u64;
     t1.saturating_sub(t0).max(2) as u16
+}
+
+/// Computes GIF frame delay in centiseconds while capping the final frame to `duration_sec`,
+/// preserving exact trimmed playback duration even at low FPS (e.g. 1.5s or 0.7s at 1 fps).
+pub fn frame_delay_centiseconds_for_duration(
+    frame_index: usize,
+    total_frames: usize,
+    duration_sec: f64,
+    fps: u32,
+) -> u16 {
+    if frame_index + 1 < total_frames {
+        return frame_delay_centiseconds(frame_index, fps);
+    }
+    let clamped = f64::from(fps.clamp(1, 50));
+    let t0 = ((frame_index as f64) * 100.0 / clamped).round() as u64;
+    let t_end = (duration_sec.max(0.02) * 100.0).round() as u64;
+    t_end.saturating_sub(t0).clamp(2, u64::from(u16::MAX)) as u16
+}
+
+/// Computes APNG `(delay_num, delay_den)` rational delay, fitting the final frame to the
+/// remaining trimmed duration so non-integer-second low-FPS exports never stretch or shrink.
+pub fn apng_frame_delay_for_duration(
+    frame_index: usize,
+    total_frames: usize,
+    duration_sec: f64,
+    fps: u32,
+) -> (u16, u16) {
+    let clamped_fps = fps.clamp(1, 60);
+    if frame_index + 1 < total_frames {
+        return (1, clamped_fps as u16);
+    }
+    let frame_step = 1.0 / f64::from(clamped_fps);
+    let remaining = (duration_sec.max(0.02) - (frame_index as f64) * frame_step).max(0.001);
+    if (remaining - frame_step).abs() <= 0.0005 {
+        return (1, clamped_fps as u16);
+    }
+    let ms = (remaining * 1000.0).round().clamp(1.0, f64::from(u16::MAX)) as u16;
+    (ms, 1000)
 }
 
 pub fn encode_rgba_frames_to_gif(
@@ -420,5 +464,18 @@ mod tests {
             .map(|i| u32::from(frame_delay_centiseconds(i, 30)))
             .sum();
         assert_eq!(total_cs, 1000);
+    }
+
+    #[test]
+    fn low_fps_non_integer_durations_match_trimmed_length_in_gif_and_apng() {
+        // 1.5s @ 1 fps => 2 frames: 1.0s + 0.5s = 1.5s
+        assert_eq!(frame_delay_centiseconds_for_duration(0, 2, 1.5, 1), 100);
+        assert_eq!(frame_delay_centiseconds_for_duration(1, 2, 1.5, 1), 50);
+        assert_eq!(apng_frame_delay_for_duration(0, 2, 1.5, 1), (1, 1));
+        assert_eq!(apng_frame_delay_for_duration(1, 2, 1.5, 1), (500, 1000));
+
+        // 0.7s @ 1 fps => 1 frame: 0.7s
+        assert_eq!(frame_delay_centiseconds_for_duration(0, 1, 0.7, 1), 70);
+        assert_eq!(apng_frame_delay_for_duration(0, 1, 0.7, 1), (700, 1000));
     }
 }
