@@ -1,4 +1,6 @@
 use std::ptr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -16,14 +18,31 @@ use crate::export::avfoundation::RgbaFrame;
 
 pub(crate) const FRAME_CAPTURE_TIMEOUT: Duration = Duration::from_secs(6);
 
-pub(crate) fn capture_screenshot_frame(
+pub(crate) struct InFlightScreenshot {
+    rx: mpsc::Receiver<Result<RgbaFrame, String>>,
+    timed_out: Arc<AtomicBool>,
+}
+
+/// Dispatches an asynchronous `SCScreenshotManager` capture without blocking.
+/// Intended to be invoked while holding the session stop/cancel lock so no new capture can be
+/// issued after stop/cancel has been signaled. If `cancelled` or `timed_out` becomes `true`
+/// before the ObjC completion handler runs, the borrowed `CGImage` is ignored without rendering.
+pub(crate) fn dispatch_screenshot_frame(
     filter: &SCContentFilter,
     stream_cfg: &SCStreamConfiguration,
     target_w: usize,
     target_h: usize,
-) -> Result<RgbaFrame, String> {
+    cancelled: &Arc<AtomicBool>,
+) -> InFlightScreenshot {
     let (tx, rx) = mpsc::sync_channel::<Result<RgbaFrame, String>>(1);
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let timed_out_cb = Arc::clone(&timed_out);
+    let cancelled_cb = Arc::clone(cancelled);
+
     let block = RcBlock::new(move |img_ptr: *mut CGImage, err_ptr: *mut NSError| {
+        if cancelled_cb.load(Ordering::Acquire) || timed_out_cb.load(Ordering::Acquire) {
+            return;
+        }
         if !err_ptr.is_null() {
             let msg = unsafe { (&*err_ptr).localizedDescription().to_string() };
             let _ = tx.send(Err(format!("Timelapse frame capture failed: {msg}")));
@@ -36,7 +55,9 @@ pub(crate) fn capture_screenshot_frame(
         // Render immediately while the borrowed CGImageRef is guaranteed alive inside this callback.
         let image = unsafe { &*img_ptr };
         let res = render_cgimage_aspect_fit_rgba(image, target_w, target_h);
-        let _ = tx.send(res);
+        if !cancelled_cb.load(Ordering::Acquire) && !timed_out_cb.load(Ordering::Acquire) {
+            let _ = tx.send(res);
+        }
     });
 
     unsafe {
@@ -47,8 +68,19 @@ pub(crate) fn capture_screenshot_frame(
         );
     }
 
-    rx.recv_timeout(FRAME_CAPTURE_TIMEOUT)
-        .map_err(|_| "Timed out capturing timelapse frame".to_string())?
+    InFlightScreenshot { rx, timed_out }
+}
+
+impl InFlightScreenshot {
+    pub(crate) fn wait(self) -> Result<RgbaFrame, String> {
+        match self.rx.recv_timeout(FRAME_CAPTURE_TIMEOUT) {
+            Ok(res) => res,
+            Err(_) => {
+                self.timed_out.store(true, Ordering::Release);
+                Err("Timed out capturing timelapse frame".to_string())
+            }
+        }
+    }
 }
 
 fn render_cgimage_aspect_fit_rgba(

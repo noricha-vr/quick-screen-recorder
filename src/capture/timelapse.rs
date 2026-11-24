@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -10,53 +10,25 @@ use crate::capture::cadence::TIMELAPSE_PLAYBACK_FPS;
 use crate::capture::filter::build_filter_and_dimensions;
 use crate::capture::recorder::StopPollState;
 use crate::capture::shareable::query_shareable_content_for_capture;
-use crate::capture::timelapse_frame::{FRAME_CAPTURE_TIMEOUT, capture_screenshot_frame};
+use crate::capture::timelapse_frame::{FRAME_CAPTURE_TIMEOUT, dispatch_screenshot_frame};
+use crate::capture::timelapse_loop::{LoopExit, SyncState, run_timelapse_loop};
 use crate::capture::{CaptureConfig, RecordingCodec, RecordingOutcome};
 use crate::export::av_writer::{StreamingMp4Writer, WRITER_FINISH_TIMEOUT};
-use crate::export::avfoundation::RgbaFrame;
 use crate::fs_safety::ExclusiveStagingDir;
 use crate::observe::{PerfEvent, PerfKind, now_unix_secs, record_perf_event};
 
 const START_INIT_TIMEOUT: Duration = Duration::from_secs(12);
-const MAX_CONSECUTIVE_CAPTURE_FAILURES: u32 = 3;
 
 /// Exceeds in-flight frame capture + `AVAssetWriter` finalization (`WRITER_FINISH_TIMEOUT`) so
 /// normal stop/finalization is never prematurely abandoned while the writer is still flushing.
 pub(crate) const TIMELAPSE_STOP_TIMEOUT: Duration =
     Duration::from_secs(WRITER_FINISH_TIMEOUT.as_secs() + FRAME_CAPTURE_TIMEOUT.as_secs() + 5);
 
-#[derive(Default)]
-struct TimelapseControl {
-    start_cancelled: bool,
-    stop_requested: bool,
-}
-
-fn signal_start_cancelled(control: &(Mutex<TimelapseControl>, Condvar)) {
-    let (lock, cvar) = control;
-    if let Ok(mut guard) = lock.lock() {
-        guard.start_cancelled = true;
-        guard.stop_requested = true;
-        cvar.notify_all();
-    }
-}
-
-fn signal_stop(control: &(Mutex<TimelapseControl>, Condvar)) {
-    let (lock, cvar) = control;
-    if let Ok(mut guard) = lock.lock() {
-        guard.stop_requested = true;
-        cvar.notify_all();
-    }
-}
-
-fn is_start_cancelled(control: &(Mutex<TimelapseControl>, Condvar)) -> bool {
-    control.0.lock().map(|g| g.start_cancelled).unwrap_or(true)
-}
-
 /// Long-running interval timelapse capture session backed by `SCScreenshotManager` and
 /// incremental `AVAssetWriter` encoding at 30 fps playback speed (0% idle CPU between ticks,
 /// O(1) memory across multi-hour recordings, audio automatically OFF).
 pub struct TimelapseSession {
-    control: Arc<(Mutex<TimelapseControl>, Condvar)>,
+    sync: Arc<SyncState>,
     frames_written: Arc<AtomicU64>,
     worker_done: Arc<AtomicBool>,
     done_rx: Option<mpsc::Receiver<Result<RecordingOutcome, String>>>,
@@ -64,7 +36,7 @@ pub struct TimelapseSession {
 }
 
 pub struct PendingTimelapseStop {
-    control: Arc<(Mutex<TimelapseControl>, Condvar)>,
+    sync: Arc<SyncState>,
     done_rx: mpsc::Receiver<Result<RecordingOutcome, String>>,
     result: Option<Result<RecordingOutcome, String>>,
     stop_initiated_at: Instant,
@@ -81,8 +53,8 @@ impl TimelapseSession {
         let out_path = output_path.to_path_buf();
         let cfg = config.clone();
 
-        let control = Arc::new((Mutex::new(TimelapseControl::default()), Condvar::new()));
-        let control_worker = Arc::clone(&control);
+        let sync = SyncState::new();
+        let sync_worker = Arc::clone(&sync);
         let frames_written = Arc::new(AtomicU64::new(0));
         let frames_worker = Arc::clone(&frames_written);
         let worker_done = Arc::new(AtomicBool::new(false));
@@ -100,7 +72,7 @@ impl TimelapseSession {
                 staging,
                 out_path,
                 Duration::from_secs(u64::from(interval_secs)),
-                control_worker,
+                sync_worker,
                 frames_worker,
                 started_at,
                 init_tx,
@@ -113,19 +85,18 @@ impl TimelapseSession {
         drop(init_rx);
         match init_res {
             Ok(Ok(())) => Ok(Self {
-                control,
+                sync,
                 frames_written,
                 worker_done,
                 done_rx: Some(done_rx),
                 started_at,
             }),
             Ok(Err(err)) => {
-                signal_start_cancelled(&control);
+                sync.signal_start_cancelled();
                 Err(err)
             }
             Err(_) => {
-                // Cancel worker immediately so delayed initialization can never continue capturing.
-                signal_start_cancelled(&control);
+                sync.signal_start_cancelled();
                 Err("Timed out starting timelapse capture".to_string())
             }
         }
@@ -145,13 +116,13 @@ impl TimelapseSession {
     }
 
     pub fn begin_stop(mut self) -> PendingTimelapseStop {
-        signal_stop(&self.control);
+        self.sync.signal_stop();
         let done_rx = self
             .done_rx
             .take()
             .expect("TimelapseSession::done_rx present until stop");
         PendingTimelapseStop {
-            control: Arc::clone(&self.control),
+            sync: Arc::clone(&self.sync),
             done_rx,
             result: None,
             stop_initiated_at: Instant::now(),
@@ -173,7 +144,7 @@ impl TimelapseSession {
 
 impl Drop for TimelapseSession {
     fn drop(&mut self) {
-        signal_stop(&self.control);
+        self.sync.signal_stop();
     }
 }
 
@@ -202,7 +173,7 @@ impl PendingTimelapseStop {
     }
 
     pub fn finish(mut self) -> Result<RecordingOutcome, String> {
-        signal_stop(&self.control);
+        self.sync.signal_stop();
         if let Some(res) = self.result.take() {
             return res;
         }
@@ -219,12 +190,12 @@ fn run_timelapse_worker(
     staging: ExclusiveStagingDir,
     output_path: PathBuf,
     interval: Duration,
-    control: Arc<(Mutex<TimelapseControl>, Condvar)>,
+    sync: Arc<SyncState>,
     frames_written: Arc<AtomicU64>,
     started_at: Instant,
     init_tx: mpsc::SyncSender<Result<(), String>>,
 ) -> Result<RecordingOutcome, String> {
-    if is_start_cancelled(&control) {
+    if sync.is_start_cancelled() {
         return Err("Timelapse start cancelled before initialization".to_string());
     }
     let snapshot = match query_shareable_content_for_capture() {
@@ -270,16 +241,17 @@ fn run_timelapse_worker(
         }
     };
 
+    let cancel_flag = Arc::clone(&sync.cancelled);
     let partial_error = match run_timelapse_loop(
         interval,
-        &control,
+        &sync,
         &frames_written,
         init_tx,
-        || capture_screenshot_frame(&filter, &stream_cfg, pixel_w, pixel_h),
+        || dispatch_screenshot_frame(&filter, &stream_cfg, pixel_w, pixel_h, &cancel_flag),
+        |inflight| inflight.wait(),
         |frame| writer.append_rgba_frame(frame),
     ) {
         Ok(LoopExit::CancelledBeforeStart) => {
-            // Drop writer and staging without committing any file.
             return Err("Timelapse start cancelled before handoff".to_string());
         }
         Ok(LoopExit::Stopped) => None,
@@ -319,140 +291,6 @@ fn run_timelapse_worker(
         output_path,
         partial_error,
     })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum LoopExit {
-    CancelledBeforeStart,
-    Stopped,
-    /// Unrecoverable capture error occurred after >= 1 frame was written; caller should still
-    /// finalize and commit already-written frames and surface the error message to the user.
-    AbortedAfterPartialCapture(String),
-}
-
-/// Pure, testable capture-loop state machine shared by production `TimelapseSession` and unit tests.
-fn run_timelapse_loop<F, W>(
-    interval: Duration,
-    control: &(Mutex<TimelapseControl>, Condvar),
-    frames_written: &AtomicU64,
-    init_tx: mpsc::SyncSender<Result<(), String>>,
-    mut capture_frame: F,
-    mut write_frame: W,
-) -> Result<LoopExit, String>
-where
-    F: FnMut() -> Result<RgbaFrame, String>,
-    W: FnMut(&RgbaFrame) -> Result<(), String>,
-{
-    if is_start_cancelled(control) {
-        return Ok(LoopExit::CancelledBeforeStart);
-    }
-
-    // Capture Frame 0 before reporting startup success so permission/target errors surface synchronously.
-    let first_frame = match capture_frame() {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = init_tx.send(Err(e.clone()));
-            return Err(e);
-        }
-    };
-    if is_start_cancelled(control) {
-        return Ok(LoopExit::CancelledBeforeStart);
-    }
-    if let Err(e) = write_frame(&first_frame) {
-        let _ = init_tx.send(Err(e.clone()));
-        return Err(e);
-    }
-    frames_written.store(1, Ordering::Relaxed);
-    let mut held_first_frame: Option<RgbaFrame> = Some(first_frame);
-
-    // Rendezvous handoff: returns `Err` if caller timed out and dropped `init_rx`.
-    // Once `Ok(())` returns, the caller owns a live session; any subsequent `stop_requested`
-    // (even immediately after start) is treated as a normal stop, never `CancelledBeforeStart`.
-    if init_tx.send(Ok(())).is_err() {
-        return Ok(LoopExit::CancelledBeforeStart);
-    }
-
-    let mut consecutive_failures: u32 = 0;
-    let mut next_tick = Instant::now() + interval;
-    loop {
-        let wait_for = next_tick.saturating_duration_since(Instant::now());
-        let stopped = {
-            let (lock, cvar) = control;
-            match lock.lock() {
-                Ok(guard) => {
-                    let (g, _) = cvar
-                        .wait_timeout_while(guard, wait_for, |c| !c.stop_requested)
-                        .unwrap_or_else(|p| p.into_inner());
-                    g.stop_requested
-                }
-                Err(_) => true,
-            }
-        };
-
-        if stopped {
-            // Never capture a new frame after stop was requested (privacy boundary):
-            // if only Frame 0 was written, duplicate that pre-stop frame once so the MP4 has >= 2 frames.
-            duplicate_single_frame_if_needed(
-                frames_written,
-                &mut held_first_frame,
-                &mut write_frame,
-            );
-            return Ok(LoopExit::Stopped);
-        }
-
-        if Instant::now() >= next_tick {
-            match capture_frame() {
-                Ok(frame) => {
-                    consecutive_failures = 0;
-                    if let Err(w_err) = write_frame(&frame) {
-                        let captured = frames_written.load(Ordering::Relaxed);
-                        return Ok(LoopExit::AbortedAfterPartialCapture(format!(
-                            "Encoder write failed after {captured} frames: {w_err}"
-                        )));
-                    }
-                    let count = frames_written.fetch_add(1, Ordering::Relaxed) + 1;
-                    if count >= 2 {
-                        held_first_frame = None;
-                    }
-                }
-                Err(err) => {
-                    consecutive_failures += 1;
-                    if consecutive_failures >= MAX_CONSECUTIVE_CAPTURE_FAILURES {
-                        let captured = frames_written.load(Ordering::Relaxed);
-                        duplicate_single_frame_if_needed(
-                            frames_written,
-                            &mut held_first_frame,
-                            &mut write_frame,
-                        );
-                        return Ok(LoopExit::AbortedAfterPartialCapture(format!(
-                            "Timelapse stopped after {consecutive_failures} consecutive capture failures ({captured} frames captured): {err}"
-                        )));
-                    }
-                }
-            }
-            let now = Instant::now();
-            next_tick += interval;
-            if next_tick <= now {
-                next_tick = now + interval;
-            }
-        }
-    }
-}
-
-fn duplicate_single_frame_if_needed<W>(
-    frames_written: &AtomicU64,
-    held_first_frame: &mut Option<RgbaFrame>,
-    write_frame: &mut W,
-) where
-    W: FnMut(&RgbaFrame) -> Result<(), String>,
-{
-    if frames_written.load(Ordering::Relaxed) == 1 {
-        if let Some(frame) = held_first_frame.take() {
-            if write_frame(&frame).is_ok() {
-                frames_written.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
 }
 
 fn record_timelapse_perf(codec: RecordingCodec, elapsed: Duration, output_bytes: u64, ok: bool) {

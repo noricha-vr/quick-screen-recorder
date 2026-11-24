@@ -1,98 +1,146 @@
-use super::*;
+use std::sync::Mutex;
 
-fn dummy_frame() -> RgbaFrame {
+use super::*;
+use crate::capture::timelapse_loop::MAX_CONSECUTIVE_CAPTURE_FAILURES;
+use crate::export::avfoundation::RgbaFrame;
+
+fn dummy_frame(tag: u8) -> RgbaFrame {
     RgbaFrame {
         width: 4,
         height: 4,
-        pixels: vec![0_u8; 4 * 4 * 4],
+        pixels: vec![tag; 4 * 4 * 4],
     }
 }
 
 #[test]
 fn delayed_init_after_caller_timeout_cancels_without_continuing_capture() {
-    let control = Arc::new((Mutex::new(TimelapseControl::default()), Condvar::new()));
+    let sync = SyncState::new();
     let frames_written = AtomicU64::new(0);
     let (init_tx, init_rx) = mpsc::sync_channel::<Result<(), String>>(0);
 
     // Caller timed out and dropped init_rx before worker finished Frame 0.
     drop(init_rx);
 
-    let mut captures = 0_u32;
+    let mut dispatches = 0_u32;
     let res = run_timelapse_loop(
         Duration::from_millis(5),
-        &control,
+        &sync,
         &frames_written,
         init_tx,
         || {
-            captures += 1;
-            Ok(dummy_frame())
+            dispatches += 1;
+            dispatches
         },
+        |_| Ok(dummy_frame(1)),
         |_| Ok(()),
     );
     assert_eq!(res, Ok(LoopExit::CancelledBeforeStart));
     assert_eq!(
-        captures, 1,
+        dispatches, 1,
         "worker must never enter interval loop after rendezvous handoff fails"
     );
 
-    // Pre-cancelled control aborts before capturing even Frame 0.
-    signal_start_cancelled(&control);
+    // Pre-cancelled control aborts before dispatching even Frame 0.
+    sync.signal_start_cancelled();
     let (init_tx2, _init_rx2) = mpsc::sync_channel::<Result<(), String>>(0);
-    let mut captures2 = 0_u32;
+    let mut dispatches2 = 0_u32;
     let res2 = run_timelapse_loop(
         Duration::from_millis(5),
-        &control,
+        &sync,
         &frames_written,
         init_tx2,
         || {
-            captures2 += 1;
-            Ok(dummy_frame())
+            dispatches2 += 1;
+            dispatches2
         },
+        |_| Ok(dummy_frame(2)),
         |_| Ok(()),
     );
     assert_eq!(res2, Ok(LoopExit::CancelledBeforeStart));
-    assert_eq!(captures2, 0);
+    assert_eq!(dispatches2, 0);
+}
+
+#[test]
+fn start_cancel_during_inflight_frame0_discards_frame_without_writing() {
+    let sync = SyncState::new();
+    let sync_worker = Arc::clone(&sync);
+    let frames_written = Arc::new(AtomicU64::new(0));
+    let frames_worker = Arc::clone(&frames_written);
+    let writes = Arc::new(AtomicU64::new(0));
+    let writes_worker = Arc::clone(&writes);
+
+    let (dispatched_tx, dispatched_rx) = mpsc::sync_channel::<()>(1);
+    let (release_tx, release_rx) = mpsc::sync_channel::<()>(1);
+    let (init_tx, init_rx) = mpsc::sync_channel::<Result<(), String>>(0);
+
+    let handle = thread::spawn(move || {
+        run_timelapse_loop(
+            Duration::from_secs(60),
+            &sync_worker,
+            &frames_worker,
+            init_tx,
+            || {
+                let _ = dispatched_tx.send(());
+            },
+            |()| {
+                let _ = release_rx.recv();
+                Ok(dummy_frame(99))
+            },
+            |_| {
+                writes_worker.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+    });
+
+    // Wait until Frame 0 is in flight, then cancel start (simulating start timeout) before it finishes.
+    dispatched_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("frame 0 dispatched");
+    drop(init_rx);
+    sync.signal_start_cancelled();
+    release_tx.send(()).expect("release inflight frame 0");
+
+    let exit = handle.join().expect("join worker");
+    assert_eq!(exit, Ok(LoopExit::CancelledBeforeStart));
+    assert_eq!(
+        writes.load(Ordering::SeqCst),
+        0,
+        "frame 0 completed after start_cancelled must be discarded without writing"
+    );
 }
 
 #[test]
 fn stop_immediately_after_start_and_never_captures_after_stop_requested() {
-    let control = Arc::new((Mutex::new(TimelapseControl::default()), Condvar::new()));
-    let control_worker = Arc::clone(&control);
+    let sync = SyncState::new();
+    let sync_worker = Arc::clone(&sync);
     let frames_written = Arc::new(AtomicU64::new(0));
     let frames_worker = Arc::clone(&frames_written);
-    let captures = Arc::new(AtomicU64::new(0));
-    let captures_worker = Arc::clone(&captures);
+    let dispatches = Arc::new(AtomicU64::new(0));
+    let dispatches_worker = Arc::clone(&dispatches);
 
     let (init_tx, init_rx) = mpsc::sync_channel::<Result<(), String>>(0);
     let handle = thread::spawn(move || {
         run_timelapse_loop(
             Duration::from_secs(60),
-            &control_worker,
+            &sync_worker,
             &frames_worker,
             init_tx,
-            || {
-                captures_worker.fetch_add(1, Ordering::SeqCst);
-                Ok(dummy_frame())
-            },
+            || dispatches_worker.fetch_add(1, Ordering::SeqCst) + 1,
+            |_| Ok(dummy_frame(1)),
             |_| Ok(()),
         )
     });
 
-    // Receive startup success, then immediately request stop (exercises post-start stop race
-    // AND verifies zero post-stop screen captures even when only Frame 0 existed).
     assert_eq!(init_rx.recv_timeout(Duration::from_secs(2)), Ok(Ok(())));
-    signal_stop(&control);
+    sync.signal_stop();
 
     let exit = handle.join().expect("join worker");
+    assert_eq!(exit, Ok(LoopExit::Stopped));
     assert_eq!(
-        exit,
-        Ok(LoopExit::Stopped),
-        "post-start stop must never be misclassified as CancelledBeforeStart"
-    );
-    assert_eq!(
-        captures.load(Ordering::SeqCst),
+        dispatches.load(Ordering::SeqCst),
         1,
-        "must never call capture_frame after stop was requested"
+        "must never dispatch a capture after stop was requested"
     );
     assert_eq!(
         frames_written.load(Ordering::Relaxed),
@@ -102,9 +150,110 @@ fn stop_immediately_after_start_and_never_captures_after_stop_requested() {
 }
 
 #[test]
+fn stop_during_inflight_interval_capture_discards_returned_frame() {
+    let sync = SyncState::new();
+    let sync_worker = Arc::clone(&sync);
+    let frames_written = Arc::new(AtomicU64::new(0));
+    let frames_worker = Arc::clone(&frames_written);
+    let written_tags = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let written_worker = Arc::clone(&written_tags);
+
+    let (second_dispatched_tx, second_dispatched_rx) = mpsc::sync_channel::<()>(1);
+    let (release_second_tx, release_second_rx) = mpsc::sync_channel::<()>(1);
+    let (init_tx, init_rx) = mpsc::sync_channel::<Result<(), String>>(0);
+
+    let handle = thread::spawn(move || {
+        let mut seq = 0_u8;
+        run_timelapse_loop(
+            Duration::from_millis(5),
+            &sync_worker,
+            &frames_worker,
+            init_tx,
+            || {
+                seq += 1;
+                if seq == 2 {
+                    let _ = second_dispatched_tx.send(());
+                }
+                seq
+            },
+            |n| {
+                if n == 2 {
+                    let _ = release_second_rx.recv();
+                }
+                Ok(dummy_frame(n))
+            },
+            |frame| {
+                written_worker.lock().unwrap().push(frame.pixels[0]);
+                Ok(())
+            },
+        )
+    });
+
+    assert_eq!(init_rx.recv_timeout(Duration::from_secs(2)), Ok(Ok(())));
+    // Wait until tick #2 has dispatched and is in flight, then signal stop before tick #2 completes.
+    second_dispatched_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("second capture dispatched");
+    sync.signal_stop();
+    release_second_tx.send(()).expect("release second capture");
+
+    let exit = handle.join().expect("join worker");
+    assert_eq!(exit, Ok(LoopExit::Stopped));
+    let tags = written_tags.lock().unwrap().clone();
+    assert_eq!(
+        tags,
+        vec![1, 1],
+        "in-flight tick #2 returned after stop must be discarded (only pre-stop frame #1 written)"
+    );
+}
+
+#[test]
+fn stop_serialized_before_tick_expiry_prevents_dispatching_second_capture() {
+    let sync = SyncState::new();
+    let sync_worker = Arc::clone(&sync);
+    let frames_written = Arc::new(AtomicU64::new(0));
+    let frames_worker = Arc::clone(&frames_written);
+    let dispatches = Arc::new(AtomicU64::new(0));
+    let dispatches_worker = Arc::clone(&dispatches);
+
+    let (init_tx, init_rx) = mpsc::sync_channel::<Result<(), String>>(0);
+    let handle = thread::spawn(move || {
+        run_timelapse_loop(
+            Duration::from_millis(25),
+            &sync_worker,
+            &frames_worker,
+            init_tx,
+            || dispatches_worker.fetch_add(1, Ordering::SeqCst) + 1,
+            |_| Ok(dummy_frame(7)),
+            |_| Ok(()),
+        )
+    });
+
+    assert_eq!(init_rx.recv_timeout(Duration::from_secs(2)), Ok(Ok(())));
+    // Hold the control lock across the tick boundary and set stop_requested before releasing it:
+    // proves the worker cannot dispatch a second capture once stop_requested becomes true.
+    {
+        let (lock, cvar) = &sync.control;
+        let mut guard = lock.lock().unwrap();
+        thread::sleep(Duration::from_millis(35));
+        guard.stop_requested = true;
+        sync.cancelled.store(true, Ordering::Release);
+        cvar.notify_all();
+    }
+
+    let exit = handle.join().expect("join worker");
+    assert_eq!(exit, Ok(LoopExit::Stopped));
+    assert_eq!(
+        dispatches.load(Ordering::SeqCst),
+        1,
+        "serialized stop across tick expiry must prevent dispatching capture #2"
+    );
+}
+
+#[test]
 fn consecutive_capture_failures_preserve_partial_frames_and_report_error() {
-    let control = Arc::new((Mutex::new(TimelapseControl::default()), Condvar::new()));
-    let control_worker = Arc::clone(&control);
+    let sync = SyncState::new();
+    let sync_worker = Arc::clone(&sync);
     let frames_written = Arc::new(AtomicU64::new(0));
     let frames_worker = Arc::clone(&frames_written);
     let (init_tx, init_rx) = mpsc::sync_channel::<Result<(), String>>(0);
@@ -113,13 +262,16 @@ fn consecutive_capture_failures_preserve_partial_frames_and_report_error() {
         let mut calls = 0_u32;
         let res = run_timelapse_loop(
             Duration::from_millis(2),
-            &control_worker,
+            &sync_worker,
             &frames_worker,
             init_tx,
             || {
                 calls += 1;
-                if calls <= 2 {
-                    Ok(dummy_frame())
+                calls
+            },
+            |n| {
+                if n <= 2 {
+                    Ok(dummy_frame(n as u8))
                 } else {
                     Err("target window closed".to_string())
                 }
@@ -150,10 +302,10 @@ fn stop_timeout_exceeds_writer_finish_and_recovers_delayed_finalization() {
         "stop wait must exceed AVAssetWriter finish timeout so slow finalization is not abandoned"
     );
 
-    let control = Arc::new((Mutex::new(TimelapseControl::default()), Condvar::new()));
+    let sync = SyncState::new();
     let (done_tx, done_rx) = mpsc::sync_channel::<Result<RecordingOutcome, String>>(1);
     let mut pending = PendingTimelapseStop {
-        control,
+        sync,
         done_rx,
         result: None,
         stop_initiated_at: Instant::now(),

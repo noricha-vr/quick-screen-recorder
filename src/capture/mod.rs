@@ -5,6 +5,7 @@ pub mod recorder;
 pub mod shareable;
 pub mod timelapse;
 mod timelapse_frame;
+mod timelapse_loop;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
