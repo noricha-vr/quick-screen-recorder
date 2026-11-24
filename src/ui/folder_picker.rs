@@ -10,7 +10,8 @@ use objc2_app_kit::{
 use objc2_foundation::{NSString, NSURL};
 
 use crate::fs_safety::{
-    default_movies_export_dir, format_tilde_path, is_usable_export_dir, valid_home_dir,
+    default_movies_export_dir, format_tilde_path, is_usable_export_dir, next_unique_token,
+    sanitize_terminal_text, valid_home_dir,
 };
 use crate::ui::editor_worker::EditorState;
 
@@ -170,15 +171,16 @@ pub fn populate_folder_popup(
         for (idx, item) in items.iter().enumerate() {
             match item {
                 FolderMenuItem::Dir { label, .. } => {
-                    let placeholder = format!("\u{1f}qsr-folder-{idx}");
+                    let placeholder = format!("\u{1f}qsr-folder-{}-{idx}", next_unique_token());
+                    let safe_label = sanitize_terminal_text(label, false);
                     popup.addItemWithTitle(&NSString::from_str(&placeholder));
                     if let Some(mi) = popup.lastItem() {
-                        mi.setTitle(&NSString::from_str(label));
+                        mi.setTitle(&NSString::from_str(&safe_label));
                         mi.setEnabled(true);
                     }
                 }
                 FolderMenuItem::Placeholder => {
-                    let placeholder = format!("\u{1f}qsr-folder-{idx}");
+                    let placeholder = format!("\u{1f}qsr-folder-{}-{idx}", next_unique_token());
                     popup.addItemWithTitle(&NSString::from_str(&placeholder));
                     if let Some(mi) = popup.lastItem() {
                         mi.setTitle(&NSString::from_str("Select Folder..."));
@@ -189,7 +191,7 @@ pub fn populate_folder_popup(
                     menu.addItem(&NSMenuItem::separatorItem(mtm));
                 }
                 FolderMenuItem::ChooseCustom => {
-                    let placeholder = format!("\u{1f}qsr-folder-{idx}");
+                    let placeholder = format!("\u{1f}qsr-folder-{}-{idx}", next_unique_token());
                     popup.addItemWithTitle(&NSString::from_str(&placeholder));
                     if let Some(mi) = popup.lastItem() {
                         mi.setTitle(&NSString::from_str("Choose Folder..."));

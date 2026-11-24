@@ -149,7 +149,7 @@ impl MicMenuItem {
         match self {
             Self::Off => "Off".to_string(),
             Self::SystemDefault { label } => label.clone(),
-            Self::Device { name, .. } => name.clone(),
+            Self::Device { name, .. } => format!("Mic: {name}"),
         }
     }
 
@@ -246,6 +246,8 @@ mod tests {
         assert_eq!(items.len(), 4);
         assert_eq!(items[0], MicMenuItem::Off);
         assert_eq!(items[1].menu_title(), "System (Off)");
+        assert_eq!(items[2].menu_title(), "Mic: Off");
+        assert_ne!(items[0].menu_title(), items[2].menu_title());
         assert_eq!(idx_b, 3);
         assert_eq!(
             items[idx_b].to_preference(),
