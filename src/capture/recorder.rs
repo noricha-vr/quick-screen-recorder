@@ -24,6 +24,7 @@ use delegate::{
     handle_start_callback_result, wait_for_capture_start_with_interrupt,
     wait_for_recording_started,
 };
+pub(crate) use finish::commit_staged_to_recovery_directly;
 pub use finish::is_valid_salvageable_mp4;
 use finish::{evaluate_stop_poll, finalize_stop_staging_outcome};
 
@@ -394,7 +395,17 @@ impl PendingRecordingStop {
     /// Stops the underlying capture stream (if not already stopped), verifies both trailer
     /// finalization and clean stream stop independently, commits/recovers the MP4, and retains
     /// staging untouched whenever stream stop was not cleanly confirmed.
-    pub fn finish(mut self) -> Result<RecordingOutcome, String> {
+    pub fn finish(self) -> Result<RecordingOutcome, String> {
+        self.finish_with_policy(false)
+    }
+
+    /// Finalizes and preserves the completed recording directly from staging into permanent
+    /// recovery (or protected staging on double failure), never writing a prunable cache file.
+    pub fn finish_to_recovery(self) -> Result<RecordingOutcome, String> {
+        self.finish_with_policy(true)
+    }
+
+    fn finish_with_policy(mut self, preserve_directly: bool) -> Result<RecordingOutcome, String> {
         self.send_stop_capture();
         let (start_completed, finished, finish_err, stream_stopped, stream_stop_err) = self
             .signal
@@ -433,6 +444,7 @@ impl PendingRecordingStop {
             finished,
             finish_err,
             stop_issue,
+            preserve_directly,
             private_recovery_dir(),
         ) {
             Ok(v) => v,

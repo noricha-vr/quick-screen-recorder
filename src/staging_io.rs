@@ -1,7 +1,7 @@
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -29,6 +29,19 @@ pub fn private_recovery_dir() -> Result<PathBuf, String> {
     };
     ensure_private_dir(&base)?;
     Ok(base)
+}
+
+pub(super) fn create_initial_keep_marker(dir_fd: libc::c_int) -> io::Result<OwnedFd> {
+    let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+    let fd = unsafe { libc::openat(dir_fd, c".qsr-keep".as_ptr(), flags, 0o600_u32) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    if unsafe { libc::pwrite(owned.as_raw_fd(), b"0".as_ptr().cast(), 1, 0) } != 1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(owned)
 }
 
 pub(super) fn fstatat_overwrite_mode(
@@ -440,7 +453,6 @@ pub fn preserve_capture_to_recovery(
     }
 }
 
-/// Rescues a finished GUI recording before app termination.
 pub fn preserve_recording_on_quit(
     output_path: &Path,
     temp_files: &mut Vec<PathBuf>,
@@ -455,8 +467,7 @@ pub fn preserve_recording_on_quit(
 }
 
 fn rename_file_as_preserved_in_place(path: &Path) -> Option<PathBuf> {
-    let parent = path.parent()?;
-    let old_name = path.file_name()?;
+    let (parent, old_name) = (path.parent()?, path.file_name()?);
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -468,8 +479,10 @@ fn rename_file_as_preserved_in_place(path: &Path) -> Option<PathBuf> {
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(parent)
         .ok()?;
-    let old_c = CString::new(old_name.as_bytes()).ok()?;
-    let new_c = CString::new(new_name.as_bytes()).ok()?;
+    let (old_c, new_c) = (
+        CString::new(old_name.as_bytes()).ok()?,
+        CString::new(new_name.as_bytes()).ok()?,
+    );
     let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
     let rc = unsafe {
         libc::renameatx_np(
@@ -480,9 +493,5 @@ fn rename_file_as_preserved_in_place(path: &Path) -> Option<PathBuf> {
             libc::RENAME_EXCL,
         )
     };
-    if rc == 0 {
-        Some(parent.join(new_name))
-    } else {
-        None
-    }
+    (rc == 0).then(|| parent.join(new_name))
 }

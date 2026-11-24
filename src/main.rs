@@ -126,7 +126,7 @@ fn execute(command: Command) -> Result<(), String> {
             // initialization are captured rather than missed.
             let monitor = SystemInterruptMonitor::start_headless();
             let session =
-                ActiveRecording::start_with_interrupt(&cfg, &output, Some(monitor.latch()))?;
+                ActiveRecording::start_with_interrupt(&cfg, &output, Some(monitor.latch()), false)?;
             monitor.attach_stop_hook(session.stop_hook());
             let deadline = Instant::now() + Duration::from_secs_f64(duration_sec);
             let mut interrupted_by = monitor.poll_interrupt();

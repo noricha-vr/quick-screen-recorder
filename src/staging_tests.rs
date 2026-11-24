@@ -245,17 +245,24 @@ fn preallocated_keep_marker_survives_retain_marker_creation_failure_and_cache_pr
     fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)).expect("chmod cache");
     let target = dest_dir.join("capture.mp4");
 
+    // 1. Crashed/abandoned ordinary export or recording (`.qsr-keep` remains `b"0"`, never retained):
+    //    simulate crash by copying an unretained `.qsr-work-*` snapshot after releasing its flock,
+    //    and verify expired cache pruning cleans it up cleanly (no permanent garbage!).
+    let crashed_dir = cache_dir.join(format!(".qsr-work-crashed-{}", random_hex_token()));
+    DirBuilder::new().mode(0o700).create(&crashed_dir).unwrap();
+    fs::write(crashed_dir.join(".qsr-keep"), b"0").unwrap();
+    fs::write(crashed_dir.join("staged.gif"), b"partial-crashed-export").unwrap();
+
+    // 2. Explicitly retained staging when `stage_dir` is read-only (0o500): creating any new file
+    //    fails with EACCES, yet `retain_staged_in_place()` flips the pre-opened `keep_marker_fd`
+    //    to `b"1"` using 0 new FDs and 0 dir writes -> survives expired cache pruning!
     let mut staging =
         ExclusiveStagingDir::create_in_cache_root(&cache_dir, &target, "mp4", false).expect("stg");
     let staged_path = staging.staged_file().to_path_buf();
     let stage_dir = staged_path.parent().expect("stage dir").to_path_buf();
     fs::write(&staged_path, b"critical-unflushed-recording").expect("write payload");
+    assert_eq!(fs::read(stage_dir.join(".qsr-keep")).unwrap(), b"0");
 
-    // Pre-allocated `.qsr-keep` exists before retain is ever needed.
-    assert!(stage_dir.join(".qsr-keep").exists());
-
-    // Simulate ENOSPC/EMFILE/EACCES at retain time by making `stage_dir` read-only (0o500),
-    // ensuring creating any new file inside `stage_dir` fails during `retain_staged_in_place()`.
     fs::set_permissions(&stage_dir, fs::Permissions::from_mode(0o500)).expect("chmod 0500");
     assert!(
         fs::OpenOptions::new()
@@ -269,18 +276,70 @@ fn preallocated_keep_marker_survives_retain_marker_creation_failure_and_cache_pr
     assert_eq!(kept, staged_path);
     drop(staging);
 
-    // Restore writable mode so `prune_stale_cache_files_in` CAN delete unmarked dirs, then run
-    // expired cache pruning (`Duration::ZERO`) — pre-allocated `.qsr-keep` MUST protect the dir!
     fs::set_permissions(&stage_dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    assert_eq!(fs::read(stage_dir.join(".qsr-keep")).unwrap(), b"1");
     prune_stale_cache_files_in(&cache_dir, Duration::ZERO);
 
     assert!(
+        !crashed_dir.exists(),
+        "crashed unretained staging (marker=0) must be pruned after expiry"
+    );
+    assert!(
         staged_path.exists(),
-        "retained staged file must survive expired cache pruning even when marker creation fails at retain time"
+        "retained staged file must survive expired cache pruning even when dir creation fails"
     );
     assert_eq!(
         fs::read(&staged_path).expect("read preserved payload"),
         b"critical-unflushed-recording"
+    );
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn auto_stop_direct_recovery_double_failure_survives_cache_pruning() {
+    let base = std::env::temp_dir().join(format!("qsr-autostop-dbl-{}", random_hex_token()));
+    let cache_dir = base.join("cache");
+    fs::create_dir_all(&cache_dir).expect("mkdir cache");
+    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)).expect("chmod cache");
+    let prunable_gui_target = cache_dir.join("capture-gui-temp.mp4");
+
+    let mut staging =
+        ExclusiveStagingDir::create_in_cache_root(&cache_dir, &prunable_gui_target, "mp4", false)
+            .expect("create staging");
+    fs::write(staging.staged_file(), b"auto-stopped-recording-bytes").expect("write clip");
+
+    // Force DOUBLE failure on auto-stop direct preservation:
+    // (1) recovery_dir fails (Err("EMFILE")) AND (2) parent cache_dir is 0o500 so
+    // `.qsr-work-*` -> `qsr-preserved-*` rename ALSO fails!
+    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o500)).expect("chmod 0500");
+    let (saved_path, size, warning) = crate::capture::recorder::commit_staged_to_recovery_directly(
+        &mut staging,
+        None,
+        Err("EMFILE".to_string()),
+    )
+    .expect("direct preservation fallback returns protected staging path");
+    drop(staging);
+
+    assert_eq!(size, b"auto-stopped-recording-bytes".len() as u64);
+    assert!(warning.as_deref().unwrap_or("").contains("EMFILE"));
+    assert!(
+        !prunable_gui_target.exists(),
+        "auto-stop direct recovery must never fall back to a prunable capture-*.mp4 in Caches"
+    );
+
+    // Restore writable cache_dir and run expired cache pruning (`Duration::ZERO`):
+    // protected staging dir (`.qsr-keep == b"1"`) MUST survive pruning intact!
+    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    prune_stale_cache_files_in(&cache_dir, Duration::ZERO);
+
+    assert!(
+        saved_path.exists(),
+        "double-failure auto-stop recording must survive 24h cache pruning"
+    );
+    assert_eq!(
+        fs::read(&saved_path).expect("read preserved bytes"),
+        b"auto-stopped-recording-bytes"
     );
 
     let _ = fs::remove_dir_all(&base);

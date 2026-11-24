@@ -16,8 +16,8 @@ use crate::fs_safety::{
 mod io_helpers;
 
 use io_helpers::{
-    XdevTempGuard, copy_into_pinned_dir_overwrite, fstatat_overwrite_mode, rename_excl_within_dir,
-    stage_once_on_dest_volume,
+    XdevTempGuard, copy_into_pinned_dir_overwrite, create_initial_keep_marker,
+    fstatat_overwrite_mode, rename_excl_within_dir, stage_once_on_dest_volume,
 };
 pub use io_helpers::{
     commit_or_recover_default, commit_or_recover_salvaged_default, commit_or_recover_staging,
@@ -31,6 +31,7 @@ pub use io_helpers::{
 pub struct ExclusiveStagingDir {
     stage_dir_path: PathBuf,
     stage_dir_fd: OwnedFd,
+    keep_marker_fd: OwnedFd,
     staged_name_c: CString,
     staged_file: PathBuf,
     dest_dir_fd: OwnedFd,
@@ -153,12 +154,15 @@ impl ExclusiveStagingDir {
             return Err("Staging directory ownership, 0700 mode, or ACL check failed".to_string());
         }
         let stage_dir_fd = OwnedFd::from(stage_dir_file);
-        // Pre-allocate `.qsr-keep` at creation so `retain_staged_in_place()` guarantees permanent
-        // exclusion from cache pruning even under later ENOSPC / EMFILE conditions.
-        if let Err(err) = ensure_keep_marker(stage_dir_fd.as_raw_fd(), true) {
-            let _ = fs::remove_dir_all(&stage_dir_path);
-            return Err(format!("Failed pre-allocating staging keep marker: {err}"));
-        }
+        // Pre-open `.qsr-keep` initialized to `b"0"` (crash-prunable) so `retain_staged_in_place()`
+        // can flip it to `b"1"` with 0 new FDs and 0 dir writes even under EMFILE/read-only dir.
+        let keep_marker_fd = match create_initial_keep_marker(stage_dir_fd.as_raw_fd()) {
+            Ok(fd) => fd,
+            Err(err) => {
+                let _ = fs::remove_dir_all(&stage_dir_path);
+                return Err(format!("Failed pre-allocating staging keep marker: {err}"));
+            }
+        };
 
         let clean_ext = ext.trim_start_matches('.');
         let staged_name = format!("staged.{clean_ext}");
@@ -169,6 +173,7 @@ impl ExclusiveStagingDir {
         Ok(Self {
             stage_dir_path,
             stage_dir_fd,
+            keep_marker_fd,
             staged_name_c,
             staged_file,
             dest_dir_fd,
@@ -425,10 +430,12 @@ impl ExclusiveStagingDir {
         ))
     }
 
-    /// Disarms drop cleanup while keeping the pre-allocated `.qsr-keep` marker in place.
+    /// Disarms drop cleanup and flips the pre-opened `.qsr-keep` marker to `b"1"` via `pwrite`
+    /// (requires 0 new FDs and 0 directory writes, surviving EMFILE and read-only parent dirs).
     pub fn retain_staged_in_place(&mut self) -> PathBuf {
         let _ = fs::set_permissions(&self.staged_file, fs::Permissions::from_mode(0o600));
-        let _ = ensure_keep_marker(self.stage_dir_fd.as_raw_fd(), false);
+        let _ =
+            unsafe { libc::pwrite(self.keep_marker_fd.as_raw_fd(), b"1".as_ptr().cast(), 1, 0) };
         self.keep_staged_on_drop = true;
         self.staged_file.clone()
     }
@@ -470,19 +477,6 @@ impl ExclusiveStagingDir {
         }
         self.staged_file.clone()
     }
-}
-
-fn ensure_keep_marker(dir_fd: libc::c_int, excl: bool) -> io::Result<()> {
-    let mut flags = libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-    if excl {
-        flags |= libc::O_EXCL;
-    }
-    let fd = unsafe { libc::openat(dir_fd, c".qsr-keep".as_ptr(), flags, 0o600_u32) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    unsafe { libc::close(fd) };
-    Ok(())
 }
 
 impl Drop for ExclusiveStagingDir {

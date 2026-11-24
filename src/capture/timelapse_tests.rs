@@ -315,6 +315,7 @@ fn stop_timeout_exceeds_writer_finish_and_recovers_delayed_finalization() {
     let mut pending = PendingTimelapseStop {
         sync,
         committing,
+        preserve_directly: Arc::new(AtomicBool::new(false)),
         done_rx,
         result: None,
         stop_initiated_at: Instant::now(),
@@ -340,6 +341,7 @@ fn slow_cross_volume_commit_does_not_time_out_after_encoder_finishes() {
     let mut pending = PendingTimelapseStop {
         sync,
         committing: Arc::clone(&committing),
+        preserve_directly: Arc::new(AtomicBool::new(false)),
         done_rx,
         result: None,
         stop_initiated_at: Instant::now(),
@@ -369,6 +371,7 @@ fn slow_cross_volume_commit_does_not_time_out_after_encoder_finishes() {
     let pending_direct = PendingTimelapseStop {
         sync: SyncState::new(),
         committing: Arc::new(AtomicBool::new(true)),
+        preserve_directly: Arc::new(AtomicBool::new(false)),
         done_rx: done_rx_direct,
         result: None,
         stop_initiated_at: Instant::now(),
@@ -387,6 +390,7 @@ fn slow_cross_volume_commit_does_not_time_out_after_encoder_finishes() {
     let mut stuck = PendingTimelapseStop {
         sync: SyncState::new(),
         committing: Arc::new(AtomicBool::new(false)),
+        preserve_directly: Arc::new(AtomicBool::new(false)),
         done_rx: rx2,
         result: None,
         stop_initiated_at: Instant::now(),

@@ -345,6 +345,7 @@ fn unconfirmed_stop_handoff_retains_staging_on_disk_after_finish_timeout() {
         false,
         None,
         Some("Timed out confirming capture stream stopped".to_string()),
+        false,
         Ok(dir.join("Recovered")),
     );
     assert!(

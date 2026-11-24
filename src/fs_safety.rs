@@ -292,15 +292,22 @@ pub(crate) fn prune_stale_cache_files_in(dir: &Path, max_age: Duration) {
 }
 
 fn has_staged_keep_marker(dir_fd: libc::c_int) -> bool {
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    unsafe {
-        libc::fstatat(
+    let fd = unsafe {
+        libc::openat(
             dir_fd,
             c".qsr-keep".as_ptr(),
-            &mut st,
-            libc::AT_SYMLINK_NOFOLLOW,
-        ) == 0
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return false;
     }
+    let mut byte = [0_u8; 1];
+    let n = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) };
+    unsafe { libc::close(fd) };
+    // `b'0'` = active/unretained staging (prunable after crash + 24h once flock releases).
+    // `b'1'` (explicitly retained) or 0-byte legacy marker = permanently exempt from pruning.
+    n == 0 || (n == 1 && byte[0] != b'0')
 }
 
 /// Strips ASCII/Unicode control characters as well as Unicode bidirectional override characters.

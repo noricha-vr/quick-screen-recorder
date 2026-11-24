@@ -187,6 +187,9 @@ pub(crate) fn stop_active_recording_with_reason(
     if auto_stop_reason.is_some() {
         arm_fresh_unlock_monitor(runtime);
     }
+    if auto_stop_reason.is_some() || runtime.borrow().quit_after_stop {
+        session.mark_preserve_to_recovery();
+    }
     let prev_latch = prev_monitor.as_ref().map(|mon| mon.latch());
     let monitor_cell = RefCell::new(prev_monitor);
 
@@ -255,7 +258,12 @@ pub(crate) fn stop_active_recording_with_reason(
             }
         }
 
-        match pending.finish() {
+        let finish_res = if auto_stop_reason.is_some() || should_quit {
+            pending.finish_to_recovery()
+        } else {
+            pending.finish()
+        };
+        match finish_res {
             Ok(outcome) => {
                 if should_quit {
                     let rescued = preserve_capture_to_recovery(

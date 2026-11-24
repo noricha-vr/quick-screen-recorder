@@ -82,18 +82,43 @@ fn format_stop_error_with_preservation(
     )
 }
 
+/// Preserves a completed staged MP4 directly into permanent recovery (never committing to a
+/// prunable cache path). If recovery fails, retains the protected staging dir (`.qsr-keep = 1`,
+/// plus `qsr-preserved-*` rename if possible) so even double failure survives 24h cache pruning.
+pub(crate) fn commit_staged_to_recovery_directly(
+    staging: &mut ExclusiveStagingDir,
+    partial_error: Option<String>,
+    recovery_dir: Result<PathBuf, String>,
+) -> Result<(PathBuf, u64, Option<String>), String> {
+    let size = std::fs::metadata(staging.staged_file())
+        .map(|m| m.len())
+        .unwrap_or(0);
+    match preserve_staged_permanently(staging, recovery_dir) {
+        Ok(saved_path) => Ok((saved_path, size, partial_error)),
+        Err((rec_err, kept_path)) => {
+            let warn = match partial_error {
+                Some(p) => format!("{p}; recovery fallback: {rec_err}"),
+                None => format!("recovery fallback: {rec_err}"),
+            };
+            Ok((kept_path, size, Some(warn)))
+        }
+    }
+}
+
 /// Resolves staging ownership at the end of `PendingRecordingStop::finish`:
 /// - Whenever `stop_issue` is `Some` (stream stop failed, timed out, or start never settled),
 ///   `staging` is NEVER deleted on drop: playable MP4s move to permanent recovery, and incomplete
 ///   or unconfirmed staging paths are retained in place via `.qsr-keep`.
-/// - When stream stop IS cleanly confirmed, salvages valid MP4s without overwriting existing files,
-///   or commits normally on clean completion.
+/// - When `preserve_directly` is `true` (GUI auto-stop / quit-save), preserves directly from
+///   staging to recovery (or protected staging on double failure) without touching prunable cache.
+/// - Otherwise commits normally or salvages without overwriting existing target files.
 pub(super) fn finalize_stop_staging_outcome(
     staging: &mut ExclusiveStagingDir,
     output_path: PathBuf,
     finished: bool,
     finish_err: Option<String>,
     stop_issue: Option<String>,
+    preserve_directly: bool,
     recovery_dir: Result<PathBuf, String>,
 ) -> Result<(PathBuf, u64, Option<String>), String> {
     if let Some(stop_err) = stop_issue {
@@ -131,7 +156,9 @@ pub(super) fn finalize_stop_staging_outcome(
         }
     }
 
-    if salvaged_warn.is_some() {
+    if preserve_directly {
+        commit_staged_to_recovery_directly(staging, salvaged_warn, recovery_dir)
+    } else if salvaged_warn.is_some() {
         commit_or_recover_salvaged_default(staging, output_path, salvaged_warn)
     } else {
         commit_or_recover_default(staging, output_path, None)

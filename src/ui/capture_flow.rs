@@ -250,7 +250,7 @@ fn launch_recording_session(
             }
         }
     });
-    match ActiveRecording::start_with_interrupt(&cfg, &raw_out, Some(monitor.latch())) {
+    match ActiveRecording::start_with_interrupt(&cfg, &raw_out, Some(monitor.latch()), true) {
         Ok(session) => {
             monitor.attach_stop_hook(session.stop_hook());
             let early_interrupt = monitor.poll_interrupt();
