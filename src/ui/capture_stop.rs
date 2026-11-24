@@ -25,6 +25,13 @@ pub(crate) fn should_complete_tutorial_on_save(
     !recording_active && active_tutorial_gen.is_some() && active_tutorial_gen == editor_tutorial_gen
 }
 
+pub(crate) fn should_drop_idle_unlock_monitor(
+    has_deferred_alerts: bool,
+    has_pending_stop: bool,
+) -> bool {
+    !has_deferred_alerts && !has_pending_stop
+}
+
 /// Defer modal `NSAlert::runModal()` calls while the screen is actively locked or still asleep
 /// (i.e. wake/unlock has not yet been observed since the auto-stop started). If macOS already
 /// resumed before finalization completed, display the alert immediately instead of waiting for
@@ -46,8 +53,9 @@ pub(crate) fn should_defer_error_alert(
     )
 }
 
-fn ensure_unlock_monitor(runtime: &Rc<RefCell<AppRuntime>>) {
-    if runtime.borrow().unlock_monitor.is_some() {
+fn arm_fresh_unlock_monitor(runtime: &Rc<RefCell<AppRuntime>>) {
+    if let Some(mon) = &runtime.borrow().unlock_monitor {
+        mon.reset_resumed();
         return;
     }
     let rt_unlock = Rc::clone(runtime);
@@ -55,10 +63,24 @@ fn ensure_unlock_monitor(runtime: &Rc<RefCell<AppRuntime>>) {
         if let Some(m) = MainThreadMarker::new() {
             if current_session_interrupt().is_none() {
                 flush_deferred_alerts(m, &rt_unlock);
+                let mut rt = rt_unlock.borrow_mut();
+                if should_drop_idle_unlock_monitor(
+                    !rt.deferred_alerts.is_empty(),
+                    rt.pending_stop.is_some(),
+                ) {
+                    let _ = rt.unlock_monitor.take();
+                }
             }
         }
     });
     runtime.borrow_mut().unlock_monitor = Some(mon);
+}
+
+fn ensure_unlock_monitor(runtime: &Rc<RefCell<AppRuntime>>) {
+    if runtime.borrow().unlock_monitor.is_some() {
+        return;
+    }
+    arm_fresh_unlock_monitor(runtime);
 }
 
 pub(crate) fn queue_or_show_error_alert(
@@ -155,10 +177,10 @@ pub(crate) fn stop_active_recording_with_reason(
         (sess, rt.active_capture_app.take(), rt.tutorial_generation)
     };
 
-    // Arm unlock/wake monitoring before finalization starts when auto-stopping so if macOS
-    // wakes up while the MP4 is flushing, we detect `has_resumed()` and never leave alerts stuck.
+    // Always reset/arm a fresh unlock/wake monitor on EVERY auto-stop so `has_resumed` from a
+    // previous stop can never bleed into a subsequent sleep auto-stop.
     if auto_stop_reason.is_some() {
-        ensure_unlock_monitor(runtime);
+        arm_fresh_unlock_monitor(runtime);
     }
 
     // Initiate teardown without blocking the AppKit main runloop; CoreAudio / ScreenCaptureKit

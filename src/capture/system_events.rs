@@ -22,6 +22,8 @@ use objc2_foundation::{
 #[path = "system_resume.rs"]
 mod resume;
 
+#[cfg(test)]
+pub(crate) use resume::ResumeLatch;
 pub use resume::UnlockMonitor;
 
 const DISTRIBUTED_SCREEN_LOCKED_NAME: &str = "com.apple.screenIsLocked";

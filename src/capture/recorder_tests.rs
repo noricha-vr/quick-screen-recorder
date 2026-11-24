@@ -98,3 +98,73 @@ fn stop_poll_state_machine_handles_ordering_fallback_delay_and_timeout() {
         (StopPollState::TimedOut, false)
     );
 }
+
+#[test]
+fn delayed_start_callback_interrupted_triggers_immediate_and_late_stop() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    let (tx, rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let latch = InterruptLatch::new();
+
+    let immediate_stops = Arc::new(AtomicUsize::new(0));
+    let late_cleanups = Arc::new(AtomicUsize::new(0));
+    let imm_hook = Arc::clone(&immediate_stops);
+    let cancel_hook = Arc::clone(&cancelled);
+    latch.attach_stop_hook(Arc::new(move || {
+        cancel_hook.store(true, Ordering::Release);
+        imm_hook.fetch_add(1, Ordering::SeqCst);
+    }));
+
+    // Trigger screen lock 30ms into the start wait, BEFORE the delayed start callback fires at 90ms.
+    let latch_bg = latch.clone();
+    let interrupter = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(30));
+        let _ = latch_bg.trigger(crate::capture::SystemInterruptReason::ScreenLocked);
+    });
+
+    let cancel_cb = Arc::clone(&cancelled);
+    let late_cb = Arc::clone(&late_cleanups);
+    let delayed_start_cb = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(90));
+        handle_start_callback_result(Ok(()), &cancel_cb, &tx, || {
+            late_cb.fetch_add(1, Ordering::SeqCst);
+        });
+    });
+
+    let started = Instant::now();
+    let wait_res = wait_for_capture_start_with_interrupt(
+        &rx,
+        Duration::from_secs(8),
+        &cancelled,
+        || {
+            latch
+                .reason()
+                .map(|r| format!("interrupted: {}", r.clause()))
+        },
+        || {
+            immediate_stops.fetch_add(1, Ordering::SeqCst);
+        },
+    );
+    assert!(
+        wait_res.is_err(),
+        "interrupted startup must abort instead of waiting for delayed callback"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "must abort promptly rather than waiting full 8s timeout"
+    );
+    assert!(
+        immediate_stops.load(Ordering::SeqCst) >= 1,
+        "immediate stop must fire when interrupted during start wait"
+    );
+
+    interrupter.join().expect("join interrupter");
+    delayed_start_cb.join().expect("join delayed callback");
+    assert_eq!(
+        late_cleanups.load(Ordering::SeqCst),
+        1,
+        "delayed start completion after cancellation must trigger forced late-start teardown"
+    );
+}

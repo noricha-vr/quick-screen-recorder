@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
@@ -19,6 +20,7 @@ mod delegate;
 pub use delegate::is_valid_salvageable_mp4;
 use delegate::{
     DelegateSignal, RecordingDelegate, SendableStreamStop, StreamStopControl, evaluate_stop_poll,
+    handle_start_callback_result, wait_for_capture_start_with_interrupt,
     wait_for_recording_started,
 };
 
@@ -211,38 +213,49 @@ impl RecordingSession {
         }
 
         let (tx, rx) = mpsc::sync_channel::<Result<(), String>>(1);
+        let cancelled_after_start = Arc::new(AtomicBool::new(false));
+
+        // Attach the immediate stop hook BEFORE invoking `startCapture` so watchdog/notifications
+        // can cancel and stop capture even while `startCapture` completion is delayed.
+        if let Some(ref latch) = interrupt_latch {
+            let s_hook = Arc::clone(&stopper);
+            let cancel_hook = Arc::clone(&cancelled_after_start);
+            latch.attach_stop_hook(Arc::new(move || {
+                cancel_hook.store(true, std::sync::atomic::Ordering::Release);
+                s_hook.stop_now(STOP_FALLBACK_AFTER);
+            }));
+        }
+        if let Some(msg) = check_interrupted() {
+            cancelled_after_start.store(true, std::sync::atomic::Ordering::Release);
+            stopper.stop_now(Duration::from_millis(250));
+            return Err(msg);
+        }
+
+        let cancel_cb = Arc::clone(&cancelled_after_start);
+        let stopper_cb = Arc::clone(&stopper);
         let start_block = RcBlock::new(move |err: *mut NSError| {
-            if !err.is_null() {
+            let res = if !err.is_null() {
                 let msg = unsafe { (&*err).localizedDescription().to_string() };
-                let _ = tx.send(Err(format!("Failed to start screen capture: {msg}")));
+                Err(format!("Failed to start screen capture: {msg}"))
             } else {
-                let _ = tx.send(Ok(()));
-            }
+                Ok(())
+            };
+            handle_start_callback_result(res, &cancel_cb, &tx, || {
+                stopper_cb.stop_force_on_late_start();
+            });
         });
 
         unsafe {
             stream.startCaptureWithCompletionHandler(Some(&start_block));
         }
 
-        match rx.recv_timeout(Duration::from_secs(8)) {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(e),
-            Err(_) => {
-                stopper.stop_now(Duration::from_millis(250));
-                return Err("Timed out starting ScreenCaptureKit stream".to_string());
-            }
-        }
-
-        // Attach the stop hook immediately once capture starts so any lock/sleep event during
-        // `did_start` initialization stops the stream right away without waiting for `start` to return.
-        if let Some(ref latch) = interrupt_latch {
-            let s_hook = Arc::clone(&stopper);
-            latch.attach_stop_hook(Arc::new(move || s_hook.stop_now(STOP_FALLBACK_AFTER)));
-        }
-        if let Some(msg) = check_interrupted() {
-            stopper.stop_now(Duration::from_millis(250));
-            return Err(msg);
-        }
+        wait_for_capture_start_with_interrupt(
+            &rx,
+            Duration::from_secs(8),
+            &cancelled_after_start,
+            check_interrupted,
+            || stopper.stop_now(Duration::from_millis(250)),
+        )?;
 
         wait_for_recording_started(&signal, &stopper, Duration::from_secs(8), check_interrupted)?;
         if let Some(msg) = check_interrupted() {

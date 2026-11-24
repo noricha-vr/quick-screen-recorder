@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
@@ -129,6 +129,88 @@ impl SendableStreamStop {
             self.control
                 .trigger_stop_capture_once(&self.stream, &self.signal);
         });
+    }
+
+    /// Unconditional teardown used when a delayed `startCapture` completion handler succeeds
+    /// AFTER startup was already cancelled by an interrupt/timeout (earlier pre-start stop calls
+    /// may have returned `-3808` before the stream transitioned to running).
+    pub(super) fn stop_force_on_late_start(&self) {
+        autoreleasepool(|_| {
+            let _ = unsafe {
+                self.stream
+                    .removeRecordingOutput_error(&self.recording_output)
+            };
+            unsafe {
+                self.stream.stopCaptureWithCompletionHandler(None);
+            }
+        });
+    }
+}
+
+/// Coordinates a potentially delayed `startCaptureWithCompletionHandler` result with concurrent
+/// system-interrupt cancellation so startup never blocks 8 seconds on lock/sleep and late start
+/// completions can never leave a stream running.
+pub(super) fn wait_for_capture_start_with_interrupt<F, S>(
+    rx: &mpsc::Receiver<Result<(), String>>,
+    timeout: Duration,
+    cancelled_after_start: &AtomicBool,
+    mut check_interrupted: F,
+    mut trigger_immediate_stop: S,
+) -> Result<(), String>
+where
+    F: FnMut() -> Option<String>,
+    S: FnMut(),
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(msg) = check_interrupted() {
+            cancelled_after_start.store(true, Ordering::Release);
+            trigger_immediate_stop();
+            return Err(msg);
+        }
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            cancelled_after_start.store(true, Ordering::Release);
+            trigger_immediate_stop();
+            return Err("Timed out starting ScreenCaptureKit stream".to_string());
+        }
+        match rx.recv_timeout(rem.min(Duration::from_millis(25))) {
+            Ok(Ok(())) => {
+                if let Some(msg) = check_interrupted() {
+                    cancelled_after_start.store(true, Ordering::Release);
+                    trigger_immediate_stop();
+                    return Err(msg);
+                }
+                return Ok(());
+            }
+            Ok(Err(err)) => return Err(err),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                cancelled_after_start.store(true, Ordering::Release);
+                trigger_immediate_stop();
+                return Err("ScreenCaptureKit start handler disconnected".to_string());
+            }
+        }
+    }
+}
+
+/// Invoked inside the `startCaptureWithCompletionHandler` completion block. If startup was
+/// already cancelled while this callback was delayed, runs `on_late_start_cleanup` so a newly
+/// running stream is torn down immediately instead of remaining active.
+pub(super) fn handle_start_callback_result<C>(
+    res: Result<(), String>,
+    cancelled_after_start: &AtomicBool,
+    tx: &mpsc::SyncSender<Result<(), String>>,
+    on_late_start_cleanup: C,
+) where
+    C: FnOnce(),
+{
+    if res.is_ok() && cancelled_after_start.load(Ordering::Acquire) {
+        on_late_start_cleanup();
+        return;
+    }
+    if tx.send(res).is_err() || cancelled_after_start.load(Ordering::Acquire) {
+        on_late_start_cleanup();
     }
 }
 

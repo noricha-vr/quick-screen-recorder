@@ -47,6 +47,44 @@ fn modal_alerts_defer_when_locked_or_asleep_and_show_once_resumed() {
 }
 
 #[test]
+fn consecutive_auto_stops_reset_resume_state_independently() {
+    let latch = crate::capture::system_events::ResumeLatch::default();
+
+    // Auto-stop #1 (display sleep): defers until wake, then shows immediately once resumed.
+    latch.reset();
+    assert!(should_defer_error_alert(
+        Some(SystemInterruptReason::DisplaySlept),
+        false,
+        latch.has_resumed()
+    ));
+    latch.mark_resumed();
+    assert!(!should_defer_error_alert(
+        Some(SystemInterruptReason::DisplaySlept),
+        false,
+        latch.has_resumed()
+    ));
+
+    // Auto-stop #2 (subsequent display sleep): previous resumed=true must NOT leak; must defer again!
+    latch.reset();
+    assert!(should_defer_error_alert(
+        Some(SystemInterruptReason::DisplaySlept),
+        false,
+        latch.has_resumed()
+    ));
+    latch.mark_resumed();
+    assert!(!should_defer_error_alert(
+        Some(SystemInterruptReason::DisplaySlept),
+        false,
+        latch.has_resumed()
+    ));
+
+    // Idle monitor cleanup only drops when neither alerts nor pending stops remain.
+    assert!(should_drop_idle_unlock_monitor(false, false));
+    assert!(!should_drop_idle_unlock_monitor(true, false));
+    assert!(!should_drop_idle_unlock_monitor(false, true));
+}
+
+#[test]
 fn auto_stop_notice_includes_reason_and_saved_location() {
     let path = Path::new("/tmp/AutoSaved-Recording-recovered-abc123.mp4");
     let clean = build_auto_stop_notice(SystemInterruptReason::ScreenLocked, path, None, None);
