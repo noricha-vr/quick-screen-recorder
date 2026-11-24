@@ -6,7 +6,8 @@ INSTALLER="$ROOT_DIR/scripts/install-local.sh"
 BUNDLE_ID="io.github.noricha-vr.quick-screen-recorder"
 
 TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/qsr-install-test.XXXXXX")"
-trap 'rm -rf "$TMP_ROOT"' EXIT
+REAL_PROC_PID=""
+trap '[[ -n "${REAL_PROC_PID:-}" ]] && kill "$REAL_PROC_PID" 2>/dev/null || true; rm -rf "$TMP_ROOT"' EXIT
 
 STUB_BIN="$TMP_ROOT/bin"
 mkdir -p "$STUB_BIN"
@@ -53,25 +54,25 @@ exit 1
 EOF
 chmod +x "$STUB_BIN/codesign"
 
-cat > "$STUB_BIN/tccutil" << EOF
+cat > "$STUB_BIN/tccutil" << 'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-echo "ARGC=\$# ARGS=\$*" >> "$TCC_LOG"
-if [[ "\${STUB_TCC_FAIL_SVC:-}" == "\${2:-}" ]]; then
+echo "ARGC=$# ARGS=$*" >> "$QSR_STUB_TCC_LOG"
+if [[ "${STUB_TCC_FAIL_SVC:-}" == "${2:-}" ]]; then
   exit 1
 fi
 exit 0
 EOF
 chmod +x "$STUB_BIN/tccutil"
 
-cat > "$STUB_BIN/ps" << EOF
+cat > "$STUB_BIN/ps" << 'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 count=0
-[[ -f "$PS_COUNT_FILE" ]] && count="\$(cat "$PS_COUNT_FILE")"
-count=\$((count + 1))
-echo "\$count" > "$PS_COUNT_FILE"
-case "\${STUB_PS_MODE:-not_running}" in
+[[ -f "$QSR_STUB_PS_COUNT_FILE" ]] && count="$(cat "$QSR_STUB_PS_COUNT_FILE")"
+count=$((count + 1))
+echo "$count" > "$QSR_STUB_PS_COUNT_FILE"
+case "${STUB_PS_MODE:-not_running}" in
   not_running)
     printf '/sbin/launchd\n/usr/bin/zsh\n'
     exit 0
@@ -80,11 +81,16 @@ case "\${STUB_PS_MODE:-not_running}" in
     printf '/sbin/launchd\n/Applications/QuickScreenRecorder.app/Contents/MacOS/quick-screen-recorder\n'
     exit 0
     ;;
+  running_long)
+    printf '/Applications/QuickScreenRecorder.app/Contents/MacOS/quick-screen-recorder\n'
+    awk 'BEGIN { for (i = 0; i < 25000; i++) print "/usr/libexec/dummy-process-line-for-sigpipe-regression-" i }'
+    exit 0
+    ;;
   error)
     exit 1
     ;;
   running_on_second)
-    if [[ "\$count" -ge 2 ]]; then
+    if [[ "$count" -ge 2 ]]; then
       printf '/Applications/QuickScreenRecorder.app/Contents/MacOS/quick-screen-recorder\n'
     else
       printf '/sbin/launchd\n'
@@ -131,7 +137,10 @@ PLIST
 
 run_inst() {
   rm -f "$PS_COUNT_FILE"
-  PATH="$STUB_BIN:$PATH" bash "$INSTALLER" "$@"
+  QSR_STUB_TCC_LOG="$TCC_LOG" \
+    QSR_STUB_PS_COUNT_FILE="$PS_COUNT_FILE" \
+    PATH="$STUB_BIN:$PATH" \
+    bash "$INSTALLER" "$@"
 }
 
 assert_log_lines() {
@@ -238,10 +247,20 @@ rm -rf "$APPS_DIR/QuickScreenRecorder.app"
 
 # 12. Refuses to install when ps reports the 21-char binary is running.
 : > "$TCC_LOG"
-if STUB_PS_MODE=running run_inst --target-dir "$APPS_DIR" --source-app "$SRC_V4" >/dev/null 2>&1; then
+if OUT_RUN="$(STUB_PS_MODE=running run_inst --target-dir "$APPS_DIR" --source-app "$SRC_V4" 2>&1)"; then
   echo "FAIL: must refuse install while app is running" >&2
   exit 1
 fi
+printf '%s\n' "$OUT_RUN" | grep -q "is currently running"
+assert_log_lines 0
+
+# 12b. SIGPIPE regression: refuses to install even when 25,000+ lines follow the matched process.
+: > "$TCC_LOG"
+if OUT_LONG="$(STUB_PS_MODE=running_long run_inst --target-dir "$APPS_DIR" --source-app "$SRC_V4" 2>&1)"; then
+  echo "FAIL: long ps output triggered SIGPIPE bypass in running check" >&2
+  exit 1
+fi
+printf '%s\n' "$OUT_LONG" | grep -q "is currently running"
 assert_log_lines 0
 
 # 13. Fails closed when ps encounters an error.
@@ -261,21 +280,44 @@ fi
 assert_log_lines 0
 [[ ! -e "$APPS_DIR/QuickScreenRecorder.app" ]]
 
-# 14b. Real macOS `ps -axo comm=` (no stub!) detects a real 21-char `quick-screen-recorder` process.
+# 14b. Real macOS `/bin/ps -axo comm=` (only ps is real; codesign/tccutil stay stubbed)
+#      detects a real 21-char `quick-screen-recorder` process and prints the running error.
+REAL_PS_BIN="$TMP_ROOT/bin-real-ps"
+mkdir -p "$REAL_PS_BIN"
+ln -s "$STUB_BIN/codesign" "$REAL_PS_BIN/codesign"
+ln -s "$STUB_BIN/tccutil" "$REAL_PS_BIN/tccutil"
+ln -s /bin/ps "$REAL_PS_BIN/ps"
 REAL_PROC_DIR="$TMP_ROOT/real-proc"
 mkdir -p "$REAL_PROC_DIR"
 cp /bin/sleep "$REAL_PROC_DIR/quick-screen-recorder"
+# Ad-hoc re-sign copied Mach-O so Apple Silicon AMFI allows execution from TMPDIR.
+/usr/bin/codesign --force --sign - "$REAL_PROC_DIR/quick-screen-recorder" >/dev/null 2>&1
 "$REAL_PROC_DIR/quick-screen-recorder" 30 &
 REAL_PROC_PID=$!
 sleep 0.1
-if bash -c "PATH=/usr/bin:/bin:\"$STUB_BIN\" bash \"$INSTALLER\" --target-dir \"$APPS_DIR\" --source-app \"$SRC_V4\"" >/dev/null 2>&1; then
-  kill "$REAL_PROC_PID" 2>/dev/null || true
-  wait "$REAL_PROC_PID" 2>/dev/null || true
+if ! kill -0 "$REAL_PROC_PID" 2>/dev/null; then
+  echo "FAIL: real 21-char test process exited before installer check" >&2
+  exit 1
+fi
+: > "$TCC_LOG"
+REAL_PS_FAILED=0
+OUT_REAL_PS="$(
+  QSR_STUB_TCC_LOG="$TCC_LOG" \
+    PATH="$REAL_PS_BIN:$PATH" \
+    bash "$INSTALLER" --target-dir "$APPS_DIR" --source-app "$SRC_V4" 2>&1
+)" || REAL_PS_FAILED=1
+kill "$REAL_PROC_PID" 2>/dev/null || true
+wait "$REAL_PROC_PID" 2>/dev/null || true
+if [[ "$REAL_PS_FAILED" -ne 1 ]]; then
   echo "FAIL: real macOS ps failed to detect 21-char quick-screen-recorder process" >&2
   exit 1
 fi
-kill "$REAL_PROC_PID" 2>/dev/null || true
-wait "$REAL_PROC_PID" 2>/dev/null || true
+if ! printf '%s\n' "$OUT_REAL_PS" | grep -q "is currently running"; then
+  echo "FAIL: installer failed for unexpected reason instead of running-process detection:" >&2
+  printf '%s\n' "$OUT_REAL_PS" >&2
+  exit 1
+fi
+assert_log_lines 0
 
 # 15. Refuses installing into dist/ (including dist/., dist/../dist, and case-insensitive DIST aliases).
 mkdir -p "$ROOT_DIR/dist"
@@ -322,33 +364,33 @@ SRC_FAIL_POST="$TMP_ROOT/fail-post.app"
 make_fake_app "$SRC_FAIL_POST" "$BUNDLE_ID" "adhoc" "badpost"
 # Simulate post-swap verify failure by making codesign --verify fail ONLY for resolved $APPS_DIR/QuickScreenRecorder.app
 REAL_APPS_DIR="$(cd "$APPS_DIR" && pwd -P)"
-cat > "$STUB_BIN/codesign" << EOF
+cat > "$STUB_BIN/codesign" << 'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ "\$1" == "--verify" ]]; then
-  app="\${@: -1}"
-  if [[ "\$app" == "$REAL_APPS_DIR/QuickScreenRecorder.app" ]] && grep -q 'CDHash=badpost' "\$app/.stub-dvvv" 2>/dev/null; then
+if [[ "$1" == "--verify" ]]; then
+  app="${@: -1}"
+  if [[ "$app" == "${QSR_STUB_FAIL_TARGET_APP:-}" ]] && grep -q 'CDHash=badpost' "$app/.stub-dvvv" 2>/dev/null; then
     exit 1
   fi
   exit 0
 fi
-if [[ "\$1" == "-dvvv" ]]; then
-  cat "\$2/.stub-dvvv" >&2
+if [[ "$1" == "-dvvv" ]]; then
+  cat "$2/.stub-dvvv" >&2
   exit 0
 fi
-if [[ "\$1" == "-d" && "\$2" == "-r" && "\$3" == "-" ]]; then
-  [[ -f "\$4/.stub-dr" ]] && cat "\$4/.stub-dr" >&2
+if [[ "$1" == "-d" && "$2" == "-r" && "$3" == "-" ]]; then
+  [[ -f "$4/.stub-dr" ]] && cat "$4/.stub-dr" >&2
   exit 0
 fi
 exit 1
 EOF
 chmod +x "$STUB_BIN/codesign"
 : > "$TCC_LOG"
-if run_inst --target-dir "$APPS_DIR" --source-app "$SRC_FAIL_POST" >/dev/null 2>&1; then
+if QSR_STUB_FAIL_TARGET_APP="$REAL_APPS_DIR/QuickScreenRecorder.app" run_inst --target-dir "$APPS_DIR" --source-app "$SRC_FAIL_POST" >/dev/null 2>&1; then
   echo "FAIL: post-swap verify failure should have failed" >&2
   exit 1
 fi
 assert_log_lines 0
 grep -q 'CDHash=hash3333' "$APPS_DIR/QuickScreenRecorder.app/.stub-dvvv"
 
-echo "INSTALL_LOCAL_STUB_TESTS_OK (19/19 cases passed)"
+echo "INSTALL_LOCAL_STUB_TESTS_OK (20/20 cases passed)"

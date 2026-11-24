@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Trust model: Local developer installer intended to run in a trusted user session
+# (not a privilege boundary). System tools (codesign, tccutil, ps) resolve via PATH
+# so scripts/test-install-local.sh can test behavior with stubs without altering real TCC.
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 APP_NAME="QuickScreenRecorder.app"
 BIN_NAME="quick-screen-recorder"
@@ -118,7 +121,7 @@ reject_newlines "resolved target directory" "$REAL_TARGET_DIR"
 
 DIST_DIR="$ROOT_DIR/dist"
 is_inside_dist_dir() {
-  /usr/bin/python3 - "$1" "$2" << 'PY'
+  /usr/bin/python3 -I - "$1" "$2" << 'PY'
 import os, sys
 
 target = os.path.realpath(sys.argv[1])
@@ -162,9 +165,11 @@ assert_app_not_running() {
     echo "ERROR: Failed to verify running process state (ps failed); aborting safely." >&2
     exit 1
   fi
+  # Drain all input without exiting early inside awk so large process tables never
+  # trigger SIGPIPE on the upstream printf under `set -o pipefail`.
   if printf '%s\n' "$ps_out" | awk -F/ -v bin="$BIN_NAME" '{
       sub(/[[:space:]]+$/, "", $0);
-      if ($NF == bin) { found = 1; exit 0 }
+      if ($NF == bin) { found = 1 }
     } END { exit(found ? 0 : 1) }'; then
     echo "ERROR: $APP_NAME ($BIN_NAME) is currently running." >&2
     echo "Finish/save any active recording and quit the app cleanly before running make install." >&2
@@ -206,7 +211,7 @@ verify_app_bundle() {
     echo "ERROR: Failed to inspect codesign metadata for $label ($safe_path)" >&2
     return 1
   fi
-  cs_id="$(printf '%s\n' "$cs_out" | awk -F= '/^Identifier=/{print $2; exit}')"
+  cs_id="$(printf '%s\n' "$cs_out" | awk -F= '/^Identifier=/ && !seen {print $2; seen=1}')"
   if [[ "$cs_id" != "$EXPECTED_BUNDLE_ID" ]]; then
     echo "ERROR: $label codesign Identifier mismatch: got '$(sanitize_print "$cs_id")', expected '$EXPECTED_BUNDLE_ID'" >&2
     return 1
@@ -219,13 +224,13 @@ inspect_signature_fingerprint() {
   local app_path="$1"
   local cs_out dr_out is_adhoc cdhashes fingerprint cs_id
   cs_out="$(codesign -dvvv "$app_path" 2>&1)" || return 1
-  cs_id="$(printf '%s\n' "$cs_out" | awk -F= '/^Identifier=/{print $2; exit}')"
+  cs_id="$(printf '%s\n' "$cs_out" | awk -F= '/^Identifier=/ && !seen {print $2; seen=1}')"
   [[ "$cs_id" == "$EXPECTED_BUNDLE_ID" ]] || return 1
 
   # Check `Authority=` first (certificate-signed bundles carry Authority and never Signature=adhoc).
-  if printf '%s\n' "$cs_out" | grep -q '^Authority='; then
+  if printf '%s\n' "$cs_out" | awk '/^Authority=/{found=1} END{exit(found?0:1)}'; then
     is_adhoc=0
-  elif printf '%s\n' "$cs_out" | grep -q '^Signature=adhoc$'; then
+  elif printf '%s\n' "$cs_out" | awk '/^Signature=adhoc$/{found=1} END{exit(found?0:1)}'; then
     is_adhoc=1
   else
     return 1
@@ -247,7 +252,7 @@ atomic_renamex() {
   local mode="$1"
   local src="$2"
   local dst="$3"
-  /usr/bin/python3 - "$mode" "$src" "$dst" << 'PY'
+  /usr/bin/python3 -I - "$mode" "$src" "$dst" << 'PY'
 import ctypes, errno, os, stat, sys
 
 mode, src, dst = sys.argv[1], sys.argv[2], sys.argv[3]
