@@ -5,6 +5,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-11-24
+
+### Fixed
+
+- **Screen-lock & dual-audio recording finalization error (`最初のサンプルバッファの処理が出来ないため、うまくいきませんでした` / `-3811`)**:
+  - Replaced the fixed 2-second `STOP_FALLBACK_AFTER` timer with a shared mutex-backed `StopControl` and single serialized background stop worker (`qsr-stop-worker`) that waits for `SCRecordingOutput` / `RPAudioMixUtility` offline audio mixing (`System Audio + Mic`) to finish before sending `SCStream::stopCaptureWithCompletionHandler:`, using a dynamic finalization budget scaled to recording duration and effective audio mode (`60–600s` for dual audio, `30–180s` otherwise).
+  - Routed delayed `startCapture` post-cancellation teardown through the same serialized stop worker (preventing double `removeRecordingOutput` / `exportAndInvalidateWithHandler:` races and `replayd` crashes).
+  - Guaranteed that timeout-forced stops and unconfirmed stream stops always retain the staged MP4 untouched in place (`.qsr-keep`) instead of moving or deleting a file while `replayd` may still be flushing.
+- **Window-mode hover leak behind toolbar & inactive toolbar appearance**:
+  - Made the floating `toolbar_window` the active key window while keeping the live `canvas_window` non-key (`acceptsFirstMouse` preserves single-click selection and dragging), so toolbar controls render in active colors immediately and `Esc` / `Return` shortcuts work cleanly without closing open popup menus.
+  - Added `NSTrackingArea` tracking and canonical coordinate-based toolbar exclusion on both `OverlayCanvasView` and `ToolbarContainerView` so hovering over the floating toolbar immediately clears any background window highlight and never shows a behind-toolbar selection frame.
+  - Committed active width/height text edits before borrowing `OverlayState` on canvas click or `● Record` click to eliminate re-entrancy risks.
+
+### Added
+
+- **Local macOS install script with target-scoped ad-hoc TCC auto-reset (`make install` / `scripts/install-local.sh`)**:
+  - Safely builds and atomically swaps `/Applications/QuickScreenRecorder.app` (refusing to overwrite a running capture process or a mismatched `CFBundleIdentifier`, and keeping `dist/` strictly ad-hoc signed).
+  - Automatically resets only the app's explicit macOS TCC entries (`ScreenCapture`, `Microphone`) when an ad-hoc install's Designated Requirement / `CDHash` changes, and preserves existing grants when locally signed with `--sign-identity <id>`.
+  - Added local-only finalization telemetry fields (`finalize_ms`, `audio_mode`, `forced_timeout`) to `perf.jsonl` (never storing paths, window titles, or personal identifiers).
+
 ## [0.5.1] - 2026-11-24
 
 ### Added

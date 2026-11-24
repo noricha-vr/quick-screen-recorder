@@ -479,6 +479,9 @@ fn record_timelapse_perf(codec: RecordingCodec, elapsed: Duration, output_bytes:
         elapsed_ms,
         output_bytes,
         ok,
+        finalize_ms: None,
+        audio_mode: Some("none".to_string()),
+        forced_timeout: None,
     });
 }
 

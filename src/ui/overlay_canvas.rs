@@ -5,12 +5,16 @@ use objc2::rc::Retained;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{
     NSBezierPath, NSColor, NSCursor, NSEvent, NSGraphicsContext, NSPopUpButton, NSView,
-    NSWindingRule,
+    NSWindingRule, NSWindow,
 };
 use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize};
 
 use crate::geometry::{DragMode, Rect, apply_drag, hit_test_selection};
 use crate::ui::overlay::{ActiveDrag, OverlayState, SelectionMode};
+use crate::ui::overlay_window::{
+    commit_toolbar_text_editing, install_hover_tracking_area, is_cursor_over_toolbar,
+    nsrect_to_rect,
+};
 
 /// Minimum non-zero alpha (`0.06 > 0.05`) so macOS WindowServer delivers mouse clicks and drags
 /// inside the selection cutout instead of passing clicks through to underlying applications.
@@ -21,6 +25,8 @@ const SELECTION_CORNER_RADIUS: f64 = 10.0;
 
 pub struct CanvasIvars {
     pub state: Rc<RefCell<OverlayState>>,
+    pub toolbar_window: Retained<NSWindow>,
+    pub toolbar_view: Retained<NSView>,
     pub target_popup: Retained<NSPopUpButton>,
     pub on_selection_changed: Rc<dyn Fn()>,
 }
@@ -119,36 +125,36 @@ define_class!(
         #[unsafe(method(mouseMoved:))]
         fn mouse_moved(&self, event: &NSEvent) {
             let loc = event.locationInWindow();
-            let mut st = self.ivars().state.borrow_mut();
-            match st.mode {
-                SelectionMode::Area => {
-                    match hit_test_selection(st.selection, loc.x, loc.y, 10.0) {
-                        Some(DragMode::Move) => NSCursor::openHandCursor().set(),
-                        _ => NSCursor::crosshairCursor().set(),
-                    }
-                }
-                SelectionMode::Window => {
-                    let hit = st.hit_test_window_at(loc.x, loc.y, false);
-                    if hit.is_some() {
-                        NSCursor::pointingHandCursor().set();
-                    } else {
-                        NSCursor::arrowCursor().set();
-                    }
-                    if st.hovered_window_idx != hit {
-                        st.hovered_window_idx = hit;
-                        drop(st);
-                        self.setNeedsDisplay(true);
-                    }
-                }
-                SelectionMode::Screen => {
-                    NSCursor::arrowCursor().set();
-                }
+            let over_tb = self.is_local_point_over_toolbar(loc);
+            self.update_hover_for_local_point(loc, over_tb);
+        }
+
+        #[unsafe(method(mouseExited:))]
+        fn mouse_exited(&self, _event: &NSEvent) {
+            let changed = self
+                .ivars()
+                .state
+                .borrow_mut()
+                .hovered_window_idx
+                .take()
+                .is_some();
+            if changed {
+                self.setNeedsDisplay(true);
             }
         }
 
         #[unsafe(method(mouseDown:))]
         fn mouse_down(&self, event: &NSEvent) {
             let loc = event.locationInWindow();
+            let demo_backdrop = self.ivars().state.borrow().demo_backdrop;
+            if !demo_backdrop {
+                // Commit any active `w_field`/`h_field` editing BEFORE borrowing `OverlayState`
+                // so synchronous `sizeCommitted:` actions can never cause a `RefCell` double borrow.
+                commit_toolbar_text_editing(&self.ivars().toolbar_window);
+            }
+            if self.is_local_point_over_toolbar(loc) {
+                return;
+            }
             let mut st = self.ivars().state.borrow_mut();
             match st.mode {
                 SelectionMode::Area => {
@@ -217,10 +223,11 @@ define_class!(
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, event: &NSEvent) {
             let loc = event.locationInWindow();
+            let over_tb = self.is_local_point_over_toolbar(loc);
             let mode_after = {
                 let mut st = self.ivars().state.borrow_mut();
                 st.drag = None;
-                if st.mode == SelectionMode::Area {
+                if !over_tb && st.mode == SelectionMode::Area {
                     hit_test_selection(st.selection, loc.x, loc.y, 10.0)
                 } else {
                     None
@@ -228,6 +235,8 @@ define_class!(
             };
             if mode_after == Some(DragMode::Move) {
                 NSCursor::openHandCursor().set();
+            } else if over_tb {
+                NSCursor::arrowCursor().set();
             }
         }
     }
@@ -236,7 +245,67 @@ define_class!(
 impl OverlayCanvasView {
     pub fn new(mtm: MainThreadMarker, frame: NSRect, ivars: CanvasIvars) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(ivars);
-        unsafe { msg_send![super(this), initWithFrame: frame] }
+        let view: Retained<Self> = unsafe { msg_send![super(this), initWithFrame: frame] };
+        install_hover_tracking_area(&view);
+        view
+    }
+
+    pub fn ivars_toolbar_rect_demo(&self) -> Rect {
+        nsrect_to_rect(self.ivars().toolbar_view.frame())
+    }
+
+    /// Evaluates whether a canvas-local point falls inside the floating toolbar using canonical
+    /// coordinates (AppKit global screen points in live two-window mode; canvas points in demo mode).
+    pub fn is_local_point_over_toolbar(&self, local_pt: NSPoint) -> bool {
+        let demo_backdrop = self.ivars().state.borrow().demo_backdrop;
+        if demo_backdrop {
+            let tb_rect = nsrect_to_rect(self.ivars().toolbar_view.frame());
+            is_cursor_over_toolbar((local_pt.x, local_pt.y), tb_rect)
+        } else {
+            let tb_rect = nsrect_to_rect(self.ivars().toolbar_window.frame());
+            let screen_pt = self
+                .window()
+                .map(|w| w.convertPointToScreen(local_pt))
+                .unwrap_or_else(NSEvent::mouseLocation);
+            is_cursor_over_toolbar((screen_pt.x, screen_pt.y), tb_rect)
+        }
+    }
+
+    /// Updates canvas hover highlight and cursor for `local_pt`, suppressing any background window
+    /// highlight whenever `cursor_over_toolbar` is `true`.
+    pub fn update_hover_for_local_point(&self, local_pt: NSPoint, cursor_over_toolbar: bool) {
+        let mut st = self.ivars().state.borrow_mut();
+        if cursor_over_toolbar {
+            if st.hovered_window_idx.take().is_some() {
+                drop(st);
+                self.setNeedsDisplay(true);
+            }
+            return;
+        }
+        match st.mode {
+            SelectionMode::Area => {
+                match hit_test_selection(st.selection, local_pt.x, local_pt.y, 10.0) {
+                    Some(DragMode::Move) => NSCursor::openHandCursor().set(),
+                    _ => NSCursor::crosshairCursor().set(),
+                }
+            }
+            SelectionMode::Window => {
+                let hit = st.hit_test_window_at(local_pt.x, local_pt.y, false);
+                if hit.is_some() {
+                    NSCursor::pointingHandCursor().set();
+                } else {
+                    NSCursor::arrowCursor().set();
+                }
+                if st.hovered_window_idx != hit {
+                    st.hovered_window_idx = hit;
+                    drop(st);
+                    self.setNeedsDisplay(true);
+                }
+            }
+            SelectionMode::Screen => {
+                NSCursor::arrowCursor().set();
+            }
+        }
     }
 }
 

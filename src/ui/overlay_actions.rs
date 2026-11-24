@@ -16,6 +16,7 @@ use crate::ui::overlay::{
 use crate::ui::overlay_toolbar::{
     OverlayToolbarActions, TOOLBAR_H, TOOLBAR_W, ToolbarActionIvars, append_tagged_popup_item,
 };
+use crate::ui::overlay_window::{commit_toolbar_text_editing, ensure_toolbar_key_if_active};
 
 #[allow(clippy::too_many_arguments)]
 pub fn build_toolbar_actions(
@@ -74,6 +75,8 @@ pub fn build_toolbar_actions(
     let st_cursor = Rc::clone(state);
     let st_clicks = Rc::clone(state);
     let st_rec = Rc::clone(state);
+    let cwin_rec = canvas_window.clone();
+    let twin_rec = toolbar_window.clone();
     let base_prefs = prefs.clone();
 
     OverlayToolbarActions::new(
@@ -151,8 +154,8 @@ pub fn build_toolbar_actions(
                 drop(st);
                 sf_mode();
                 cv_mode.setNeedsDisplay(true);
-                if !is_demo {
-                    cwin_mode.makeKeyWindow();
+                if let Some(m) = MainThreadMarker::new() {
+                    ensure_toolbar_key_if_active(m, &twin_pick_mode, is_demo);
                 }
             }),
             on_aspect: Box::new(move |idx| {
@@ -213,8 +216,8 @@ pub fn build_toolbar_actions(
                 drop(st);
                 sf_pick();
                 cv_pick.setNeedsDisplay(true);
-                if !is_demo {
-                    cwin_pick.makeKeyWindow();
+                if let Some(m) = MainThreadMarker::new() {
+                    ensure_toolbar_key_if_active(m, &twin_pick, is_demo);
                 }
             }),
             on_fps: Box::new(move |idx| {
@@ -250,6 +253,13 @@ pub fn build_toolbar_actions(
                 st_clicks.borrow_mut().highlight_clicks = on;
             }),
             on_record: Box::new(move || {
+                // Commit any in-progress width/height text edits BEFORE borrowing `OverlayState`.
+                let is_demo = st_rec.borrow().demo_backdrop;
+                if is_demo {
+                    commit_toolbar_text_editing(&cwin_rec);
+                } else {
+                    commit_toolbar_text_editing(&twin_rec);
+                }
                 let st = st_rec.borrow();
                 let (target, source_app_name) = match st.mode {
                     SelectionMode::Area => (
@@ -355,7 +365,9 @@ fn relocate_overlay_to_display(
             st.visible_frame = nsrect_to_rect(vf);
             st.bounds = Rect::new(0.0, 0.0, sf.size.width, sf.size.height);
             st.selection = st.bounds;
+            st.hovered_window_idx = None;
             canvas_window.setFrame_display(sf, true);
+            canvas_window.orderFrontRegardless();
             let (tx, ty) = compute_toolbar_origin(
                 st.selection,
                 st.screen_frame,
@@ -365,6 +377,7 @@ fn relocate_overlay_to_display(
             );
             let next_tb = NSRect::new(NSPoint::new(tx, ty), NSSize::new(TOOLBAR_W, TOOLBAR_H));
             toolbar_window.setFrame_display(next_tb, true);
+            ensure_toolbar_key_if_active(mtm, toolbar_window, st.demo_backdrop);
             break;
         }
     }

@@ -45,6 +45,19 @@ impl AudioCaptureMode {
         }
     }
 
+    pub fn slug(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::SystemAudio => "system",
+            Self::Microphone => "mic",
+            Self::Both => "both",
+        }
+    }
+
+    pub fn is_dual(self) -> bool {
+        matches!(self, Self::Both)
+    }
+
     pub fn captures_system(self) -> bool {
         matches!(self, Self::SystemAudio | Self::Both)
     }

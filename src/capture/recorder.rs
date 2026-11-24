@@ -18,39 +18,39 @@ use objc2_screen_capture_kit::{
 mod delegate;
 #[path = "recorder_finish.rs"]
 mod finish;
+#[path = "recorder_stop.rs"]
+mod stop;
 
 use delegate::{
-    DelegateSignal, RecordingDelegate, SendableStreamStop, StartWaitOutcome, StreamStopControl,
+    DelegateSignal, RecordingDelegate, SendableStreamStop, StartWaitOutcome,
     handle_start_callback_result, wait_for_capture_start_with_interrupt,
     wait_for_recording_started,
 };
 pub(crate) use finish::commit_staged_to_recovery_directly;
 pub use finish::is_valid_salvageable_mp4;
 use finish::{evaluate_stop_poll, finalize_stop_staging_outcome};
+use stop::{
+    RemovePhase, STOP_SINGLE_AUDIO_MIN, STOP_STREAM_CONFIRM_TIMEOUT, StopControl, StopMode,
+};
 
 use crate::capture::filter::build_filter_and_dimensions;
 use crate::capture::shareable::query_shareable_content_for_capture;
 use crate::capture::system_events::{InterruptLatch, StopHook, current_session_interrupt};
-use crate::capture::{CaptureConfig, RecordingCodec, RecordingOutcome};
+use crate::capture::{AudioCaptureMode, CaptureConfig, RecordingCodec, RecordingOutcome};
 use crate::fs_safety::ExclusiveStagingDir;
 use crate::observe::{PerfEvent, PerfKind, now_unix_secs, record_perf_event};
 use crate::staging::private_recovery_dir;
 
-pub(super) const STOP_FALLBACK_AFTER: Duration = Duration::from_secs(2);
-pub(super) const STOP_TIMEOUT: Duration = Duration::from_secs(12);
-pub(super) const STOP_STREAM_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
-
 pub struct RecordingSession {
-    stream: Retained<SCStream>,
-    recording_output: Retained<SCRecordingOutput>,
+    stopper: Arc<SendableStreamStop>,
     _delegate: Retained<RecordingDelegate>,
     signal: Arc<(Mutex<DelegateSignal>, Condvar)>,
-    stop_control: Arc<StreamStopControl>,
     staging: ExclusiveStagingDir,
     output_path: PathBuf,
     started_at: Instant,
     fps: u32,
     codec: RecordingCodec,
+    effective_audio: AudioCaptureMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,20 +61,18 @@ pub enum StopPollState {
 }
 
 /// Non-blocking handle returned by [`RecordingSession::begin_stop`] so the AppKit main runloop
-/// never blocks while CoreAudio / ScreenCaptureKit finalizes the MP4 trailer and tears down mic capture.
+/// never blocks while CoreAudio / ScreenCaptureKit / `RPAudioMixUtility` finalize the MP4 and
+/// tear down stream/mic capture via the shared serialized stop worker.
 pub struct PendingRecordingStop {
-    stream: Retained<SCStream>,
-    _recording_output: Retained<SCRecordingOutput>,
+    stopper: Arc<SendableStreamStop>,
     _delegate: Retained<RecordingDelegate>,
     signal: Arc<(Mutex<DelegateSignal>, Condvar)>,
-    stop_control: Arc<StreamStopControl>,
     staging: ExclusiveStagingDir,
     output_path: PathBuf,
     elapsed_ms: u64,
     fps: u32,
     codec: RecordingCodec,
-    stop_initiated_at: Instant,
-    stop_capture_sent_at: Option<Instant>,
+    effective_audio: AudioCaptureMode,
 }
 
 impl RecordingSession {
@@ -190,13 +188,15 @@ impl RecordingSession {
         if let Some(msg) = check_interrupted() {
             return Err(msg);
         }
-        let stop_control = Arc::new(StreamStopControl::default());
-        let stopper = Arc::new(SendableStreamStop::new(
+        // Single recording clock shared across startup hooks, stop deadline calculation, and UI/CLI.
+        let started_at = Instant::now();
+        let stop_control = Arc::new(StopControl::new(started_at, effective_audio.is_dual()));
+        let stopper = SendableStreamStop::new(
             stream.clone(),
             recording_output.clone(),
             Arc::clone(&signal),
             Arc::clone(&stop_control),
-        ));
+        );
 
         unsafe {
             stream
@@ -209,26 +209,34 @@ impl RecordingSession {
                 })?;
         }
         if let Some(msg) = check_interrupted() {
-            stopper.stop_now(Duration::from_millis(250));
+            let _ = unsafe { stream.removeRecordingOutput_error(&recording_output) };
             return Err(msg);
         }
 
         let (tx, rx) = mpsc::sync_channel::<Result<(), String>>(1);
         let cancelled_after_start = Arc::new(AtomicBool::new(false));
 
-        // Attach the immediate stop hook BEFORE invoking `startCapture` so watchdog/notifications
-        // can cancel and stop capture even while `startCapture` completion is delayed.
+        // Attach the non-blocking stop hook BEFORE invoking `startCapture` so watchdog/notifications
+        // can cancel and route teardown through the serial worker even if `startCapture` is delayed.
         if let Some(ref latch) = interrupt_latch {
             let s_hook = Arc::clone(&stopper);
             let cancel_hook = Arc::clone(&cancelled_after_start);
+            let sig_hook = Arc::clone(&signal);
             latch.attach_stop_hook(Arc::new(move || {
-                cancel_hook.store(true, std::sync::atomic::Ordering::Release);
-                s_hook.stop_now(STOP_FALLBACK_AFTER);
+                let already_started = sig_hook.0.lock().map(|g| g.started).unwrap_or(false);
+                if !already_started {
+                    cancel_hook.store(true, std::sync::atomic::Ordering::Release);
+                }
+                s_hook.request_stop_async(if already_started {
+                    StopMode::Normal
+                } else {
+                    StopMode::StartupAbort
+                });
             }));
         }
         if let Some(msg) = check_interrupted() {
             cancelled_after_start.store(true, std::sync::atomic::Ordering::Release);
-            stopper.stop_now(Duration::from_millis(250));
+            let _ = unsafe { stream.removeRecordingOutput_error(&recording_output) };
             return Err(msg);
         }
 
@@ -243,7 +251,7 @@ impl RecordingSession {
                 Ok(())
             };
             handle_start_callback_result(res, &sig_cb, &cancel_cb, &tx, |late_gen| {
-                stopper_cb.stop_force_on_late_start(late_gen);
+                stopper_cb.request_late_start_stop(late_gen);
             });
         });
 
@@ -269,16 +277,15 @@ impl RecordingSession {
         }
 
         Ok(Self {
-            stream,
-            recording_output,
+            stopper,
             _delegate: delegate,
             signal,
-            stop_control,
             staging,
             output_path: output_path.to_path_buf(),
-            started_at: Instant::now(),
+            started_at,
             fps,
             codec: config.codec,
+            effective_audio,
         })
     }
 
@@ -299,114 +306,92 @@ impl RecordingSession {
             .unwrap_or(false)
     }
 
-    /// Thread-safe immediate stop hook that removes `SCRecordingOutput` and stops `SCStream`
-    /// directly from the background system-interrupt queue without waiting for the GUI main thread.
+    /// Thread-safe non-blocking stop hook routing lock/sleep teardown through the shared serial
+    /// stop worker so `mainQueue` never stalls and `stopCapture` waits for audio mixing to finish.
     pub fn stop_hook(&self) -> StopHook {
-        let stopper = SendableStreamStop::new(
-            self.stream.clone(),
-            self.recording_output.clone(),
-            Arc::clone(&self.signal),
-            Arc::clone(&self.stop_control),
-        );
-        Arc::new(move || stopper.stop_now(STOP_FALLBACK_AFTER))
+        let stopper = Arc::clone(&self.stopper);
+        Arc::new(move || stopper.request_stop_async(StopMode::Normal))
     }
 
     /// Initiates recording finalization without blocking the caller's thread or AppKit runloop.
     pub fn begin_stop(self) -> PendingRecordingStop {
-        let elapsed_ms = self.started_at.elapsed().as_millis() as u64;
-        let remove_failed = self
-            .stop_control
-            .trigger_remove_once(&self.stream, &self.recording_output);
-        let mut pending = PendingRecordingStop {
-            stream: self.stream,
-            _recording_output: self.recording_output,
+        let now = Instant::now();
+        self.stopper.request_stop_async(StopMode::Normal);
+        let elapsed_ms = self.stopper.control().recording_elapsed_ms_at_stop(now);
+        PendingRecordingStop {
+            stopper: self.stopper,
             _delegate: self._delegate,
             signal: self.signal,
-            stop_control: self.stop_control,
             staging: self.staging,
             output_path: self.output_path,
             elapsed_ms,
             fps: self.fps,
             codec: self.codec,
-            stop_initiated_at: Instant::now(),
-            stop_capture_sent_at: None,
-        };
-        if remove_failed {
-            pending.send_stop_capture();
+            effective_audio: self.effective_audio,
         }
-        pending
     }
 
     /// Blocking stop helper for headless CLI sessions and app shutdown cleanup.
     pub fn stop(self) -> Result<RecordingOutcome, String> {
         let mut pending = self.begin_stop();
         let signal = Arc::clone(&pending.signal);
-        {
-            let (lock, cvar) = &*signal;
-            if let Ok(guard) = lock.lock() {
-                let (guard, _) = cvar
-                    .wait_timeout_while(guard, STOP_FALLBACK_AFTER, |s| !s.finished)
-                    .map_err(|_| "Mutex poisoned")?;
-                drop(guard);
-                pending.send_stop_capture();
-                let remaining = STOP_TIMEOUT
-                    .saturating_sub(pending.stop_initiated_at.elapsed())
-                    .max(STOP_STREAM_CONFIRM_TIMEOUT);
-                let guard = lock.lock().map_err(|_| "Mutex poisoned")?;
-                let _ = cvar.wait_timeout_while(guard, remaining, |s| {
-                    !(s.finished && s.start_completed && s.stream_stopped)
-                });
+        loop {
+            if pending.poll() != StopPollState::Pending {
+                break;
             }
+            let (lock, cvar) = &*signal;
+            let guard = lock.lock().map_err(|_| "Mutex poisoned")?;
+            if guard.finished && guard.start_completed && guard.stream_stopped {
+                break;
+            }
+            let _ = cvar.wait_timeout(guard, Duration::from_millis(50));
         }
         pending.finish()
     }
 }
 
 impl PendingRecordingStop {
-    fn send_stop_capture(&mut self) {
-        if self.stop_capture_sent_at.is_none() {
-            self.stop_capture_sent_at = Some(Instant::now());
-            self.stop_control
-                .trigger_stop_capture_once(&self.stream, &self.signal);
-        }
-    }
-
     /// Non-blocking poll designed for a short `NSTimer` tick on the main thread.
     pub fn poll(&mut self) -> StopPollState {
+        // Retry worker spawn automatically if an earlier spawn failed under transient thread pressure.
+        self.stopper.request_stop_async(StopMode::Normal);
         let (finished, stream_settled) = self
             .signal
             .0
             .lock()
             .map(|g| (g.finished, g.start_completed && g.stream_stopped))
             .unwrap_or((true, true));
-        let stop_sent_elapsed = self.stop_capture_sent_at.map(|t| t.elapsed());
-        let (state, should_send_stop) = evaluate_stop_poll(
+        let now = Instant::now();
+        let snap = self.stopper.control().snapshot();
+        let finalize_deadline = snap
+            .finalize_deadline
+            .unwrap_or(now + STOP_SINGLE_AUDIO_MIN);
+        evaluate_stop_poll(
+            now,
             finished,
             stream_settled,
-            stop_sent_elapsed,
-            self.stop_initiated_at.elapsed(),
-        );
-        if should_send_stop {
-            self.send_stop_capture();
-        }
-        state
+            snap.remove_phase,
+            snap.stop_capture_sent_at,
+            finalize_deadline,
+        )
     }
 
-    /// Stops the underlying capture stream (if not already stopped), verifies both trailer
-    /// finalization and clean stream stop independently, commits/recovers the MP4, and retains
-    /// staging untouched whenever stream stop was not cleanly confirmed.
+    /// Finalizes staging ownership using the shared stop state, retaining staging untouched in
+    /// place whenever stream stop is unconfirmed or forced on timeout.
     pub fn finish(self) -> Result<RecordingOutcome, String> {
         self.finish_with_policy(false)
     }
 
-    /// Finalizes and preserves the completed recording directly from staging into permanent
-    /// recovery (or protected staging on double failure), never writing a prunable cache file.
+    /// Finalizes and preserves completed recordings directly from staging into permanent recovery
+    /// (or protected staging on double failure / timeout), never writing a prunable cache file.
     pub fn finish_to_recovery(self) -> Result<RecordingOutcome, String> {
         self.finish_with_policy(true)
     }
 
     fn finish_with_policy(mut self, preserve_directly: bool) -> Result<RecordingOutcome, String> {
-        self.send_stop_capture();
+        let now = Instant::now();
+        let snap = self.stopper.control().snapshot();
+        let finalize_ms = self.stopper.control().finalization_elapsed_ms(now);
         let (start_completed, finished, finish_err, stream_stopped, stream_stop_err) = self
             .signal
             .0
@@ -430,6 +415,11 @@ impl PendingRecordingStop {
 
         let stop_issue = if let Some(err) = stream_stop_err {
             Some(format!("Failed to stop screen/audio capture stream: {err}"))
+        } else if snap.remove_phase == RemovePhase::InFlight {
+            Some(
+                "Timed out waiting for ScreenCaptureKit removeRecordingOutput to return"
+                    .to_string(),
+            )
         } else if !start_completed {
             Some("Timed out confirming capture stream start/stop settled".to_string())
         } else if !stream_stopped {
@@ -444,23 +434,35 @@ impl PendingRecordingStop {
             finished,
             finish_err,
             stop_issue,
+            snap.forced_stop_on_timeout,
             preserve_directly,
             private_recovery_dir(),
         ) {
             Ok(v) => v,
             Err(err) => {
-                self.record_perf(0, false);
+                self.record_perf(0, false, finalize_ms, snap.forced_stop_on_timeout);
                 return Err(err);
             }
         };
-        self.record_perf(size, final_warning.is_none());
+        self.record_perf(
+            size,
+            final_warning.is_none(),
+            finalize_ms,
+            snap.forced_stop_on_timeout,
+        );
         Ok(RecordingOutcome {
             output_path: final_path,
             partial_error: final_warning,
         })
     }
 
-    fn record_perf(&self, output_bytes: u64, ok: bool) {
+    fn record_perf(
+        &self,
+        output_bytes: u64,
+        ok: bool,
+        finalize_ms: Option<u64>,
+        forced_timeout: bool,
+    ) {
         record_perf_event(&PerfEvent {
             ts_unix: now_unix_secs(),
             kind: PerfKind::Record,
@@ -470,6 +472,9 @@ impl PendingRecordingStop {
             elapsed_ms: self.elapsed_ms,
             output_bytes,
             ok,
+            finalize_ms,
+            audio_mode: Some(self.effective_audio.slug().to_string()),
+            forced_timeout: Some(forced_timeout),
         });
     }
 }

@@ -38,7 +38,7 @@ Unlike Electron-based recorders that keep a full Chromium runtime resident in me
 - **Privacy by Design**
   - 100% local execution with **zero network access** and **zero external telemetry**.
   - **Auto-Stop & Save on Lock/Sleep**: Automatically stops active real-time and timelapse recordings as soon as macOS reports screen lock, user switch, or display/system sleep—saving everything captured up to detection safely to local recovery and opening it in the editor (timelapse additionally checks session lock state before capturing and before writing each frame).
-  - Container metadata is stripped automatically on export (`setMetadata(None)` / `-map_metadata -1`).
+  - Container metadata is stripped automatically on export (empty `AVAssetExportSession` metadata array + `metadataItemFilterForSharing` / `-map_metadata -1`).
   - Local performance stats (`stats` command) record only format, duration, and encode latency—never file paths, window titles, or personal identifiers.
 
 ## Requirements
@@ -53,14 +53,14 @@ Unlike Electron-based recorders that keep a full Chromium runtime resident in me
 git clone https://github.com/noricha-vr/quick-screen-recorder.git
 cd quick-screen-recorder
 
-# Build release .app bundle into dist/QuickScreenRecorder.app
+# Build release .app bundle into dist/QuickScreenRecorder.app (ad-hoc signed)
 make bundle
 
 # Launch the menu-bar app
 open dist/QuickScreenRecorder.app
 
-# Or move to /Applications
-cp -R dist/QuickScreenRecorder.app /Applications/
+# Or safely install into /Applications (auto-resets stale ad-hoc TCC entries when DR changes)
+make install
 ```
 
 On first launch, the **Quick Start** window checks **Screen & System Audio Recording** permission, opens **System Settings** in one click, turns green after macOS **Quit & Reopen**, and guides you through your first recording and export.
@@ -105,8 +105,9 @@ quick-screen-recorder stats
 ## Development
 
 ```bash
-make check    # cargo fmt --check + cargo clippy (-D warnings) + unit & integration tests
-make bundle   # Build release binary and package dist/QuickScreenRecorder.app
+make check    # cargo fmt --check + cargo clippy (-D warnings) + unit, integration & script tests
+make bundle   # Build release binary and package ad-hoc dist/QuickScreenRecorder.app
+make install  # Verify & swap /Applications/QuickScreenRecorder.app (+ ad-hoc TCC auto-reset)
 ```
 
 ## License

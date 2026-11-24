@@ -97,8 +97,8 @@ pub(crate) fn show_selector(mtm: MainThreadMarker, runtime: &Rc<RefCell<AppRunti
             let app = NSApplication::sharedApplication(mtm);
             #[allow(deprecated)]
             app.activateIgnoringOtherApps(true);
-            ov.canvas_window.makeKeyAndOrderFront(None);
-            ov.toolbar_window.orderFrontRegardless();
+            ov.canvas_window.orderFrontRegardless();
+            ov.toolbar_window.makeKeyAndOrderFront(None);
             runtime.borrow_mut().overlay = Some(ov);
         }
         Err(err) => show_error_alert(mtm, "Overlay Error", &err),

@@ -2,11 +2,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use objc2::rc::Retained;
-use objc2::{MainThreadMarker, MainThreadOnly};
+use objc2::{MainThreadMarker, msg_send};
 use objc2_app_kit::{
-    NSAppearance, NSAppearanceCustomization, NSAppearanceNameDarkAqua, NSButton, NSColor,
-    NSFloatingWindowLevel, NSFont, NSPopUpButton, NSScreen, NSStatusWindowLevel, NSTextField,
-    NSView, NSWindow,
+    NSAppearance, NSAppearanceCustomization, NSAppearanceNameDarkAqua, NSButton, NSColor, NSEvent,
+    NSFloatingWindowLevel, NSFont, NSPopUpButton, NSScreen, NSSegmentedControl,
+    NSStatusWindowLevel, NSTextField, NSView, NSWindow,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
@@ -25,10 +25,12 @@ use crate::geometry::{
 use crate::ui::overlay_actions::build_toolbar_actions;
 use crate::ui::overlay_canvas::{CanvasIvars, OverlayCanvasView};
 use crate::ui::overlay_toolbar::{
-    OverlayToolbarActions, TOOLBAR_H, TOOLBAR_W, populate_toolbar_controls,
+    OverlayToolbarActions, TOOLBAR_H, TOOLBAR_W, create_mode_segmented_control,
+    populate_toolbar_controls,
 };
 pub use crate::ui::overlay_window::{
-    KeyableOverlayWindow, extract_nsscreen_display_id, nsrect_to_rect,
+    KeyableOverlayWindow, ToolbarContainerView, commit_toolbar_text_editing,
+    extract_nsscreen_display_id, is_cursor_over_toolbar, nsrect_to_rect,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +140,11 @@ impl OverlayState {
 pub struct SelectorOverlay {
     pub canvas_window: Retained<NSWindow>,
     pub toolbar_window: Retained<NSWindow>,
+    pub(crate) canvas_view: Retained<OverlayCanvasView>,
+    toolbar_container: Retained<ToolbarContainerView>,
+    mode_seg: Retained<NSSegmentedControl>,
+    pub(crate) w_field: Retained<NSTextField>,
+    pub(crate) state: Rc<RefCell<OverlayState>>,
     _actions: Retained<OverlayToolbarActions>,
 }
 
@@ -245,7 +252,10 @@ impl SelectorOverlay {
             drag: None,
         }));
 
-        let canvas_window = KeyableOverlayWindow::new_borderless(mtm, win_frame, false);
+        // In live two-window mode, `canvas_window` is non-key so `toolbar_window` stays the active
+        // key window (vibrant controls + Esc/Return) while `acceptsFirstMouse` handles canvas clicks.
+        let canvas_window =
+            KeyableOverlayWindow::new_borderless(mtm, win_frame, false, demo_backdrop);
         unsafe { canvas_window.setReleasedWhenClosed(false) };
         if let Some(dark) = NSAppearance::appearanceNamed(unsafe { NSAppearanceNameDarkAqua }) {
             canvas_window.setAppearance(Some(&dark));
@@ -303,70 +313,79 @@ impl SelectorOverlay {
             NSPoint::new(init_tb_x, init_tb_y),
             NSSize::new(TOOLBAR_W, TOOLBAR_H),
         );
-        let toolbar_window = KeyableOverlayWindow::new_borderless(mtm, bar_rect, demo_backdrop);
+        let toolbar_window =
+            KeyableOverlayWindow::new_borderless(mtm, bar_rect, demo_backdrop, true);
         unsafe { toolbar_window.setReleasedWhenClosed(false) };
         if let Some(dark) = NSAppearance::appearanceNamed(unsafe { NSAppearanceNameDarkAqua }) {
             toolbar_window.setAppearance(Some(&dark));
         }
 
-        let bar_container = NSView::initWithFrame(
-            NSView::alloc(mtm),
-            if demo_backdrop {
-                NSRect::new(
-                    NSPoint::new(init_tb_x, init_tb_y),
-                    NSSize::new(TOOLBAR_W, TOOLBAR_H),
-                )
-            } else {
-                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(TOOLBAR_W, TOOLBAR_H))
-            },
-        );
+        let bar_frame = if demo_backdrop {
+            bar_rect
+        } else {
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(TOOLBAR_W, TOOLBAR_H))
+        };
+        let bar_container = ToolbarContainerView::new(mtm, bar_frame, Rc::clone(&state));
+        let bar_nsview: Retained<NSView> = Retained::into_super(bar_container.clone());
 
         let w_sync = w_field.clone();
         let h_sync = h_field.clone();
         let badge_sync = window_badge.clone();
         let tb_win_sync = toolbar_window.clone();
-        let tb_view_sync = bar_container.clone();
+        let tb_view_sync = bar_nsview.clone();
         let state_sync = Rc::clone(&state);
         let sync_fields: Rc<dyn Fn()> = Rc::new(move || {
-            let st = state_sync.borrow();
-            let sf = st.scale_factor.max(1.0);
-            w_sync.setStringValue(&NSString::from_str(&format!(
-                "{}",
-                (st.selection.width * sf).round() as u32
-            )));
-            h_sync.setStringValue(&NSString::from_str(&format!(
-                "{}",
-                (st.selection.height * sf).round() as u32
-            )));
-            let (tx, ty) = compute_toolbar_origin(
-                st.selection,
-                st.screen_frame,
-                st.visible_frame,
-                TOOLBAR_W,
-                TOOLBAR_H,
-            );
-            if st.demo_backdrop {
-                tb_view_sync.setFrameOrigin(NSPoint::new(tx, ty));
-            } else {
-                tb_win_sync.setFrameOrigin(NSPoint::new(tx, ty));
-            }
-            if st.mode == SelectionMode::Window && !st.demo_backdrop {
-                if let Some(win) = st.windows.get(st.selected_window_idx) {
-                    let clean = sanitize_terminal_text(&win.display_label(), false);
-                    let label = format!("  {}  ", clean.chars().take(52).collect::<String>());
-                    badge_sync.setStringValue(&NSString::from_str(&label));
-                    badge_sync.sizeToFit();
-                    let bsize = badge_sync.frame().size;
-                    let bw = bsize.width.min((st.selection.width - 16.0).max(40.0));
-                    let bx = st.selection.x + 8.0;
-                    let by = (st.selection.top_y_up() - 28.0).max(st.selection.y + 4.0);
-                    badge_sync.setFrame(NSRect::new(NSPoint::new(bx, by), NSSize::new(bw, 22.0)));
-                    badge_sync.setHidden(false);
+            let demo_mode = {
+                let st = state_sync.borrow();
+                let sf = st.scale_factor.max(1.0);
+                w_sync.setStringValue(&NSString::from_str(&format!(
+                    "{}",
+                    (st.selection.width * sf).round() as u32
+                )));
+                h_sync.setStringValue(&NSString::from_str(&format!(
+                    "{}",
+                    (st.selection.height * sf).round() as u32
+                )));
+                let (tx, ty) = compute_toolbar_origin(
+                    st.selection,
+                    st.screen_frame,
+                    st.visible_frame,
+                    TOOLBAR_W,
+                    TOOLBAR_H,
+                );
+                if st.demo_backdrop {
+                    tb_view_sync.setFrameOrigin(NSPoint::new(tx, ty));
+                } else {
+                    tb_win_sync.setFrameOrigin(NSPoint::new(tx, ty));
+                }
+                if st.mode == SelectionMode::Window && !st.demo_backdrop {
+                    if let Some(win) = st.windows.get(st.selected_window_idx) {
+                        let clean = sanitize_terminal_text(&win.display_label(), false);
+                        let label = format!("  {}  ", clean.chars().take(52).collect::<String>());
+                        badge_sync.setStringValue(&NSString::from_str(&label));
+                        badge_sync.sizeToFit();
+                        let bsize = badge_sync.frame().size;
+                        let bw = bsize.width.min((st.selection.width - 16.0).max(40.0));
+                        let bx = st.selection.x + 8.0;
+                        let by = (st.selection.top_y_up() - 28.0).max(st.selection.y + 4.0);
+                        badge_sync
+                            .setFrame(NSRect::new(NSPoint::new(bx, by), NSSize::new(bw, 22.0)));
+                        badge_sync.setHidden(false);
+                    } else {
+                        badge_sync.setHidden(true);
+                    }
                 } else {
                     badge_sync.setHidden(true);
                 }
-            } else {
-                badge_sync.setHidden(true);
+                st.demo_backdrop
+            };
+            // Re-check canonical pointer position after toolbar relocation so a newly positioned
+            // toolbar covering the cursor never leaves a stale background window hover highlight.
+            if !demo_mode {
+                let mouse = NSEvent::mouseLocation();
+                if is_cursor_over_toolbar((mouse.x, mouse.y), nsrect_to_rect(tb_win_sync.frame())) {
+                    state_sync.borrow_mut().hovered_window_idx = None;
+                }
             }
         });
 
@@ -375,13 +394,17 @@ impl SelectorOverlay {
             NSRect::new(NSPoint::new(0.0, 0.0), win_frame.size),
             CanvasIvars {
                 state: Rc::clone(&state),
+                toolbar_window: toolbar_window.clone(),
+                toolbar_view: bar_nsview.clone(),
                 target_popup: target_popup.clone(),
                 on_selection_changed: Rc::clone(&sync_fields),
             },
         );
         canvas_view.addSubview(&window_badge);
         canvas_window.setContentView(Some(&canvas_view));
-        let _ = canvas_window.makeFirstResponder(Some(&canvas_view));
+        if demo_backdrop {
+            let _ = canvas_window.makeFirstResponder(Some(&canvas_view));
+        }
 
         let sys_audio_chk = unsafe {
             NSButton::checkboxWithTitle_target_action(
@@ -394,6 +417,7 @@ impl SelectorOverlay {
         let mic_popup = NSPopUpButton::new(mtm);
 
         let canvas_nsview: Retained<NSView> = Retained::into_super(canvas_view.clone());
+        bar_container.attach_canvas(canvas_nsview.clone());
         let actions = build_toolbar_actions(
             mtm,
             &state,
@@ -412,11 +436,13 @@ impl SelectorOverlay {
             on_start,
             on_cancel,
         );
+        let mode_seg = create_mode_segmented_control(mtm, &actions);
 
         populate_toolbar_controls(
             mtm,
-            &bar_container,
+            &bar_nsview,
             &actions,
+            &mode_seg,
             &aspect_popup,
             &w_field,
             &x_lbl,
@@ -432,7 +458,8 @@ impl SelectorOverlay {
         );
 
         if demo_backdrop {
-            canvas_view.addSubview(&bar_container);
+            canvas_view.addSubview(&bar_nsview);
+            canvas_window.makeKeyAndOrderFront(None);
         } else {
             toolbar_window.setOpaque(false);
             toolbar_window.setBackgroundColor(Some(&NSColor::clearColor()));
@@ -440,22 +467,30 @@ impl SelectorOverlay {
             toolbar_window.setMovable(false);
             toolbar_window.setMovableByWindowBackground(false);
             toolbar_window.setLevel(NSStatusWindowLevel);
-            toolbar_window.setContentView(Some(&bar_container));
-        }
-
-        canvas_window.makeKeyAndOrderFront(None);
-        if !demo_backdrop {
-            toolbar_window.orderFrontRegardless();
+            toolbar_window.setContentView(Some(&bar_nsview));
+            canvas_window.orderFrontRegardless();
+            toolbar_window.makeKeyAndOrderFront(None);
         }
 
         Ok(Self {
             canvas_window,
             toolbar_window,
+            canvas_view,
+            toolbar_container: bar_container,
+            mode_seg,
+            w_field,
+            state,
             _actions: actions,
         })
     }
 
+    pub(crate) fn select_mode_segment(&self, seg: isize) {
+        self.mode_seg.setSelectedSegment(seg);
+        let _: () = unsafe { msg_send![&*self._actions, modeChanged: &*self.mode_seg] };
+    }
+
     pub fn close(&self) {
+        self.toolbar_container.detach_canvas();
         self.toolbar_window.orderOut(None);
         self.canvas_window.orderOut(None);
         self.toolbar_window.close();
