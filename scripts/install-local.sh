@@ -7,6 +7,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 APP_NAME="AirRec.app"
 BIN_NAME="airrec"
+LEGACY_BIN_NAME="quick-screen-recorder"
 EXPECTED_BUNDLE_ID="io.github.noricha-vr.airrec"
 TCC_SERVICES=("ScreenCapture" "Microphone")
 
@@ -167,11 +168,13 @@ assert_app_not_running() {
   fi
   # Drain all input without exiting early inside awk so large process tables never
   # trigger SIGPIPE on the upstream printf under `set -o pipefail`.
-  if printf '%s\n' "$ps_out" | awk -F/ -v bin="$BIN_NAME" '{
+  # Checks both `airrec` and legacy `quick-screen-recorder` (21 chars) so an older running
+  # instance cannot keep holding the global ⇧⌘6 hotkey after installing AirRec.app.
+  if printf '%s\n' "$ps_out" | awk -F/ -v bin="$BIN_NAME" -v legacy="$LEGACY_BIN_NAME" '{
       sub(/[[:space:]]+$/, "", $0);
-      if ($NF == bin) { found = 1 }
+      if ($NF == bin || $NF == legacy) { found = 1 }
     } END { exit(found ? 0 : 1) }'; then
-    echo "ERROR: $APP_NAME ($BIN_NAME) is currently running." >&2
+    echo "ERROR: $APP_NAME ($BIN_NAME / $LEGACY_BIN_NAME) is currently running." >&2
     echo "Finish/save any active recording and quit the app cleanly before running make install." >&2
     exit 1
   fi

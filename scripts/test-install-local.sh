@@ -281,7 +281,7 @@ assert_log_lines 0
 [[ ! -e "$APPS_DIR/AirRec.app" ]]
 
 # 14b. Real macOS `/bin/ps -axo comm=` (only ps is real; codesign/tccutil stay stubbed)
-#      detects a real 21-char `airrec` process and prints the running error.
+#      detects BOTH `airrec` and the 21-char legacy `quick-screen-recorder` process.
 REAL_PS_BIN="$TMP_ROOT/bin-real-ps"
 mkdir -p "$REAL_PS_BIN"
 ln -s "$STUB_BIN/codesign" "$REAL_PS_BIN/codesign"
@@ -289,36 +289,39 @@ ln -s "$STUB_BIN/tccutil" "$REAL_PS_BIN/tccutil"
 ln -s /bin/ps "$REAL_PS_BIN/ps"
 REAL_PROC_DIR="$TMP_ROOT/real-proc"
 mkdir -p "$REAL_PROC_DIR"
-# Build a minimal native Mach-O sleeper rather than copying `/bin/sleep`, because copying an
-# Apple-signed system binary triggers AMFI `Killed: 9` on macOS 15+ even after re-signing.
-printf '#include <unistd.h>\nint main(void) { sleep(30); return 0; }\n' \
-  | /usr/bin/cc -x c - -o "$REAL_PROC_DIR/airrec"
-"$REAL_PROC_DIR/airrec" &
-REAL_PROC_PID=$!
-sleep 0.1
-if ! kill -0 "$REAL_PROC_PID" 2>/dev/null; then
-  echo "FAIL: real 21-char test process exited before installer check" >&2
-  exit 1
-fi
-: > "$TCC_LOG"
-REAL_PS_FAILED=0
-OUT_REAL_PS="$(
-  QSR_STUB_TCC_LOG="$TCC_LOG" \
-    PATH="$REAL_PS_BIN:$PATH" \
-    bash "$INSTALLER" --target-dir "$APPS_DIR" --source-app "$SRC_V4" 2>&1
-)" || REAL_PS_FAILED=1
-kill "$REAL_PROC_PID" 2>/dev/null || true
-wait "$REAL_PROC_PID" 2>/dev/null || true
-if [[ "$REAL_PS_FAILED" -ne 1 ]]; then
-  echo "FAIL: real macOS ps failed to detect 21-char airrec process" >&2
-  exit 1
-fi
-if ! printf '%s\n' "$OUT_REAL_PS" | grep -q "is currently running"; then
-  echo "FAIL: installer failed for unexpected reason instead of running-process detection:" >&2
-  printf '%s\n' "$OUT_REAL_PS" >&2
-  exit 1
-fi
-assert_log_lines 0
+for proc_name in "airrec" "quick-screen-recorder"; do
+  # Build a minimal native Mach-O sleeper rather than copying `/bin/sleep`, because copying an
+  # Apple-signed system binary triggers AMFI `Killed: 9` on macOS 15+ even after re-signing.
+  printf '#include <unistd.h>\nint main(void) { sleep(30); return 0; }\n' \
+    | /usr/bin/cc -x c - -o "$REAL_PROC_DIR/$proc_name"
+  "$REAL_PROC_DIR/$proc_name" &
+  REAL_PROC_PID=$!
+  sleep 0.1
+  if ! kill -0 "$REAL_PROC_PID" 2>/dev/null; then
+    echo "FAIL: real $proc_name test process exited before installer check" >&2
+    exit 1
+  fi
+  : > "$TCC_LOG"
+  REAL_PS_FAILED=0
+  OUT_REAL_PS="$(
+    QSR_STUB_TCC_LOG="$TCC_LOG" \
+      PATH="$REAL_PS_BIN:$PATH" \
+      bash "$INSTALLER" --target-dir "$APPS_DIR" --source-app "$SRC_V4" 2>&1
+  )" || REAL_PS_FAILED=1
+  kill "$REAL_PROC_PID" 2>/dev/null || true
+  wait "$REAL_PROC_PID" 2>/dev/null || true
+  REAL_PROC_PID=""
+  if [[ "$REAL_PS_FAILED" -ne 1 ]]; then
+    echo "FAIL: real macOS ps failed to detect $proc_name process" >&2
+    exit 1
+  fi
+  if ! printf '%s\n' "$OUT_REAL_PS" | grep -q "is currently running"; then
+    echo "FAIL: installer failed for unexpected reason instead of running-process detection ($proc_name):" >&2
+    printf '%s\n' "$OUT_REAL_PS" >&2
+    exit 1
+  fi
+  assert_log_lines 0
+done
 
 # 15. Refuses installing into dist/ (including dist/., dist/../dist, and case-insensitive DIST aliases).
 mkdir -p "$ROOT_DIR/dist"
