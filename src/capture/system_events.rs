@@ -1,16 +1,15 @@
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
 use objc2_app_kit::{
-    NSWorkspace, NSWorkspaceDidWakeNotification, NSWorkspaceScreensDidSleepNotification,
-    NSWorkspaceScreensDidWakeNotification, NSWorkspaceSessionDidBecomeActiveNotification,
+    NSWorkspace, NSWorkspaceScreensDidSleepNotification,
     NSWorkspaceSessionDidResignActiveNotification, NSWorkspaceWillSleepNotification,
 };
 use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFString, CFType};
@@ -20,8 +19,13 @@ use objc2_foundation::{
     NSNotificationName, NSObjectProtocol, NSOperationQueue, NSRunLoop, NSString,
 };
 
+#[path = "system_resume.rs"]
+mod resume;
+
+pub use resume::UnlockMonitor;
+
 const DISTRIBUTED_SCREEN_LOCKED_NAME: &str = "com.apple.screenIsLocked";
-const DISTRIBUTED_SCREEN_UNLOCKED_NAME: &str = "com.apple.screenIsUnlocked";
+const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 pub type StopHook = Arc<dyn Fn() + Send + Sync>;
 
@@ -35,25 +39,6 @@ pub enum SystemInterruptReason {
 }
 
 impl SystemInterruptReason {
-    fn to_code(self) -> u8 {
-        match self {
-            Self::ScreenLocked => 1,
-            Self::SessionResigned => 2,
-            Self::DisplaySlept => 3,
-            Self::SystemWillSleep => 4,
-        }
-    }
-
-    fn from_code(code: u8) -> Option<Self> {
-        match code {
-            1 => Some(Self::ScreenLocked),
-            2 => Some(Self::SessionResigned),
-            3 => Some(Self::DisplaySlept),
-            4 => Some(Self::SystemWillSleep),
-            _ => None,
-        }
-    }
-
     pub fn clause(self) -> &'static str {
         match self {
             Self::ScreenLocked => "the screen was locked",
@@ -73,28 +58,86 @@ impl SystemInterruptReason {
     }
 }
 
-/// Lock-free first-wins latch recording the first system interrupt seen by an active recording.
+#[derive(Default)]
+struct CoordinatorState {
+    reason: Option<SystemInterruptReason>,
+    hook: Option<StopHook>,
+    hook_invoked: bool,
+}
+
+/// Thread-safe first-wins interrupt latch & at-most-once stop-hook coordinator.
+///
+/// Decouples recording the first interrupt reason from stop-hook invocation so regardless of
+/// whether the UI observer, background notification observer, or independent watchdog thread
+/// triggers first—or whether `attach_stop_hook` runs before or after an interrupt—the attached
+/// stop hook is guaranteed to run exactly once.
 #[derive(Clone, Default)]
 pub struct InterruptLatch {
-    code: Arc<AtomicU8>,
+    inner: Arc<Mutex<CoordinatorState>>,
 }
 
 impl InterruptLatch {
     pub fn new() -> Self {
-        Self {
-            code: Arc::new(AtomicU8::new(0)),
+        Self::default()
+    }
+
+    /// Records `reason` (first-wins) and invokes any attached stop hook if not yet invoked.
+    /// Returns `true` if this call recorded the first interrupt reason.
+    pub fn trigger(&self, reason: SystemInterruptReason) -> bool {
+        let (first, hook_to_run) = match self.inner.lock() {
+            Ok(mut guard) => {
+                let first = if guard.reason.is_none() {
+                    guard.reason = Some(reason);
+                    true
+                } else {
+                    false
+                };
+                let hook = if !guard.hook_invoked {
+                    if let Some(h) = guard.hook.clone() {
+                        guard.hook_invoked = true;
+                        Some(h)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                (first, hook)
+            }
+            Err(_) => (false, None),
+        };
+        if let Some(hook) = hook_to_run {
+            hook();
+        }
+        first
+    }
+
+    /// Attaches a session's immediate stop hook. If an interrupt already fired before attachment,
+    /// invokes the hook immediately outside the mutex.
+    pub fn attach_stop_hook(&self, hook: StopHook) {
+        let hook_to_run = match self.inner.lock() {
+            Ok(mut guard) => {
+                guard.hook = Some(Arc::clone(&hook));
+                if guard.reason.is_some() && !guard.hook_invoked {
+                    guard.hook_invoked = true;
+                    Some(hook)
+                } else {
+                    None
+                }
+            }
+            Err(_) => None,
+        };
+        if let Some(h) = hook_to_run {
+            h();
         }
     }
 
-    /// Records `reason` if no interrupt has been recorded yet. Returns `true` only on the first trigger.
-    pub fn trigger(&self, reason: SystemInterruptReason) -> bool {
-        self.code
-            .compare_exchange(0, reason.to_code(), Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+    pub fn reason(&self) -> Option<SystemInterruptReason> {
+        self.inner.lock().ok().and_then(|g| g.reason)
     }
 
-    pub fn reason(&self) -> Option<SystemInterruptReason> {
-        SystemInterruptReason::from_code(self.code.load(Ordering::Acquire))
+    pub fn is_interrupted(&self) -> bool {
+        self.reason().is_some()
     }
 }
 
@@ -113,7 +156,7 @@ pub(crate) fn evaluate_session_lock_flags(
 }
 
 /// Synchronously queries macOS WindowServer session state for screen lock or console switch.
-/// Returns `None` when unlocked or when running without a WindowServer session.
+/// Completely independent of AppKit and the main thread's `NSRunLoop`.
 pub fn current_session_interrupt() -> Option<SystemInterruptReason> {
     autoreleasepool(|_| {
         let dict = CGSessionCopyCurrentDictionary()?;
@@ -139,24 +182,87 @@ fn cf_dict_bool(dict: &CFDictionary, key: &str) -> Option<bool> {
     None
 }
 
-/// Active macOS notification monitor watching screen lock, fast user switch, display sleep,
-/// and system sleep.
+/// Dedicated OS watchdog thread that polls WindowServer lock/console state completely
+/// independently of the AppKit main runloop (since `NSDistributedNotificationCenter` delivers via
+/// the main runloop and can stall whenever the GUI main thread is blocked).
+struct SessionWatchdog {
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl SessionWatchdog {
+    fn start<P>(interval: Duration, latch: InterruptLatch, mut probe: P) -> Self
+    where
+        P: FnMut() -> Option<SystemInterruptReason> + Send + 'static,
+    {
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let stop_bg = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            let (lock, cvar) = &*stop_bg;
+            let mut guard = match lock.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            while !*guard {
+                if latch.is_interrupted() {
+                    return;
+                }
+                drop(guard);
+                if let Some(reason) = probe() {
+                    let _ = latch.trigger(reason);
+                    return;
+                }
+                guard = match lock.lock() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+                if *guard {
+                    break;
+                }
+                let (next_guard, _) = cvar
+                    .wait_timeout(guard, interval)
+                    .unwrap_or_else(|p| p.into_inner());
+                guard = next_guard;
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for SessionWatchdog {
+    fn drop(&mut self) {
+        let (lock, cvar) = &*self.stop;
+        if let Ok(mut guard) = lock.lock() {
+            *guard = true;
+            cvar.notify_all();
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Active macOS monitor watching screen lock, user switch, display sleep, and system sleep.
 ///
-/// Immediate stop signaling runs on a dedicated serial background `NSOperationQueue` completely
-/// independent of the AppKit main thread, so even a busy/blocked GUI runloop can never delay
-/// stopping capture or allow post-lock frames. A separate main-queue observer notifies GUI state.
+/// Combines three redundant layers:
+/// 1. An independent OS watchdog thread polling `CGSessionCopyCurrentDictionary()` every 100ms
+///    (works even when the AppKit main thread is 100% blocked).
+/// 2. Background serial `NSOperationQueue` observers for instant push on workspace sleep/lock.
+/// 3. Optional main-queue GUI wake observers (strictly on `mainQueue()` so `Rc` stays main-only).
 pub struct SystemInterruptMonitor {
     latch: InterruptLatch,
-    stop_hook: Arc<Mutex<Option<StopHook>>>,
     _bg_queue: Retained<NSOperationQueue>,
+    _watchdog: SessionWatchdog,
     distributed_tokens: Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
     workspace_tokens: Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
 }
 
 impl SystemInterruptMonitor {
     /// Arms monitoring BEFORE recording startup so lock/sleep events during initialization are
-    /// never missed. `on_main_interrupt` runs strictly on `NSOperationQueue::mainQueue()`, while
-    /// the latch and attached stop hook execute immediately on an independent background queue.
+    /// captured immediately.
     pub fn start_gui<F>(on_main_interrupt: F) -> Self
     where
         F: Fn(SystemInterruptReason) + 'static,
@@ -164,7 +270,7 @@ impl SystemInterruptMonitor {
         Self::start_inner(Some(Arc::new(on_main_interrupt)))
     }
 
-    /// Arms headless monitoring for CLI sessions (background serial queue + `pump_current_runloop`).
+    /// Arms headless monitoring for CLI sessions (watchdog + notification centers).
     pub fn start_headless() -> Self {
         Self::start_inner(None)
     }
@@ -173,7 +279,6 @@ impl SystemInterruptMonitor {
         on_main_interrupt: Option<Arc<dyn Fn(SystemInterruptReason) + 'static>>,
     ) -> Self {
         let latch = InterruptLatch::new();
-        let stop_hook: Arc<Mutex<Option<StopHook>>> = Arc::new(Mutex::new(None));
         let bg_queue = NSOperationQueue::new();
         bg_queue.setMaxConcurrentOperationCount(1);
 
@@ -200,12 +305,8 @@ impl SystemInterruptMonitor {
             ]
         };
 
-        // Layer 1: Independent background queue for zero-latency latch + immediate stop hook.
-        let bg_lock_block = make_bg_observer_block(
-            latch.clone(),
-            Arc::clone(&stop_hook),
-            SystemInterruptReason::ScreenLocked,
-        );
+        let bg_lock_block =
+            make_bg_observer_block(latch.clone(), SystemInterruptReason::ScreenLocked);
         distributed_tokens.push(unsafe {
             dist_center.addObserverForName_object_queue_usingBlock(
                 Some(&lock_name),
@@ -215,7 +316,7 @@ impl SystemInterruptMonitor {
             )
         });
         for (name, reason) in workspace_events {
-            let block = make_bg_observer_block(latch.clone(), Arc::clone(&stop_hook), reason);
+            let block = make_bg_observer_block(latch.clone(), reason);
             workspace_tokens.push(unsafe {
                 ws_center.addObserverForName_object_queue_usingBlock(
                     Some(name),
@@ -226,7 +327,6 @@ impl SystemInterruptMonitor {
             });
         }
 
-        // Layer 2 (GUI only): Main-queue observer wakes AppKit UI state without touching Rc on bg thread.
         if let Some(cb) = on_main_interrupt {
             let main_queue = NSOperationQueue::mainQueue();
             let ui_fired = Arc::new(AtomicBool::new(false));
@@ -262,10 +362,16 @@ impl SystemInterruptMonitor {
             }
         }
 
+        let watchdog = SessionWatchdog::start(
+            WATCHDOG_POLL_INTERVAL,
+            latch.clone(),
+            current_session_interrupt,
+        );
+
         Self {
             latch,
-            stop_hook,
             _bg_queue: bg_queue,
+            _watchdog: watchdog,
             distributed_tokens,
             workspace_tokens,
         }
@@ -275,27 +381,18 @@ impl SystemInterruptMonitor {
         self.latch.clone()
     }
 
-    /// Attaches the newly started session's thread-safe immediate stop hook. If an interrupt
-    /// already fired while the session was initializing, invokes the stop hook immediately.
+    /// Attaches the session's immediate stop hook (invoked immediately if already interrupted).
     pub fn attach_stop_hook(&self, hook: StopHook) {
-        if let Ok(mut guard) = self.stop_hook.lock() {
-            *guard = Some(Arc::clone(&hook));
-        }
-        if self.latch.reason().is_some() {
-            hook();
-        }
+        self.latch.attach_stop_hook(hook);
     }
 
-    /// Returns the recorded interrupt reason, falling back to a synchronous `CGSession` check
-    /// so missed or delayed distributed notifications are still caught promptly.
+    /// Returns the recorded interrupt reason, falling back to a synchronous `CGSession` check.
     pub fn poll_interrupt(&self) -> Option<SystemInterruptReason> {
         if let Some(reason) = self.latch.reason() {
             return Some(reason);
         }
         if let Some(reason) = current_session_interrupt() {
-            if self.latch.trigger(reason) {
-                invoke_attached_stop_hook(&self.stop_hook);
-            }
+            let _ = self.latch.trigger(reason);
             return self.latch.reason();
         }
         None
@@ -319,23 +416,13 @@ impl Drop for SystemInterruptMonitor {
     }
 }
 
-fn invoke_attached_stop_hook(slot: &Arc<Mutex<Option<StopHook>>>) {
-    let hook = slot.lock().ok().and_then(|g| g.clone());
-    if let Some(stop_fn) = hook {
-        stop_fn();
-    }
-}
-
 fn make_bg_observer_block(
     latch: InterruptLatch,
-    stop_hook: Arc<Mutex<Option<StopHook>>>,
     reason: SystemInterruptReason,
 ) -> RcBlock<dyn Fn(NonNull<NSNotification>)> {
     RcBlock::new(move |_note: NonNull<NSNotification>| {
         autoreleasepool(|_| {
-            if latch.trigger(reason) {
-                invoke_attached_stop_hook(&stop_hook);
-            }
+            let _ = latch.trigger(reason);
         });
     })
 }
@@ -355,81 +442,6 @@ fn make_ui_observer_block(
             }
         });
     })
-}
-
-/// Main-thread observer used to present deferred error alerts once macOS unlocks or wakes.
-pub struct UnlockMonitor {
-    distributed_tokens: Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
-    workspace_tokens: Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
-}
-
-impl UnlockMonitor {
-    pub fn start_gui<F>(on_unlock: F) -> Self
-    where
-        F: Fn() + 'static,
-    {
-        let main_queue = NSOperationQueue::mainQueue();
-        let cb: Arc<dyn Fn() + 'static> = Arc::new(on_unlock);
-        let dist_center = NSDistributedNotificationCenter::defaultCenter();
-        let unlock_name = NSString::from_str(DISTRIBUTED_SCREEN_UNLOCKED_NAME);
-        let make_block = |f: Arc<dyn Fn() + 'static>| {
-            RcBlock::new(move |_note: NonNull<NSNotification>| {
-                autoreleasepool(|_| f());
-            })
-        };
-        let mut distributed_tokens = Vec::with_capacity(1);
-        let b_dist = make_block(Arc::clone(&cb));
-        distributed_tokens.push(unsafe {
-            dist_center.addObserverForName_object_queue_usingBlock(
-                Some(&unlock_name),
-                None,
-                Some(&main_queue),
-                &b_dist,
-            )
-        });
-
-        let ws_center = NSWorkspace::sharedWorkspace().notificationCenter();
-        let wake_names: [&NSNotificationName; 3] = unsafe {
-            [
-                NSWorkspaceSessionDidBecomeActiveNotification,
-                NSWorkspaceScreensDidWakeNotification,
-                NSWorkspaceDidWakeNotification,
-            ]
-        };
-        let mut workspace_tokens = Vec::with_capacity(3);
-        for name in wake_names {
-            let b = make_block(Arc::clone(&cb));
-            workspace_tokens.push(unsafe {
-                ws_center.addObserverForName_object_queue_usingBlock(
-                    Some(name),
-                    None,
-                    Some(&main_queue),
-                    &b,
-                )
-            });
-        }
-        Self {
-            distributed_tokens,
-            workspace_tokens,
-        }
-    }
-}
-
-impl Drop for UnlockMonitor {
-    fn drop(&mut self) {
-        let dist_center = NSDistributedNotificationCenter::defaultCenter();
-        for token in self.distributed_tokens.drain(..) {
-            unsafe {
-                dist_center.removeObserver(token.as_ref());
-            }
-        }
-        let ws_center = NSWorkspace::sharedWorkspace().notificationCenter();
-        for token in self.workspace_tokens.drain(..) {
-            unsafe {
-                ws_center.removeObserver(token.as_ref());
-            }
-        }
-    }
 }
 
 /// Pumps the current thread's `NSRunLoop` up to `duration` so CLI sessions receive macOS

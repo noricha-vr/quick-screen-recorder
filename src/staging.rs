@@ -23,7 +23,7 @@ use io_helpers::{
 pub use io_helpers::{
     commit_or_recover_default, commit_or_recover_salvaged_default, commit_or_recover_staging,
     commit_or_recover_staging_with_policy, preserve_capture_to_recovery,
-    preserve_recording_on_quit,
+    preserve_recording_on_quit, preserve_staged_permanently,
 };
 
 /// Returns a private (`0700`, non-auto-pruned) local recovery directory inside Application Support

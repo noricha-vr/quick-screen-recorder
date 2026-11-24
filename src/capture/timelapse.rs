@@ -67,6 +67,10 @@ impl TimelapseSession {
         let cfg = config.clone();
 
         let sync = SyncState::new();
+        if let Some(ref latch) = interrupt_latch {
+            let sync_hook = Arc::clone(&sync);
+            latch.attach_stop_hook(Arc::new(move || sync_hook.signal_stop()));
+        }
         let sync_worker = Arc::clone(&sync);
         let frames_written = Arc::new(AtomicU64::new(0));
         let frames_worker = Arc::clone(&frames_written);

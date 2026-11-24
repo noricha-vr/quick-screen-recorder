@@ -200,3 +200,37 @@ fn commit_or_recover_staging_rescues_on_destination_loss_and_retains_on_double_f
     let _ = fs::remove_dir_all(retained_file.parent().unwrap());
     let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn preserve_staged_permanently_survives_gui_temp_files_cleanup_on_stop_error() {
+    let base = std::env::temp_dir().join(format!("qsr-perm-{}", random_hex_token()));
+    let cache_dir = base.join("cache");
+    let rec_dir = base.join("rec");
+    fs::create_dir_all(&cache_dir).expect("mkdir cache");
+    let gui_temp_out = cache_dir.join("capture-gui.mp4");
+    let mut temp_files = vec![gui_temp_out.clone()];
+
+    let mut s1 = ExclusiveStagingDir::create_for_target(&gui_temp_out, "mp4").expect("stage1");
+    fs::write(s1.staged_file(), b"salvaged-during-stop-error").expect("write s1");
+    let perm_path =
+        preserve_staged_permanently(&mut s1, Ok(rec_dir.clone())).expect("preserve permanently");
+    drop(s1);
+    assert_ne!(perm_path, gui_temp_out);
+
+    // Draining GUI temp_files must never remove the permanently preserved recording.
+    for tmp in temp_files.drain(..) {
+        let _ = fs::remove_file(tmp);
+    }
+    assert_eq!(fs::read(&perm_path).unwrap(), b"salvaged-during-stop-error");
+
+    // Fallback when recovery dir fails: retained in qsr-preserved-* and survives cache pruning.
+    let mut s2 = ExclusiveStagingDir::create_for_target(&gui_temp_out, "mp4").expect("stage2");
+    fs::write(s2.staged_file(), b"retained-fallback").expect("write s2");
+    let (_, kept) = preserve_staged_permanently(&mut s2, Err("blocked".to_string()))
+        .expect_err("recovery error returns kept path");
+    drop(s2);
+    assert_eq!(fs::read(&kept).unwrap(), b"retained-fallback");
+
+    let _ = fs::remove_dir_all(kept.parent().unwrap());
+    let _ = fs::remove_dir_all(&base);
+}

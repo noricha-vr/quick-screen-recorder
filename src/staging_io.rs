@@ -379,6 +379,22 @@ pub fn commit_or_recover_salvaged_default(
     )
 }
 
+/// Permanently preserves a completed staged MP4 directly into `recovery_dir` (never into
+/// `output_path` / GUI `temp_files`). If `recovery_dir` fails, retains staging exempt from
+/// drop deletion and 24-hour cache pruning, returning `Err((reason, surviving_path))`.
+pub fn preserve_staged_permanently(
+    staging: &mut ExclusiveStagingDir,
+    recovery_dir: Result<PathBuf, String>,
+) -> Result<PathBuf, (String, PathBuf)> {
+    match recovery_dir.and_then(|rec_dir| staging.preserve_to_recovery_dir(&rec_dir)) {
+        Ok((recovered_path, _)) => Ok(recovered_path),
+        Err(rec_err) => {
+            let kept = staging.retain_staged_file();
+            Err((rec_err, kept))
+        }
+    }
+}
+
 /// Rescues a finished GUI capture out of `temp_files` into `recovery_dir` so shutdown cleanup,
 /// OS reboots, and 24-hour cache pruning never delete it. If `recovery_dir` is unavailable,
 /// renames the file in place to `qsr-preserved-*` and returns `Err((reason, surviving_path))`.

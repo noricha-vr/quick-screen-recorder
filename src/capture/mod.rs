@@ -181,10 +181,9 @@ impl ActiveRecording {
             ));
         }
         match config.cadence.normalized() {
-            CaptureCadence::RealTime { .. } => Ok(Self::RealTime(RecordingSession::start(
-                config,
-                output_path,
-            )?)),
+            CaptureCadence::RealTime { .. } => Ok(Self::RealTime(
+                RecordingSession::start_with_interrupt(config, output_path, interrupt_latch)?,
+            )),
             CaptureCadence::Timelapse { .. } => Ok(Self::Timelapse(
                 TimelapseSession::start_with_interrupt(config, output_path, interrupt_latch)?,
             )),

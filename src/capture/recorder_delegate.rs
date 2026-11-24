@@ -1,6 +1,7 @@
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use block2::RcBlock;
 use objc2::rc::{Retained, autoreleasepool};
@@ -9,6 +10,11 @@ use objc2_foundation::{NSError, NSObject, NSObjectProtocol};
 use objc2_screen_capture_kit::{
     SCRecordingOutput, SCRecordingOutputDelegate, SCStream, SCStreamErrorCode,
 };
+
+use crate::capture::recorder::{
+    STOP_FALLBACK_AFTER, STOP_STREAM_CONFIRM_TIMEOUT, STOP_TIMEOUT, StopPollState,
+};
+use crate::export::avfoundation::{extract_rgba_frame, probe_video_metadata};
 
 #[derive(Default)]
 pub(super) struct DelegateSignal {
@@ -176,4 +182,91 @@ impl RecordingDelegate {
         // SAFETY: Calling `[super init]` on freshly allocated NSObject subclass.
         unsafe { msg_send![super(this), init] }
     }
+}
+
+/// Waits up to `timeout` for `recordingOutputDidStartRecording:` while polling `check_interrupted`
+/// every 50ms so screen lock/sleep during startup tears down the stream immediately.
+pub(super) fn wait_for_recording_started<F>(
+    signal: &Arc<(Mutex<DelegateSignal>, Condvar)>,
+    stopper: &SendableStreamStop,
+    timeout: Duration,
+    mut check_interrupted: F,
+) -> Result<(), String>
+where
+    F: FnMut() -> Option<String>,
+{
+    let (lock, cvar) = &**signal;
+    let deadline = Instant::now() + timeout;
+    let mut guard = lock.lock().map_err(|_| "Mutex poisoned")?;
+    while !guard.started && guard.error.is_none() {
+        if let Some(msg) = check_interrupted() {
+            drop(guard);
+            stopper.stop_now(Duration::from_millis(250));
+            return Err(msg);
+        }
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            break;
+        }
+        let (next_guard, _) = cvar
+            .wait_timeout(guard, rem.min(Duration::from_millis(50)))
+            .map_err(|_| "Mutex poisoned")?;
+        guard = next_guard;
+    }
+    if let Some(err) = guard.error.clone() {
+        drop(guard);
+        stopper.stop_now(Duration::from_millis(250));
+        return Err(format!("Recording output failed to start: {err}"));
+    }
+    if !guard.started {
+        drop(guard);
+        stopper.stop_now(Duration::from_millis(250));
+        return Err("Timed out waiting for hardware recording writer to start".to_string());
+    }
+    Ok(())
+}
+
+/// Pure transition table for [`crate::capture::recorder::PendingRecordingStop::poll`].
+/// Returns `(next_poll_state, should_send_stop_capture)`.
+pub(super) fn evaluate_stop_poll(
+    finished: bool,
+    stream_stopped: bool,
+    stop_sent_elapsed: Option<Duration>,
+    total_elapsed: Duration,
+) -> (StopPollState, bool) {
+    if finished && stream_stopped {
+        return (StopPollState::Finished, stop_sent_elapsed.is_none());
+    }
+    if stop_sent_elapsed.is_none() && (finished || total_elapsed >= STOP_FALLBACK_AFTER) {
+        return (StopPollState::Pending, true);
+    }
+    let timed_out = match stop_sent_elapsed {
+        Some(sent_for) if finished => sent_for >= STOP_STREAM_CONFIRM_TIMEOUT,
+        Some(sent_for) => total_elapsed >= STOP_TIMEOUT && sent_for >= STOP_STREAM_CONFIRM_TIMEOUT,
+        None => false,
+    };
+    let state = if timed_out {
+        StopPollState::TimedOut
+    } else {
+        StopPollState::Pending
+    };
+    (state, false)
+}
+
+/// Strictly verifies that `path` is a non-empty playable video file with at least one playable
+/// video track and a decodable initial frame (rejecting non-video files and truncated MP4s).
+pub fn is_valid_salvageable_mp4(path: &Path) -> bool {
+    let Ok(meta_fs) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta_fs.is_file() || meta_fs.len() == 0 {
+        return false;
+    }
+    let Ok(meta) = probe_video_metadata(path) else {
+        return false;
+    };
+    meta.has_video
+        && meta.is_playable
+        && meta.duration_sec >= 0.05
+        && extract_rgba_frame(path, 0.0, Some(64)).is_ok()
 }

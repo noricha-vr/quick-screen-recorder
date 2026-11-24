@@ -25,17 +25,40 @@ pub(crate) fn should_complete_tutorial_on_save(
     !recording_active && active_tutorial_gen.is_some() && active_tutorial_gen == editor_tutorial_gen
 }
 
-/// Defer modal `NSAlert::runModal()` calls while the screen is actively locked or entering sleep
-/// so logout, sleep, and termination never hang—errors are queued and displayed upon unlock/wake.
+/// Defer modal `NSAlert::runModal()` calls while the screen is actively locked or still asleep
+/// (i.e. wake/unlock has not yet been observed since the auto-stop started). If macOS already
+/// resumed before finalization completed, display the alert immediately instead of waiting for
+/// another sleep/wake cycle.
 pub(crate) fn should_defer_error_alert(
     auto_stop_reason: Option<SystemInterruptReason>,
     session_currently_interrupted: bool,
+    already_resumed: bool,
 ) -> bool {
-    session_currently_interrupted
-        || matches!(
-            auto_stop_reason,
-            Some(SystemInterruptReason::DisplaySlept | SystemInterruptReason::SystemWillSleep)
-        )
+    if session_currently_interrupted {
+        return true;
+    }
+    if already_resumed {
+        return false;
+    }
+    matches!(
+        auto_stop_reason,
+        Some(SystemInterruptReason::DisplaySlept | SystemInterruptReason::SystemWillSleep)
+    )
+}
+
+fn ensure_unlock_monitor(runtime: &Rc<RefCell<AppRuntime>>) {
+    if runtime.borrow().unlock_monitor.is_some() {
+        return;
+    }
+    let rt_unlock = Rc::clone(runtime);
+    let mon = UnlockMonitor::start_gui(move || {
+        if let Some(m) = MainThreadMarker::new() {
+            if current_session_interrupt().is_none() {
+                flush_deferred_alerts(m, &rt_unlock);
+            }
+        }
+    });
+    runtime.borrow_mut().unlock_monitor = Some(mon);
 }
 
 pub(crate) fn queue_or_show_error_alert(
@@ -49,22 +72,19 @@ pub(crate) fn queue_or_show_error_alert(
         show_error_alert(mtm, title, message);
         return;
     }
-    let needs_unlock_monitor = {
+    ensure_unlock_monitor(runtime);
+    let already_unlocked = {
         let mut rt = runtime.borrow_mut();
         rt.deferred_alerts
             .push((title.to_string(), message.to_string()));
-        rt.unlock_monitor.is_none()
+        current_session_interrupt().is_none()
+            && rt
+                .unlock_monitor
+                .as_ref()
+                .is_some_and(UnlockMonitor::has_resumed)
     };
-    if needs_unlock_monitor {
-        let rt_unlock = Rc::clone(runtime);
-        let mon = UnlockMonitor::start_gui(move || {
-            if let Some(m) = MainThreadMarker::new() {
-                if current_session_interrupt().is_none() {
-                    flush_deferred_alerts(m, &rt_unlock);
-                }
-            }
-        });
-        runtime.borrow_mut().unlock_monitor = Some(mon);
+    if already_unlocked {
+        flush_deferred_alerts(mtm, runtime);
     }
 }
 
@@ -135,6 +155,12 @@ pub(crate) fn stop_active_recording_with_reason(
         (sess, rt.active_capture_app.take(), rt.tutorial_generation)
     };
 
+    // Arm unlock/wake monitoring before finalization starts when auto-stopping so if macOS
+    // wakes up while the MP4 is flushing, we detect `has_resumed()` and never leave alerts stuck.
+    if auto_stop_reason.is_some() {
+        ensure_unlock_monitor(runtime);
+    }
+
     // Initiate teardown without blocking the AppKit main runloop; CoreAudio / ScreenCaptureKit
     // can deliver final audio + video buffers cleanly while NSTimer polls completion.
     let pending = session.begin_stop();
@@ -174,9 +200,26 @@ pub(crate) fn stop_active_recording_with_reason(
             return;
         };
         let app_name = captured_cell.borrow_mut().take();
-        let should_quit = rt_poll.borrow().quit_after_stop;
-        let defer_modal =
-            should_defer_error_alert(auto_stop_reason, current_session_interrupt().is_some());
+        let (should_quit, already_resumed) = {
+            let rt = rt_poll.borrow();
+            (
+                rt.quit_after_stop,
+                rt.unlock_monitor
+                    .as_ref()
+                    .is_some_and(UnlockMonitor::has_resumed),
+            )
+        };
+        let defer_modal = should_defer_error_alert(
+            auto_stop_reason,
+            current_session_interrupt().is_some(),
+            already_resumed,
+        );
+        if !defer_modal {
+            let mut rt = rt_poll.borrow_mut();
+            if rt.deferred_alerts.is_empty() {
+                let _ = rt.unlock_monitor.take();
+            }
+        }
 
         match pending.finish() {
             Ok(outcome) => {
@@ -392,56 +435,5 @@ pub(crate) fn open_editor_for_file(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unrelated_or_stale_editor_save_never_completes_tutorial() {
-        assert!(!should_complete_tutorial_on_save(Some(1), None, false));
-        assert!(!should_complete_tutorial_on_save(Some(1), None, true));
-        assert!(!should_complete_tutorial_on_save(Some(2), Some(1), false));
-        assert!(!should_complete_tutorial_on_save(Some(2), Some(2), true));
-        assert!(should_complete_tutorial_on_save(Some(2), Some(2), false));
-        assert!(!should_complete_tutorial_on_save(None, Some(2), false));
-    }
-
-    #[test]
-    fn modal_alerts_defer_when_locked_or_entering_sleep_and_show_once_unlocked() {
-        assert!(!should_defer_error_alert(None, false));
-        assert!(should_defer_error_alert(None, true));
-        // If screen already unlocked before finalization finished, show immediately.
-        assert!(!should_defer_error_alert(
-            Some(SystemInterruptReason::ScreenLocked),
-            false
-        ));
-        assert!(should_defer_error_alert(
-            Some(SystemInterruptReason::ScreenLocked),
-            true
-        ));
-        assert!(should_defer_error_alert(
-            Some(SystemInterruptReason::DisplaySlept),
-            false
-        ));
-        assert!(should_defer_error_alert(
-            Some(SystemInterruptReason::SystemWillSleep),
-            false
-        ));
-    }
-
-    #[test]
-    fn auto_stop_notice_includes_reason_and_saved_location() {
-        let path = Path::new("/tmp/AutoSaved-Recording-recovered-abc123.mp4");
-        let clean = build_auto_stop_notice(SystemInterruptReason::ScreenLocked, path, None, None);
-        assert!(clean.contains("screen locked"));
-        assert!(clean.contains("AutoSaved-Recording"));
-
-        let with_warn = build_auto_stop_notice(
-            SystemInterruptReason::DisplaySlept,
-            path,
-            Some("window closed"),
-            None,
-        );
-        assert!(with_warn.contains("display slept"));
-        assert!(with_warn.contains("window closed"));
-    }
-}
+#[path = "capture_stop_tests.rs"]
+mod tests;

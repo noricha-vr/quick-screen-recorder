@@ -16,20 +16,26 @@ use objc2_screen_capture_kit::{
 #[path = "recorder_delegate.rs"]
 mod delegate;
 
-use delegate::{DelegateSignal, RecordingDelegate, SendableStreamStop, StreamStopControl};
+pub use delegate::is_valid_salvageable_mp4;
+use delegate::{
+    DelegateSignal, RecordingDelegate, SendableStreamStop, StreamStopControl, evaluate_stop_poll,
+    wait_for_recording_started,
+};
 
 use crate::capture::filter::build_filter_and_dimensions;
 use crate::capture::shareable::query_shareable_content_for_capture;
-use crate::capture::system_events::StopHook;
+use crate::capture::system_events::{InterruptLatch, StopHook, current_session_interrupt};
 use crate::capture::{CaptureConfig, RecordingCodec, RecordingOutcome};
-use crate::export::avfoundation::{extract_rgba_frame, probe_video_metadata};
 use crate::fs_safety::{ExclusiveStagingDir, format_tilde_path};
 use crate::observe::{PerfEvent, PerfKind, now_unix_secs, record_perf_event};
-use crate::staging::{commit_or_recover_default, commit_or_recover_salvaged_default};
+use crate::staging::{
+    commit_or_recover_default, commit_or_recover_salvaged_default, preserve_staged_permanently,
+    private_recovery_dir,
+};
 
-const STOP_FALLBACK_AFTER: Duration = Duration::from_secs(2);
-const STOP_TIMEOUT: Duration = Duration::from_secs(12);
-const STOP_STREAM_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const STOP_FALLBACK_AFTER: Duration = Duration::from_secs(2);
+pub(super) const STOP_TIMEOUT: Duration = Duration::from_secs(12);
+pub(super) const STOP_STREAM_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct RecordingSession {
     stream: Retained<SCStream>,
@@ -70,9 +76,30 @@ pub struct PendingRecordingStop {
 
 impl RecordingSession {
     pub fn start(config: &CaptureConfig, output_path: &Path) -> Result<Self, String> {
+        Self::start_with_interrupt(config, output_path, None)
+    }
+
+    pub fn start_with_interrupt(
+        config: &CaptureConfig,
+        output_path: &Path,
+        interrupt_latch: Option<InterruptLatch>,
+    ) -> Result<Self, String> {
+        let check_interrupted = || -> Option<String> {
+            interrupt_latch
+                .as_ref()
+                .and_then(InterruptLatch::reason)
+                .or_else(current_session_interrupt)
+                .map(|r| format!("Cannot start recording because {}", r.clause()))
+        };
+        if let Some(msg) = check_interrupted() {
+            return Err(msg);
+        }
         let staging = ExclusiveStagingDir::create_for_target(output_path, "mp4")?;
 
         let snapshot = query_shareable_content_for_capture()?;
+        if let Some(msg) = check_interrupted() {
+            return Err(msg);
+        }
         let (filter, pixel_w, pixel_h, source_rect_opt) =
             build_filter_and_dimensions(&snapshot.content, config)?;
 
@@ -157,6 +184,17 @@ impl RecordingSession {
             )
         };
 
+        if let Some(msg) = check_interrupted() {
+            return Err(msg);
+        }
+        let stop_control = Arc::new(StreamStopControl::default());
+        let stopper = Arc::new(SendableStreamStop::new(
+            stream.clone(),
+            recording_output.clone(),
+            Arc::clone(&signal),
+            Arc::clone(&stop_control),
+        ));
+
         unsafe {
             stream
                 .addRecordingOutput_error(&recording_output)
@@ -166,6 +204,10 @@ impl RecordingSession {
                         e.localizedDescription()
                     )
                 })?;
+        }
+        if let Some(msg) = check_interrupted() {
+            stopper.stop_now(Duration::from_millis(250));
+            return Err(msg);
         }
 
         let (tx, rx) = mpsc::sync_channel::<Result<(), String>>(1);
@@ -186,27 +228,26 @@ impl RecordingSession {
             Ok(Ok(())) => {}
             Ok(Err(e)) => return Err(e),
             Err(_) => {
-                unsafe { stream.stopCaptureWithCompletionHandler(None) };
+                stopper.stop_now(Duration::from_millis(250));
                 return Err("Timed out starting ScreenCaptureKit stream".to_string());
             }
         }
 
-        {
-            let (lock, cvar) = &*signal;
-            let guard = lock.lock().map_err(|_| "Mutex poisoned")?;
-            let (guard, _) = cvar
-                .wait_timeout_while(guard, Duration::from_secs(8), |s| {
-                    !s.started && s.error.is_none()
-                })
-                .map_err(|_| "Mutex poisoned")?;
-            if let Some(err) = &guard.error {
-                unsafe { stream.stopCaptureWithCompletionHandler(None) };
-                return Err(format!("Recording output failed to start: {err}"));
-            }
-            if !guard.started {
-                unsafe { stream.stopCaptureWithCompletionHandler(None) };
-                return Err("Timed out waiting for hardware recording writer to start".to_string());
-            }
+        // Attach the stop hook immediately once capture starts so any lock/sleep event during
+        // `did_start` initialization stops the stream right away without waiting for `start` to return.
+        if let Some(ref latch) = interrupt_latch {
+            let s_hook = Arc::clone(&stopper);
+            latch.attach_stop_hook(Arc::new(move || s_hook.stop_now(STOP_FALLBACK_AFTER)));
+        }
+        if let Some(msg) = check_interrupted() {
+            stopper.stop_now(Duration::from_millis(250));
+            return Err(msg);
+        }
+
+        wait_for_recording_started(&signal, &stopper, Duration::from_secs(8), check_interrupted)?;
+        if let Some(msg) = check_interrupted() {
+            stopper.stop_now(Duration::from_millis(250));
+            return Err(msg);
         }
 
         Ok(Self {
@@ -214,7 +255,7 @@ impl RecordingSession {
             recording_output,
             _delegate: delegate,
             signal,
-            stop_control: Arc::new(StreamStopControl::default()),
+            stop_control,
             staging,
             output_path: output_path.to_path_buf(),
             started_at: Instant::now(),
@@ -382,9 +423,26 @@ impl PendingRecordingStop {
             });
         }
 
-        // Salvaged or stop-error clips use non-overwriting publish so existing target files are never replaced.
-        let use_non_overwrite = salvaged_warn.is_some() || stop_issue.is_some();
-        let commit_res = if use_non_overwrite {
+        // If stopping the capture stream itself failed or timed out, preserve any playable MP4
+        // directly into permanent recovery (never GUI `temp_files`) before returning `Err`.
+        if let Some(stop_err) = stop_issue {
+            self.record_perf(0, false);
+            return Err(
+                match preserve_staged_permanently(&mut self.staging, private_recovery_dir()) {
+                    Ok(saved_path) => format!(
+                        "{stop_err}. Playable footage was preserved at {}",
+                        format_tilde_path(&saved_path)
+                    ),
+                    Err((rec_err, kept_path)) => format!(
+                        "{stop_err} (recovery failed: {rec_err}). Playable footage was preserved in staging at {}",
+                        format_tilde_path(&kept_path)
+                    ),
+                },
+            );
+        }
+
+        // Salvaged clips use non-overwriting publish so existing target files are never replaced.
+        let commit_res = if salvaged_warn.is_some() {
             commit_or_recover_salvaged_default(
                 &mut self.staging,
                 self.output_path.clone(),
@@ -393,17 +451,6 @@ impl PendingRecordingStop {
         } else {
             commit_or_recover_default(&mut self.staging, self.output_path.clone(), None)
         };
-
-        if let Some(stop_err) = stop_issue {
-            self.record_perf(0, false);
-            return Err(match commit_res {
-                Ok((saved_path, _, _)) => format!(
-                    "{stop_err}. Playable footage was still preserved at {}",
-                    format_tilde_path(&saved_path)
-                ),
-                Err(com_err) => format!("{stop_err}; {com_err}"),
-            });
-        }
 
         let (final_path, size, final_warning) = match commit_res {
             Ok(v) => v,
@@ -431,53 +478,6 @@ impl PendingRecordingStop {
             ok,
         });
     }
-}
-
-/// Pure transition table for [`PendingRecordingStop::poll`].
-/// Returns `(next_poll_state, should_send_stop_capture)`.
-/// Never times out on the tick that first sends `stopCaptureWithCompletionHandler`,
-/// guaranteeing a full stream-stop confirmation window even after a delayed runloop tick.
-fn evaluate_stop_poll(
-    finished: bool,
-    stream_stopped: bool,
-    stop_sent_elapsed: Option<Duration>,
-    total_elapsed: Duration,
-) -> (StopPollState, bool) {
-    if finished && stream_stopped {
-        return (StopPollState::Finished, stop_sent_elapsed.is_none());
-    }
-    if stop_sent_elapsed.is_none() && (finished || total_elapsed >= STOP_FALLBACK_AFTER) {
-        return (StopPollState::Pending, true);
-    }
-    let timed_out = match stop_sent_elapsed {
-        Some(sent_for) if finished => sent_for >= STOP_STREAM_CONFIRM_TIMEOUT,
-        Some(sent_for) => total_elapsed >= STOP_TIMEOUT && sent_for >= STOP_STREAM_CONFIRM_TIMEOUT,
-        None => false,
-    };
-    let state = if timed_out {
-        StopPollState::TimedOut
-    } else {
-        StopPollState::Pending
-    };
-    (state, false)
-}
-
-/// Strictly verifies that `path` is a non-empty playable video file with at least one playable
-/// video track and a decodable initial frame (rejecting non-video files and truncated MP4s).
-pub fn is_valid_salvageable_mp4(path: &Path) -> bool {
-    let Ok(meta_fs) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !meta_fs.is_file() || meta_fs.len() == 0 {
-        return false;
-    }
-    let Ok(meta) = probe_video_metadata(path) else {
-        return false;
-    };
-    meta.has_video
-        && meta.is_playable
-        && meta.duration_sec >= 0.05
-        && extract_rgba_frame(path, 0.0, Some(64)).is_ok()
 }
 
 #[cfg(test)]
