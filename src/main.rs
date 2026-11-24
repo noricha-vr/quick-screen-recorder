@@ -62,6 +62,7 @@ fn execute(command: Command) -> Result<(), String> {
             start_sec,
             end_sec,
             max_width,
+            mute_audio,
         } => {
             let res = run_export(&ExportRequest {
                 input,
@@ -71,6 +72,7 @@ fn execute(command: Command) -> Result<(), String> {
                 start_sec,
                 end_sec,
                 max_width,
+                mute_audio,
             })?;
             let safe_out = sanitize_terminal_text(&res.output_path.display().to_string(), false);
             println!(
@@ -116,6 +118,7 @@ fn execute(command: Command) -> Result<(), String> {
                 show_cursor,
                 highlight_clicks,
                 audio_mode: audio,
+                microphone_device_id: None,
                 excluded_window_ids: Vec::new(),
                 source_app_name: None,
             };

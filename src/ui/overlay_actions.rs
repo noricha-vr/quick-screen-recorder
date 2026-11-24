@@ -4,15 +4,17 @@ use std::rc::Rc;
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 use objc2_app_kit::{NSPopUpButton, NSScreen, NSTextField, NSView, NSWindow};
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSPoint, NSRect, NSSize};
 
 use crate::capture::{AudioCaptureMode, CaptureConfig, CaptureTarget};
 use crate::config::Preferences;
-use crate::geometry::{AspectRatio, Rect, apply_aspect_to_rect};
+use crate::geometry::{AspectRatio, Rect, apply_aspect_to_rect, compute_toolbar_origin};
 use crate::ui::overlay::{
-    OverlayState, SelectionMode, StartCaptureCallback, extract_nsscreen_display_id,
+    OverlayState, SelectionMode, StartCaptureCallback, extract_nsscreen_display_id, nsrect_to_rect,
 };
-use crate::ui::overlay_toolbar::{OverlayToolbarActions, ToolbarActionIvars};
+use crate::ui::overlay_toolbar::{
+    OverlayToolbarActions, TOOLBAR_H, TOOLBAR_W, ToolbarActionIvars, append_tagged_popup_item,
+};
 
 #[allow(clippy::too_many_arguments)]
 pub fn build_toolbar_actions(
@@ -23,6 +25,7 @@ pub fn build_toolbar_actions(
     canvas_view: &Retained<NSView>,
     aspect_popup: &Retained<NSPopUpButton>,
     w_field: &Retained<NSTextField>,
+    x_lbl: &Retained<NSTextField>,
     h_field: &Retained<NSTextField>,
     target_popup: &Retained<NSPopUpButton>,
     sync_fields: &Rc<dyn Fn()>,
@@ -39,6 +42,7 @@ pub fn build_toolbar_actions(
     let twin_pick_mode = toolbar_window.clone();
     let ap_mode = aspect_popup.clone();
     let wf_mode = w_field.clone();
+    let xl_mode = x_lbl.clone();
     let hf_mode = h_field.clone();
     let tp_mode = target_popup.clone();
     let sf_mode = Rc::clone(sync_fields);
@@ -60,7 +64,8 @@ pub fn build_toolbar_actions(
     let sf_pick = Rc::clone(sync_fields);
 
     let st_fps = Rc::clone(state);
-    let st_audio = Rc::clone(state);
+    let st_sys_audio = Rc::clone(state);
+    let st_mic = Rc::clone(state);
     let st_cursor = Rc::clone(state);
     let st_clicks = Rc::clone(state);
     let st_rec = Rc::clone(state);
@@ -81,6 +86,7 @@ pub fn build_toolbar_actions(
                 st.hovered_window_idx = None;
                 ap_mode.setHidden(!is_area);
                 wf_mode.setHidden(!is_area);
+                xl_mode.setHidden(!is_area);
                 hf_mode.setHidden(!is_area);
                 tp_mode.setHidden(is_area);
                 tp_mode.removeAllItems();
@@ -90,10 +96,10 @@ pub fn build_toolbar_actions(
                     }
                     SelectionMode::Window => {
                         if st.windows.is_empty() {
-                            tp_mode.addItemWithTitle(&NSString::from_str("No windows available"));
+                            append_tagged_popup_item(&tp_mode, "No windows available", -1);
                         } else {
-                            for w in &st.windows {
-                                tp_mode.addItemWithTitle(&NSString::from_str(&w.display_label()));
+                            for (i, w) in st.windows.iter().enumerate() {
+                                append_tagged_popup_item(&tp_mode, &w.display_label(), i as isize);
                             }
                             let idx = st.selected_window_idx.min(st.windows.len() - 1);
                             tp_mode.selectItemAtIndex(idx as isize);
@@ -115,12 +121,11 @@ pub fn build_toolbar_actions(
                     }
                     SelectionMode::Screen => {
                         for (i, d) in st.displays.iter().enumerate() {
-                            tp_mode.addItemWithTitle(&NSString::from_str(&format!(
-                                "Display {} ({}×{})",
-                                i + 1,
-                                d.width,
-                                d.height
-                            )));
+                            append_tagged_popup_item(
+                                &tp_mode,
+                                &format!("Display {} ({}×{})", i + 1, d.width, d.height),
+                                i as isize,
+                            );
                         }
                         if st.screen_display_id != st.overlay_display_id && !st.demo_backdrop {
                             let target_did = st.screen_display_id;
@@ -166,9 +171,12 @@ pub fn build_toolbar_actions(
                 cv_size.setNeedsDisplay(true);
             }),
             on_target_pick: Box::new(move |idx| {
+                if idx < 0 {
+                    return;
+                }
                 let mut st = st_pick.borrow_mut();
                 let is_demo = st.demo_backdrop;
-                let u = idx.max(0) as usize;
+                let u = idx as usize;
                 match st.mode {
                     SelectionMode::Window => {
                         if st.window_overlay_rect(u).is_none() && !st.demo_backdrop {
@@ -207,9 +215,17 @@ pub fn build_toolbar_actions(
             on_fps: Box::new(move |idx| {
                 st_fps.borrow_mut().fps = if idx == 0 { 30 } else { 60 };
             }),
-            on_audio: Box::new(move |idx| {
-                st_audio.borrow_mut().audio_mode =
-                    AudioCaptureMode::from_index(idx.max(0) as usize);
+            on_sys_audio: Box::new(move |on| {
+                st_sys_audio.borrow_mut().capture_system_audio = on;
+            }),
+            on_mic: Box::new(move |idx| {
+                if idx < 0 {
+                    return;
+                }
+                let mut st = st_mic.borrow_mut();
+                if let Some(item) = st.mic_items.get(idx as usize) {
+                    st.mic_input = item.to_preference();
+                }
             }),
             on_cursor: Box::new(move |on| {
                 st_cursor.borrow_mut().show_cursor = on;
@@ -251,11 +267,18 @@ pub fn build_toolbar_actions(
                         None,
                     ),
                 };
+                let audio_mode = AudioCaptureMode::from_split(
+                    st.capture_system_audio,
+                    st.mic_input.is_enabled(),
+                );
+                let microphone_device_id = st.mic_input.explicit_device_id().map(ToOwned::to_owned);
                 let mut updated = base_prefs.clone();
                 updated.fps = st.fps;
                 updated.show_cursor = st.show_cursor;
                 updated.highlight_clicks = st.highlight_clicks;
-                updated.audio_mode = st.audio_mode;
+                updated.capture_system_audio = st.capture_system_audio;
+                updated.mic_input = st.mic_input.clone();
+                updated.audio_mode = audio_mode;
                 updated.aspect_ratio = st.aspect;
                 if st.mode == SelectionMode::Area {
                     updated.last_region = st.selection;
@@ -266,7 +289,8 @@ pub fn build_toolbar_actions(
                     codec: updated.recording_codec,
                     show_cursor: st.show_cursor,
                     highlight_clicks: st.highlight_clicks,
-                    audio_mode: st.audio_mode,
+                    audio_mode,
+                    microphone_device_id,
                     excluded_window_ids: vec![cwin_num, twin_num],
                     source_app_name,
                 };
@@ -292,6 +316,7 @@ fn relocate_overlay_to_display(
         let s = screens.objectAtIndex(i);
         if extract_nsscreen_display_id(&s) == Some(target_display_id) {
             let sf = s.frame();
+            let vf = s.visibleFrame();
             st.overlay_display_id = target_display_id;
             st.screen_display_id = target_display_id;
             if let Some(pos) = st
@@ -302,17 +327,19 @@ fn relocate_overlay_to_display(
                 st.selected_display_idx = pos;
             }
             st.scale_factor = s.backingScaleFactor();
+            st.screen_frame = nsrect_to_rect(sf);
+            st.visible_frame = nsrect_to_rect(vf);
             st.bounds = Rect::new(0.0, 0.0, sf.size.width, sf.size.height);
             st.selection = st.bounds;
             canvas_window.setFrame_display(sf, true);
-            let tb_frame = toolbar_window.frame();
-            let next_tb = NSRect::new(
-                NSPoint::new(
-                    sf.origin.x + (sf.size.width - tb_frame.size.width) * 0.5,
-                    sf.origin.y + 36.0,
-                ),
-                NSSize::new(tb_frame.size.width, tb_frame.size.height),
+            let (tx, ty) = compute_toolbar_origin(
+                st.selection,
+                st.screen_frame,
+                st.visible_frame,
+                TOOLBAR_W,
+                TOOLBAR_H,
             );
+            let next_tb = NSRect::new(NSPoint::new(tx, ty), NSSize::new(TOOLBAR_W, TOOLBAR_H));
             toolbar_window.setFrame_display(next_tb, true);
             break;
         }

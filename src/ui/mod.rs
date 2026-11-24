@@ -28,7 +28,7 @@ use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_foundation::NSTimer;
 
 use crate::capture::RecordingCodec;
-use crate::capture::recorder::RecordingSession;
+use crate::capture::recorder::{PendingRecordingStop, RecordingSession};
 use crate::cli::DemoMode;
 use crate::config::Preferences;
 use crate::permissions::has_screen_capture_permission;
@@ -55,8 +55,11 @@ pub(crate) struct AppRuntime {
     pub(crate) next_tutorial_gen: u64,
     pub(crate) overlay: Option<SelectorOverlay>,
     pub(crate) session: Option<RecordingSession>,
+    pub(crate) pending_stop: Option<PendingRecordingStop>,
     pub(crate) active_capture_app: Option<String>,
     pub(crate) rec_timer: Option<Retained<NSTimer>>,
+    pub(crate) stop_poll_timer: Option<Retained<NSTimer>>,
+    pub(crate) mic_perm_timer: Option<Retained<NSTimer>>,
     pub(crate) editors: Vec<EditorWindow>,
     pub(crate) temp_files: Vec<PathBuf>,
 }
@@ -93,8 +96,11 @@ pub fn run_gui(
         next_tutorial_gen: 1,
         overlay: None,
         session: None,
+        pending_stop: None,
         active_capture_app: None,
         rec_timer: None,
+        stop_poll_timer: None,
+        mic_perm_timer: None,
         editors: Vec::new(),
         temp_files: Vec::new(),
     }));
@@ -177,7 +183,7 @@ fn build_status_bar_callbacks(runtime: &Rc<RefCell<AppRuntime>>) -> StatusBarCal
         on_open_guide: Box::new(move |m| {
             let is_rec = {
                 let mut rt = rt_g.borrow_mut();
-                let rec = rt.session.is_some();
+                let rec = rt.session.is_some() || rt.pending_stop.is_some();
                 if !rec {
                     // Start a fresh tutorial generation so any previously open editor cannot complete it.
                     rt.tutorial_generation = None;
@@ -277,6 +283,15 @@ fn cleanup_and_quit(mtm: MainThreadMarker, runtime: &Rc<RefCell<AppRuntime>>) {
         }
         if let Some(t) = rt.rec_timer.take() {
             t.invalidate();
+        }
+        if let Some(t) = rt.stop_poll_timer.take() {
+            t.invalidate();
+        }
+        if let Some(t) = rt.mic_perm_timer.take() {
+            t.invalidate();
+        }
+        if let Some(pending) = rt.pending_stop.take() {
+            let _ = pending.finish();
         }
         if let Some(sess) = rt.session.take() {
             let _ = sess.stop();

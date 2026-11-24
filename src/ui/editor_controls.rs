@@ -27,6 +27,7 @@ pub struct EditorControls {
     pub folder_items: Vec<FolderMenuItem>,
     pub name_field: Retained<NSTextField>,
     pub ext_label: Retained<NSTextField>,
+    pub mute_checkbox: Retained<NSButton>,
     pub status_label: Retained<NSTextField>,
     pub progress_view: Retained<ExportProgressView>,
     pub copy_btn: Retained<NSButton>,
@@ -47,6 +48,7 @@ pub fn build_editor_controls(
     prefs: &Preferences,
     initial_export_dir: Option<&Path>,
     default_stem: &str,
+    has_audio: bool,
     demo_showcase: bool,
     tutorial_hint: bool,
 ) -> EditorControls {
@@ -87,7 +89,8 @@ pub fn build_editor_controls(
     let folder_items = populate_folder_popup(mtm, &folder_popup, initial_export_dir, demo_showcase);
     root.addSubview(&folder_popup);
 
-    let (name_field, ext_label) = build_name_row(mtm, root, default_stem, initial_fmt);
+    let (name_field, ext_label, mute_checkbox) =
+        build_name_row(mtm, root, default_stem, initial_fmt, has_audio);
 
     let ready_text = if tutorial_hint {
         "Tutorial (3/3) · Edit name or trim if you like, then click Save".to_string()
@@ -156,6 +159,7 @@ pub fn build_editor_controls(
         folder_items,
         name_field,
         ext_label,
+        mute_checkbox,
         status_label,
         progress_view,
         copy_btn,
@@ -253,7 +257,12 @@ fn build_name_row(
     root: &NSView,
     default_stem: &str,
     initial_fmt: ExportFormat,
-) -> (Retained<NSTextField>, Retained<NSTextField>) {
+    has_audio: bool,
+) -> (
+    Retained<NSTextField>,
+    Retained<NSTextField>,
+    Retained<NSButton>,
+) {
     let name_lbl = NSTextField::labelWithString(&NSString::from_str("Name"), mtm);
     name_lbl.setFont(Some(&NSFont::systemFontOfSize_weight(12.0, 0.2)));
     name_lbl.setTextColor(Some(&NSColor::colorWithSRGBRed_green_blue_alpha(
@@ -281,13 +290,13 @@ fn build_name_row(
     )));
     name_field.setFrame(NSRect::new(
         NSPoint::new(68.0, 90.0),
-        NSSize::new(612.0, 24.0),
+        NSSize::new(498.0, 24.0),
     ));
     root.addSubview(&name_field);
 
     let ext_box = NSBox::initWithFrame(
         NSBox::alloc(mtm),
-        NSRect::new(NSPoint::new(686.0, 90.0), NSSize::new(54.0, 24.0)),
+        NSRect::new(NSPoint::new(572.0, 90.0), NSSize::new(52.0, 24.0)),
     );
     ext_box.setBoxType(NSBoxType::Custom);
     ext_box.setCornerRadius(6.0);
@@ -312,11 +321,32 @@ fn build_name_row(
     )));
     ext_label.setAlignment(NSTextAlignment::Center);
     ext_label.setFrame(NSRect::new(
-        NSPoint::new(686.0, 92.0),
-        NSSize::new(54.0, 19.0),
+        NSPoint::new(572.0, 92.0),
+        NSSize::new(52.0, 19.0),
     ));
     root.addSubview(&ext_label);
-    (name_field, ext_label)
+
+    let mute_checkbox = unsafe {
+        NSButton::checkboxWithTitle_target_action(
+            &NSString::from_str("Mute audio"),
+            None,
+            None,
+            mtm,
+        )
+    };
+    mute_checkbox.setFont(Some(&NSFont::systemFontOfSize_weight(12.0, 0.15)));
+    mute_checkbox.setFrame(NSRect::new(
+        NSPoint::new(636.0, 91.0),
+        NSSize::new(104.0, 22.0),
+    ));
+    let can_mute = has_audio && !matches!(initial_fmt, ExportFormat::Gif | ExportFormat::Apng);
+    mute_checkbox.setEnabled(can_mute);
+    mute_checkbox.setToolTip(Some(&NSString::from_str(
+        "Remove audio tracks from the exported video",
+    )));
+    root.addSubview(&mute_checkbox);
+
+    (name_field, ext_label, mute_checkbox)
 }
 
 fn build_preview_stage(

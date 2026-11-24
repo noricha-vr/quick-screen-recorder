@@ -10,7 +10,9 @@ use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send};
 use objc2_app_kit::{NSBezierPath, NSButton, NSColor, NSPopUpButton, NSTextField, NSView};
-use objc2_foundation::{NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer};
+use objc2_foundation::{
+    NSObjectProtocol, NSPoint, NSRect, NSRunLoop, NSRunLoopCommonModes, NSSize, NSString, NSTimer,
+};
 
 use crate::export::avfoundation::VideoMetadata;
 use crate::export::{ExportFormat, ExportRequest, ExportResult, run_export_with_options};
@@ -37,6 +39,7 @@ pub struct EditorState {
     pub max_width: Option<u32>,
     pub export_dir: Option<PathBuf>,
     pub default_stem: String,
+    pub mute_audio: bool,
     pub busy: bool,
 }
 
@@ -130,6 +133,11 @@ pub struct ExportUiControls {
     pub save_btn: Retained<NSButton>,
     pub folder_popup: Retained<NSPopUpButton>,
     pub name_field: Retained<NSTextField>,
+    pub mute_checkbox: Retained<NSButton>,
+}
+
+fn can_toggle_mute(state: &EditorState) -> bool {
+    state.meta.has_audio && !matches!(state.format, ExportFormat::Gif | ExportFormat::Apng)
 }
 
 pub fn spawn_async_export(
@@ -153,6 +161,7 @@ pub fn spawn_async_export(
     ui.save_btn.setEnabled(false);
     ui.folder_popup.setEnabled(false);
     ui.name_field.setEnabled(false);
+    ui.mute_checkbox.setEnabled(false);
 
     let progress = Arc::new(AtomicU32::new(25));
     let progress_bg = Arc::clone(&progress);
@@ -174,11 +183,16 @@ pub fn spawn_async_export(
             }
             Ok(result) => {
                 unsafe { timer.as_ref().invalidate() };
-                state.borrow_mut().busy = false;
+                let enable_mute = {
+                    let mut st = state.borrow_mut();
+                    st.busy = false;
+                    can_toggle_mute(&st)
+                };
                 ui.copy_btn.setEnabled(true);
                 ui.save_btn.setEnabled(true);
                 ui.folder_popup.setEnabled(true);
                 ui.name_field.setEnabled(true);
+                ui.mute_checkbox.setEnabled(enable_mute);
 
                 match result {
                     Ok(res) => {
@@ -238,11 +252,16 @@ pub fn spawn_async_export(
             }
             Err(mpsc::TryRecvError::Disconnected) => {
                 unsafe { timer.as_ref().invalidate() };
-                state.borrow_mut().busy = false;
+                let enable_mute = {
+                    let mut st = state.borrow_mut();
+                    st.busy = false;
+                    can_toggle_mute(&st)
+                };
                 ui.copy_btn.setEnabled(true);
                 ui.save_btn.setEnabled(true);
                 ui.folder_popup.setEnabled(true);
                 ui.name_field.setEnabled(true);
+                ui.mute_checkbox.setEnabled(enable_mute);
                 ui.progress_view
                     .set_progress(1000, ProgressVisualState::Failed);
                 ui.status_label
@@ -254,6 +273,7 @@ pub fn spawn_async_export(
     });
 
     unsafe {
-        let _ = NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.035, true, &poll_block);
+        let t = NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.035, true, &poll_block);
+        NSRunLoop::mainRunLoop().addTimer_forMode(&t, NSRunLoopCommonModes);
     }
 }

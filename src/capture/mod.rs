@@ -1,3 +1,5 @@
+pub mod audio_devices;
+mod filter;
 pub mod recorder;
 pub mod shareable;
 
@@ -42,6 +44,40 @@ impl AudioCaptureMode {
     pub fn index(self) -> usize {
         Self::ALL.iter().position(|&m| m == self).unwrap_or(0)
     }
+
+    pub fn from_split(system_audio: bool, mic_enabled: bool) -> Self {
+        match (system_audio, mic_enabled) {
+            (false, false) => Self::None,
+            (true, false) => Self::SystemAudio,
+            (false, true) => Self::Microphone,
+            (true, true) => Self::Both,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum MicInputPreference {
+    Off,
+    #[default]
+    SystemDefault,
+    Device {
+        id: String,
+        name: String,
+    },
+}
+
+impl MicInputPreference {
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub fn explicit_device_id(&self) -> Option<&str> {
+        match self {
+            Self::Device { id, .. } => Some(id.as_str()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -83,6 +119,7 @@ pub struct CaptureConfig {
     pub show_cursor: bool,
     pub highlight_clicks: bool,
     pub audio_mode: AudioCaptureMode,
+    pub microphone_device_id: Option<String>,
     pub excluded_window_ids: Vec<u32>,
     pub source_app_name: Option<String>,
 }

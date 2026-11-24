@@ -11,12 +11,12 @@ Development guide for contributors and coding agents working in `quick-screen-re
 | Path | Responsibility |
 |------|----------------|
 | `src/main.rs`, `src/cli.rs` | Binary entry point and zero-dependency CLI flag parser |
-| `src/geometry.rs` | Pure coordinate conversion (AppKit Y-up <-> CoreGraphics Y-down), aspect-ratio locking, even-pixel alignment, and 8-way resize hit-testing |
-| `src/config.rs` | Local user preferences serialization (`~/Library/Application Support/QuickScreenRecorder/preferences.json`) |
+| `src/geometry.rs` | Pure coordinate conversion (AppKit Y-up <-> CoreGraphics Y-down), aspect-ratio locking, even-pixel alignment, 8-way resize hit-testing, and Dock-aware floating toolbar positioning |
+| `src/config.rs` | Local user preferences serialization (`~/Library/Application Support/QuickScreenRecorder/preferences.json`), including split system/mic audio defaults |
 | `src/export_name.rs` | Chronological Spotlight-friendly export filename generation and user filename sanitization |
 | `src/observe.rs` | Local-only latency/size stats (`perf.jsonl`) with zero personal paths or titles |
-| `src/permissions.rs` | CoreGraphics Screen Recording permission checks, System Settings deep link, Finder reveal, and `doctor` diagnostics |
-| `src/capture/` | `SCShareableContent` enumeration and `SCStream` + `SCRecordingOutput` hardware capture session |
+| `src/permissions.rs` | CoreGraphics Screen Recording permission checks, Screen Recording & Microphone System Settings deep links, Finder reveal, and `doctor` diagnostics |
+| `src/capture/` | `SCShareableContent` enumeration, `AVCaptureDevice` microphone discovery/permission helpers, `SCContentFilter` builders, and non-blocking `SCStream` + `SCRecordingOutput` hardware capture session |
 | `src/export/` | `AVAssetExportSession` MP4/HEVC trimming, `AVAssetImageGenerator` frame extraction, parallel Rust GIF/APNG encoders, and optional `ffmpeg` WebM/AV1 runner |
 | `src/ui/` | Native AppKit status-bar controller, first-run onboarding & animated tutorial, selection overlay, and Trim & Export editor window |
 | `tests/export_pipeline.rs` | End-to-end export and privacy-invariant integration tests |

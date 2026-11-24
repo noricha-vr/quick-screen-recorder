@@ -5,6 +5,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-24
+
+### Added
+
+- **High-contrast 2-row floating capture toolbar with smart target following**:
+  - Automatically positions directly below the active Area or Window selection (`12pt` gap), flips above when near the macOS Dock (`NSScreen::visibleFrame()`), and floats cleanly inside fullscreen targets.
+  - Uses an elevated slate surface with an outer dark rim, bright inner highlight rim, and native window shadow so it remains clearly legible over both dark and bright screens.
+- **Split audio controls & persisted defaults**:
+  - Separated capture audio into an independent **`System Audio`** checkbox (default **ON**) and a **`Mic`** device dropdown (`Off`, `System (<default mic>)` default **ON**, plus individual connected microphones via `AVCaptureDeviceDiscoverySession`), with selections persisted across launches and graceful fallback if a saved microphone is unplugged.
+  - Requests microphone permission natively via async `AVCaptureDevice` prompt only when starting a mic-enabled capture (keeping first-run onboarding focused solely on Screen Recording), with a helpful `Record Without Mic` / `Open Microphone Settings` alert if previously denied.
+- **Post-capture `Mute audio` export option**:
+  - Added a **`Mute audio`** checkbox to the Trim & Export editor (disabled automatically for silent sources or GIF/APNG) and a `--mute` flag to `quick-screen-recorder convert` to strip audio tracks cleanly on MP4, HEVC, WebM, and AV1 exports.
+
+### Changed
+
+- Rounded selection overlay corners to a subtle previous-gen macOS **10pt** radius (with `EvenOdd` outer dim cutout, clipped thirds grid, and arc-seated handles; kept square in full-screen mode).
+- Moved the onboarding **`Open Settings →`** action button directly inside the top amber Screen Recording status banner and replaced the duplicate bottom-right button with a quiet `"Waiting for Screen Recording permission..."` status line during the permission step.
+
+### Fixed
+
+- Fixed **`Recording Error: Timed out stopping capture stream`** when finishing recordings with System Audio + Microphone enabled by replacing synchronous main-thread blocking teardown with non-blocking `RecordingSession::begin_stop()` + `NSTimer` polling so CoreAudio and ScreenCaptureKit flush final frames cleanly without stalling the AppKit runloop.
+
 ## [0.3.0] - 2026-11-24
 
 ### Added

@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use objc2::{MainThreadMarker, MainThreadOnly};
+use objc2::MainThreadMarker;
 use objc2_app_kit::{
     NSAlert, NSApplication, NSColor, NSMenuItem, NSModalResponseOK, NSOpenPanel, NSPopUpButton,
     NSTextField,
@@ -10,7 +10,8 @@ use objc2_app_kit::{
 use objc2_foundation::{NSString, NSURL};
 
 use crate::fs_safety::{
-    default_movies_export_dir, format_tilde_path, is_usable_export_dir, valid_home_dir,
+    default_movies_export_dir, format_tilde_path, is_usable_export_dir, next_unique_token,
+    sanitize_terminal_text, valid_home_dir,
 };
 use crate::ui::editor_worker::EditorState;
 
@@ -167,46 +168,35 @@ pub fn populate_folder_popup(
 
     if let Some(menu) = popup.menu() {
         menu.setAutoenablesItems(false);
-        for item in &items {
+        for (idx, item) in items.iter().enumerate() {
             match item {
                 FolderMenuItem::Dir { label, .. } => {
-                    let mi = unsafe {
-                        NSMenuItem::initWithTitle_action_keyEquivalent(
-                            NSMenuItem::alloc(mtm),
-                            &NSString::from_str(label),
-                            None,
-                            &NSString::from_str(""),
-                        )
-                    };
-                    mi.setEnabled(true);
-                    menu.addItem(&mi);
+                    let placeholder = format!("\u{1f}qsr-folder-{}-{idx}", next_unique_token());
+                    let safe_label = sanitize_terminal_text(label, false);
+                    popup.addItemWithTitle(&NSString::from_str(&placeholder));
+                    if let Some(mi) = popup.lastItem() {
+                        mi.setTitle(&NSString::from_str(&safe_label));
+                        mi.setEnabled(true);
+                    }
                 }
                 FolderMenuItem::Placeholder => {
-                    let mi = unsafe {
-                        NSMenuItem::initWithTitle_action_keyEquivalent(
-                            NSMenuItem::alloc(mtm),
-                            &NSString::from_str("Select Folder..."),
-                            None,
-                            &NSString::from_str(""),
-                        )
-                    };
-                    mi.setEnabled(false);
-                    menu.addItem(&mi);
+                    let placeholder = format!("\u{1f}qsr-folder-{}-{idx}", next_unique_token());
+                    popup.addItemWithTitle(&NSString::from_str(&placeholder));
+                    if let Some(mi) = popup.lastItem() {
+                        mi.setTitle(&NSString::from_str("Select Folder..."));
+                        mi.setEnabled(false);
+                    }
                 }
                 FolderMenuItem::Separator => {
                     menu.addItem(&NSMenuItem::separatorItem(mtm));
                 }
                 FolderMenuItem::ChooseCustom => {
-                    let mi = unsafe {
-                        NSMenuItem::initWithTitle_action_keyEquivalent(
-                            NSMenuItem::alloc(mtm),
-                            &NSString::from_str("Choose Folder..."),
-                            None,
-                            &NSString::from_str(""),
-                        )
-                    };
-                    mi.setEnabled(true);
-                    menu.addItem(&mi);
+                    let placeholder = format!("\u{1f}qsr-folder-{}-{idx}", next_unique_token());
+                    popup.addItemWithTitle(&NSString::from_str(&placeholder));
+                    if let Some(mi) = popup.lastItem() {
+                        mi.setTitle(&NSString::from_str("Choose Folder..."));
+                        mi.setEnabled(true);
+                    }
                 }
             }
         }

@@ -57,9 +57,8 @@ pub fn export_with_ffmpeg(
                 "4",
                 "-pix_fmt",
                 "yuv420p",
-                "-c:a",
-                "libopus",
             ],
+            "libopus",
             "webm",
             clip_duration_sec,
             progress,
@@ -79,9 +78,8 @@ pub fn export_with_ffmpeg(
                     "8",
                     "-pix_fmt",
                     "yuv420p",
-                    "-c:a",
-                    "aac",
                 ],
+                "aac",
                 "mp4",
                 clip_duration_sec,
                 progress,
@@ -105,9 +103,8 @@ pub fn export_with_ffmpeg(
                     "1",
                     "-pix_fmt",
                     "yuv420p",
-                    "-c:a",
-                    "aac",
                 ],
+                "aac",
                 "mp4",
                 clip_duration_sec,
                 progress,
@@ -126,7 +123,8 @@ fn run_ffmpeg_encode(
     input_file_url: &str,
     output_file_url: &str,
     req: &ExportRequest,
-    codec_args: &[&str],
+    video_codec_args: &[&str],
+    audio_codec: &str,
     container: &str,
     clip_duration_sec: f64,
     progress: Option<&SharedExportProgress>,
@@ -167,8 +165,13 @@ fn run_ffmpeg_encode(
         input_file_url.into(),
         "-map".into(),
         "0:v:0".into(),
-        "-map".into(),
-        "0:a:0?".into(),
+    ]);
+    if req.mute_audio {
+        args.push("-an".into());
+    } else {
+        args.extend(["-map".into(), "0:a:0?".into()]);
+    }
+    args.extend([
         "-sn".into(),
         "-dn".into(),
         "-map_metadata".into(),
@@ -188,8 +191,11 @@ fn run_ffmpeg_encode(
         args.push("scale=trunc(iw/2)*2:trunc(ih/2)*2".into());
     }
 
-    for &c in codec_args {
+    for &c in video_codec_args {
         args.push(c.into());
+    }
+    if !req.mute_audio {
+        args.extend(["-c:a".into(), audio_codec.into()]);
     }
     args.extend([
         "-protocol_whitelist".into(),

@@ -19,6 +19,7 @@ pub enum Command {
         start_sec: Option<f64>,
         end_sec: Option<f64>,
         max_width: Option<u32>,
+        mute_audio: bool,
     },
     Record {
         output: PathBuf,
@@ -159,6 +160,7 @@ fn parse_convert_flags(args: &[String]) -> Result<Command, String> {
     let mut start_sec: Option<f64> = None;
     let mut end_sec: Option<f64> = None;
     let mut max_width: Option<u32> = None;
+    let mut mute_audio = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -225,6 +227,7 @@ fn parse_convert_flags(args: &[String]) -> Result<Command, String> {
                 }
                 max_width = Some(w);
             }
+            "--mute" => mute_audio = true,
             other => return Err(format!("Unknown convert option '{other}'")),
         }
         i += 1;
@@ -257,6 +260,7 @@ fn parse_convert_flags(args: &[String]) -> Result<Command, String> {
         start_sec,
         end_sec,
         max_width,
+        mute_audio,
     })
 }
 
@@ -364,7 +368,7 @@ Quick Screen Recorder — Fast native screen recorder for macOS (ScreenCaptureKi
 USAGE:
   quick-screen-recorder [--select | --edit <video.mp4>]
   quick-screen-recorder record --output <out.mp4> [--duration <sec>] [--region x,y,w,h] [--fps 60] [--codec h264|hevc] [--audio none|system|mic|both] [--no-cursor] [--no-clicks]
-  quick-screen-recorder convert --input <in.mp4> --output <out.ext> [--format mp4|hevc|gif|apng|webm|av1] [--fps 30] [--start <sec>] [--end <sec>] [--max-width <px>]
+  quick-screen-recorder convert --input <in.mp4> --output <out.ext> [--format mp4|hevc|gif|apng|webm|av1] [--fps 30] [--start <sec>] [--end <sec>] [--max-width <px>] [--mute]
   quick-screen-recorder doctor
   quick-screen-recorder stats
 "
@@ -416,6 +420,7 @@ mod tests {
                 start_sec: Some(0.5),
                 end_sec: Some(2.5),
                 max_width: Some(640),
+                mute_audio: false,
             }
         );
 

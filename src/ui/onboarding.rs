@@ -26,6 +26,7 @@ pub struct OnboardingCallbacks {
 }
 
 struct OnboardingActionIvars {
+    on_open_settings: Box<dyn Fn()>,
     on_primary: Box<dyn Fn(MainThreadMarker)>,
     on_secondary: Box<dyn Fn(MainThreadMarker)>,
 }
@@ -40,6 +41,11 @@ define_class!(
     unsafe impl NSObjectProtocol for OnboardingActions {}
 
     impl OnboardingActions {
+        #[unsafe(method(openSettingsClicked:))]
+        fn open_settings_clicked(&self, _sender: Option<&AnyObject>) {
+            (self.ivars().on_open_settings)();
+        }
+
         #[unsafe(method(primaryClicked:))]
         fn primary_clicked(&self, _sender: Option<&AnyObject>) {
             (self.ivars().on_primary)(self.mtm());
@@ -93,6 +99,8 @@ impl OnboardingWindow {
         }));
 
         let cbs = Rc::new(callbacks);
+        let st_open = Rc::clone(&state);
+        let ui_open = Rc::clone(&ui);
         let st_pri = Rc::clone(&state);
         let ui_pri = Rc::clone(&ui);
         let cbs_pri = Rc::clone(&cbs);
@@ -101,6 +109,21 @@ impl OnboardingWindow {
 
         let actions: Retained<OnboardingActions> = {
             let ivars = OnboardingActionIvars {
+                on_open_settings: Box::new(move || {
+                    let _ = open_screen_recording_settings();
+                    if has_screen_capture_permission() {
+                        transition_step(
+                            &ui_open,
+                            &st_open,
+                            OnboardingStep::StartRecording,
+                            true,
+                            None,
+                        );
+                        if let Some(pt) = st_open.borrow_mut().perm_timer.take() {
+                            pt.invalidate();
+                        }
+                    }
+                }),
                 on_primary: Box::new(move |m| {
                     let step = st_pri.borrow().step;
                     match step {
@@ -143,6 +166,8 @@ impl OnboardingWindow {
         };
 
         unsafe {
+            ui.perm_open_btn.setTarget(Some(&actions));
+            ui.perm_open_btn.setAction(Some(sel!(openSettingsClicked:)));
             ui.primary_btn.setTarget(Some(&actions));
             ui.primary_btn.setAction(Some(sel!(primaryClicked:)));
             ui.secondary_btn.setTarget(Some(&actions));

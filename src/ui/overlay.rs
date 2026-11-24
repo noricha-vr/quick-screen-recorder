@@ -11,16 +11,22 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSNumber, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
+use crate::capture::audio_devices::{
+    MicDeviceInfo, MicMenuItem, build_mic_menu_model, list_microphone_devices,
+};
 use crate::capture::shareable::{DisplayInfo, WindowInfo};
-use crate::capture::{AudioCaptureMode, CaptureConfig};
+use crate::capture::{CaptureConfig, MicInputPreference};
 use crate::config::Preferences;
 use crate::fs_safety::sanitize_terminal_text;
 use crate::geometry::{
-    AspectRatio, DragMode, Rect, hit_test_window_frames, window_frame_to_overlay_rect,
+    AspectRatio, DragMode, Rect, compute_toolbar_origin, hit_test_window_frames,
+    window_frame_to_overlay_rect,
 };
 use crate::ui::overlay_actions::build_toolbar_actions;
 use crate::ui::overlay_canvas::{CanvasIvars, OverlayCanvasView};
-use crate::ui::overlay_toolbar::{OverlayToolbarActions, populate_toolbar_controls};
+use crate::ui::overlay_toolbar::{
+    OverlayToolbarActions, TOOLBAR_H, TOOLBAR_W, populate_toolbar_controls,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelectionMode {
@@ -42,6 +48,8 @@ pub struct OverlayState {
     pub mode: SelectionMode,
     pub selection: Rect,
     pub bounds: Rect,
+    pub screen_frame: Rect,
+    pub visible_frame: Rect,
     pub overlay_display_id: u32,
     pub screen_display_id: u32,
     pub scale_factor: f64,
@@ -49,7 +57,9 @@ pub struct OverlayState {
     pub fps: u32,
     pub show_cursor: bool,
     pub highlight_clicks: bool,
-    pub audio_mode: AudioCaptureMode,
+    pub capture_system_audio: bool,
+    pub mic_input: MicInputPreference,
+    pub mic_items: Vec<MicMenuItem>,
     pub windows: Vec<WindowInfo>,
     pub selected_window_idx: usize,
     pub hovered_window_idx: Option<usize>,
@@ -175,6 +185,7 @@ impl SelectorOverlay {
     ) -> Result<Self, String> {
         let screen = NSScreen::mainScreen(mtm).ok_or("No active macOS screen found")?;
         let screen_frame = screen.frame();
+        let visible_frame = screen.visibleFrame();
         let scale_factor = screen.backingScaleFactor();
         let matched_display_id = if demo_backdrop {
             displays.first().map(|d| d.display_id).unwrap_or(1)
@@ -209,16 +220,38 @@ impl SelectorOverlay {
         };
 
         let local_bounds = Rect::new(0.0, 0.0, win_frame.size.width, win_frame.size.height);
+        let (tb_screen_rect, tb_visible_rect) = if demo_backdrop {
+            (local_bounds, local_bounds)
+        } else {
+            (nsrect_to_rect(screen_frame), nsrect_to_rect(visible_frame))
+        };
         let initial_sel = if demo_backdrop {
-            Rect::new(190.0, 170.0, 700.0, 420.0)
+            Rect::new(190.0, 184.0, 700.0, 412.0)
         } else {
             prefs.last_region.clamp_and_align_even(local_bounds)
         };
+
+        let mic_devices = if demo_backdrop {
+            vec![MicDeviceInfo {
+                id: "demo-mic".to_string(),
+                name: "Built-in Mic".to_string(),
+                is_default: true,
+            }]
+        } else {
+            list_microphone_devices()
+        };
+        let (mic_items, selected_mic_idx) = build_mic_menu_model(&prefs.mic_input, &mic_devices);
+        let initial_mic_pref = mic_items
+            .get(selected_mic_idx)
+            .map(MicMenuItem::to_preference)
+            .unwrap_or_default();
 
         let state = Rc::new(RefCell::new(OverlayState {
             mode: SelectionMode::Area,
             selection: initial_sel,
             bounds: local_bounds,
+            screen_frame: tb_screen_rect,
+            visible_frame: tb_visible_rect,
             overlay_display_id: matched_display_id,
             screen_display_id: matched_display_id,
             scale_factor,
@@ -226,7 +259,9 @@ impl SelectorOverlay {
             fps: if prefs.fps >= 60 { 60 } else { 30 },
             show_cursor: prefs.show_cursor,
             highlight_clicks: prefs.highlight_clicks,
-            audio_mode: prefs.audio_mode,
+            capture_system_audio: prefs.capture_system_audio,
+            mic_input: initial_mic_pref,
+            mic_items: mic_items.clone(),
             windows,
             selected_window_idx: 0,
             hovered_window_idx: None,
@@ -257,6 +292,7 @@ impl SelectorOverlay {
             )),
             mtm,
         );
+        let x_lbl = NSTextField::labelWithString(&NSString::from_str("×"), mtm);
         let h_field = NSTextField::textFieldWithString(
             &NSString::from_str(&format!(
                 "{}",
@@ -282,9 +318,40 @@ impl SelectorOverlay {
         )));
         window_badge.setHidden(true);
 
+        let (init_tb_x, init_tb_y) = compute_toolbar_origin(
+            initial_sel,
+            tb_screen_rect,
+            tb_visible_rect,
+            TOOLBAR_W,
+            TOOLBAR_H,
+        );
+        let bar_rect = NSRect::new(
+            NSPoint::new(init_tb_x, init_tb_y),
+            NSSize::new(TOOLBAR_W, TOOLBAR_H),
+        );
+        let toolbar_window = KeyableOverlayWindow::new_borderless(mtm, bar_rect, demo_backdrop);
+        unsafe { toolbar_window.setReleasedWhenClosed(false) };
+        if let Some(dark) = NSAppearance::appearanceNamed(unsafe { NSAppearanceNameDarkAqua }) {
+            toolbar_window.setAppearance(Some(&dark));
+        }
+
+        let bar_container = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            if demo_backdrop {
+                NSRect::new(
+                    NSPoint::new(init_tb_x, init_tb_y),
+                    NSSize::new(TOOLBAR_W, TOOLBAR_H),
+                )
+            } else {
+                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(TOOLBAR_W, TOOLBAR_H))
+            },
+        );
+
         let w_sync = w_field.clone();
         let h_sync = h_field.clone();
         let badge_sync = window_badge.clone();
+        let tb_win_sync = toolbar_window.clone();
+        let tb_view_sync = bar_container.clone();
         let state_sync = Rc::clone(&state);
         let sync_fields: Rc<dyn Fn()> = Rc::new(move || {
             let st = state_sync.borrow();
@@ -297,6 +364,18 @@ impl SelectorOverlay {
                 "{}",
                 (st.selection.height * sf).round() as u32
             )));
+            let (tx, ty) = compute_toolbar_origin(
+                st.selection,
+                st.screen_frame,
+                st.visible_frame,
+                TOOLBAR_W,
+                TOOLBAR_H,
+            );
+            if st.demo_backdrop {
+                tb_view_sync.setFrameOrigin(NSPoint::new(tx, ty));
+            } else {
+                tb_win_sync.setFrameOrigin(NSPoint::new(tx, ty));
+            }
             if st.mode == SelectionMode::Window && !st.demo_backdrop {
                 if let Some(win) = st.windows.get(st.selected_window_idx) {
                     let clean = sanitize_terminal_text(&win.display_label(), false);
@@ -330,32 +409,6 @@ impl SelectorOverlay {
         canvas_window.setContentView(Some(&canvas_view));
         let _ = canvas_window.makeFirstResponder(Some(&canvas_view));
 
-        let (bar_w, bar_h) = (840.0, 52.0);
-        let bar_rect = NSRect::new(
-            NSPoint::new(
-                win_frame.origin.x + (win_frame.size.width - bar_w) * 0.5,
-                win_frame.origin.y + 36.0,
-            ),
-            NSSize::new(bar_w, bar_h),
-        );
-        let toolbar_window = KeyableOverlayWindow::new_borderless(mtm, bar_rect, demo_backdrop);
-        unsafe { toolbar_window.setReleasedWhenClosed(false) };
-        if let Some(dark) = NSAppearance::appearanceNamed(unsafe { NSAppearanceNameDarkAqua }) {
-            toolbar_window.setAppearance(Some(&dark));
-        }
-
-        let bar_container = NSView::initWithFrame(
-            NSView::alloc(mtm),
-            if demo_backdrop {
-                NSRect::new(
-                    NSPoint::new((win_frame.size.width - bar_w) * 0.5, 28.0),
-                    NSSize::new(bar_w, bar_h),
-                )
-            } else {
-                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(bar_w, bar_h))
-            },
-        );
-
         let canvas_nsview: Retained<NSView> = Retained::into_super(canvas_view.clone());
         let actions = build_toolbar_actions(
             mtm,
@@ -365,6 +418,7 @@ impl SelectorOverlay {
             &canvas_nsview,
             &aspect_popup,
             &w_field,
+            &x_lbl,
             &h_field,
             &target_popup,
             &sync_fields,
@@ -379,8 +433,11 @@ impl SelectorOverlay {
             &actions,
             &aspect_popup,
             &w_field,
+            &x_lbl,
             &h_field,
             &target_popup,
+            &mic_items,
+            selected_mic_idx,
             prefs,
         );
 
@@ -389,6 +446,7 @@ impl SelectorOverlay {
         } else {
             toolbar_window.setOpaque(false);
             toolbar_window.setBackgroundColor(Some(&NSColor::clearColor()));
+            toolbar_window.setHasShadow(true);
             toolbar_window.setMovable(false);
             toolbar_window.setMovableByWindowBackground(false);
             toolbar_window.setLevel(NSStatusWindowLevel);
@@ -413,6 +471,10 @@ impl SelectorOverlay {
         self.toolbar_window.close();
         self.canvas_window.close();
     }
+}
+
+pub fn nsrect_to_rect(r: NSRect) -> Rect {
+    Rect::new(r.origin.x, r.origin.y, r.size.width, r.size.height)
 }
 
 pub fn extract_nsscreen_display_id(screen: &NSScreen) -> Option<u32> {

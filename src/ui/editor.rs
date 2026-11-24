@@ -6,8 +6,9 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSAppearance, NSAppearanceCustomization, NSAppearanceNameDarkAqua, NSBackingStoreType, NSColor,
-    NSPopUpButton, NSScreen, NSTextField, NSView, NSWindow, NSWindowStyleMask,
+    NSAppearance, NSAppearanceCustomization, NSAppearanceNameDarkAqua, NSBackingStoreType,
+    NSButton, NSColor, NSControlStateValueOn, NSPopUpButton, NSScreen, NSTextField, NSView,
+    NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
@@ -31,6 +32,7 @@ struct EditorActionIvars {
     on_fps_change: Box<dyn Fn(isize)>,
     on_size_change: Box<dyn Fn(isize)>,
     on_folder_change: Box<dyn Fn(isize)>,
+    on_mute_change: Box<dyn Fn(bool)>,
     on_copy: Box<dyn Fn()>,
     on_save: Box<dyn Fn()>,
 }
@@ -60,6 +62,10 @@ define_class!(
         #[unsafe(method(folderChanged:))]
         fn folder_changed(&self, sender: &NSPopUpButton) {
             (self.ivars().on_folder_change)(sender.indexOfSelectedItem());
+        }
+        #[unsafe(method(muteToggled:))]
+        fn mute_toggled(&self, sender: &NSButton) {
+            (self.ivars().on_mute_change)(sender.state() == NSControlStateValueOn);
         }
         #[unsafe(method(copyClicked:))]
         fn copy_clicked(&self, _sender: Option<&AnyObject>) {
@@ -168,6 +174,7 @@ impl EditorWindow {
             prefs,
             initial_export_dir.as_deref(),
             &default_stem,
+            meta.has_audio,
             demo_showcase,
             tutorial_hint,
         );
@@ -183,6 +190,7 @@ impl EditorWindow {
             max_width: controls.initial_max_width,
             export_dir: initial_export_dir,
             default_stem,
+            mute_audio: false,
             busy: false,
         }));
 
@@ -214,8 +222,10 @@ impl EditorWindow {
         let st_f = Rc::clone(&state);
         let fps_pop_f = controls.fps_popup.clone();
         let ext_lbl_f = controls.ext_label.clone();
+        let mute_chk_f = controls.mute_checkbox.clone();
         let st_fps = Rc::clone(&state);
         let st_sz = Rc::clone(&state);
+        let st_mute = Rc::clone(&state);
 
         let st_dir = Rc::clone(&state);
         let fld_pop_dir = controls.folder_popup.clone();
@@ -229,6 +239,7 @@ impl EditorWindow {
         let save_c = controls.save_btn.clone();
         let folder_c = controls.folder_popup.clone();
         let name_c = controls.name_field.clone();
+        let mute_c = controls.mute_checkbox.clone();
         let win_c = window.clone();
 
         let st_save = Rc::clone(&state);
@@ -238,6 +249,7 @@ impl EditorWindow {
         let save_s = controls.save_btn.clone();
         let folder_s = controls.folder_popup.clone();
         let name_s = controls.name_field.clone();
+        let mute_s = controls.mute_checkbox.clone();
         let win_s = window.clone();
         let saved_cb_copy: Rc<dyn Fn(PathBuf)> = Rc::new(|_: PathBuf| {});
         let saved_cb_save = Rc::clone(&on_export_saved);
@@ -256,6 +268,9 @@ impl EditorWindow {
                         st.fps = 30;
                         fps_pop_f.selectItemAtIndex(1);
                     }
+                    let can_mute =
+                        st.meta.has_audio && !matches!(fmt, ExportFormat::Gif | ExportFormat::Apng);
+                    mute_chk_f.setEnabled(!st.busy && can_mute);
                 }),
                 on_fps_change: Box::new(move |idx| {
                     st_fps.borrow_mut().fps =
@@ -278,6 +293,9 @@ impl EditorWindow {
                             on_export_dir_change.as_ref(),
                         );
                     }
+                }),
+                on_mute_change: Box::new(move |muted| {
+                    st_mute.borrow_mut().mute_audio = muted;
                 }),
                 on_copy: Box::new(move || {
                     let _ = win_c.makeFirstResponder(None);
@@ -309,6 +327,7 @@ impl EditorWindow {
                             start_sec: Some(st.start_sec),
                             end_sec: Some(st.end_sec),
                             max_width: st.max_width,
+                            mute_audio: st.mute_audio,
                         }
                     };
                     spawn_async_export(
@@ -322,6 +341,7 @@ impl EditorWindow {
                             save_btn: save_c.clone(),
                             folder_popup: folder_c.clone(),
                             name_field: name_c.clone(),
+                            mute_checkbox: mute_c.clone(),
                         },
                         Rc::clone(&saved_cb_copy),
                     );
@@ -363,6 +383,7 @@ impl EditorWindow {
                             start_sec: Some(st.start_sec),
                             end_sec: Some(st.end_sec),
                             max_width: st.max_width,
+                            mute_audio: st.mute_audio,
                         }
                     };
                     spawn_async_export(
@@ -376,6 +397,7 @@ impl EditorWindow {
                             save_btn: save_s.clone(),
                             folder_popup: folder_s.clone(),
                             name_field: name_s.clone(),
+                            mute_checkbox: mute_s.clone(),
                         },
                         Rc::clone(&saved_cb_save),
                     );
@@ -394,6 +416,8 @@ impl EditorWindow {
             controls.size_popup.setAction(Some(sel!(sizeChanged:)));
             controls.folder_popup.setTarget(Some(&actions));
             controls.folder_popup.setAction(Some(sel!(folderChanged:)));
+            controls.mute_checkbox.setTarget(Some(&actions));
+            controls.mute_checkbox.setAction(Some(sel!(muteToggled:)));
             controls.copy_btn.setTarget(Some(&actions));
             controls.copy_btn.setAction(Some(sel!(copyClicked:)));
             controls.save_btn.setTarget(Some(&actions));

@@ -90,6 +90,7 @@ fn end_to_end_native_exports_codec_resize_metadata_and_telemetry() {
         start_sec: None,
         end_sec: None,
         max_width: None,
+        mute_audio: false,
     });
     assert!(same_err.is_err(), "must block overwriting same inode");
     assert!(src_mp4.exists(), "original source must remain intact");
@@ -108,6 +109,7 @@ fn end_to_end_native_exports_codec_resize_metadata_and_telemetry() {
         start_sec: Some(0.2),
         end_sec: Some(1.1),
         max_width: None,
+        mute_audio: false,
     })
     .expect("export trimmed mp4");
     assert!(mp4_res.output_bytes > 500);
@@ -125,6 +127,7 @@ fn end_to_end_native_exports_codec_resize_metadata_and_telemetry() {
         start_sec: Some(0.0),
         end_sec: Some(1.0),
         max_width: Some(400),
+        mute_audio: false,
     })
     .expect("export custom-width hevc");
     assert!(hevc_res.output_bytes > 500);
@@ -145,6 +148,7 @@ fn end_to_end_native_exports_codec_resize_metadata_and_telemetry() {
         start_sec: None,
         end_sec: None,
         max_width: None,
+        mute_audio: false,
     })
     .expect("transcode hevc back to h264");
     let back_meta = probe_video_metadata(&back_h264).expect("probe back_h264");
@@ -165,6 +169,7 @@ fn end_to_end_native_exports_codec_resize_metadata_and_telemetry() {
             start_sec: Some(0.1),
             end_sec: Some(1.0),
             max_width: Some(320),
+            mute_audio: false,
         },
         Some(&gif_prog),
     )
@@ -183,6 +188,7 @@ fn end_to_end_native_exports_codec_resize_metadata_and_telemetry() {
         start_sec: Some(0.1),
         end_sec: Some(0.9),
         max_width: Some(320),
+        mute_audio: false,
     })
     .expect("export apng");
     assert!(apng_res.output_bytes > 500);
@@ -231,6 +237,7 @@ fn end_to_end_native_exports_codec_resize_metadata_and_telemetry() {
             start_sec: None,
             end_sec: None,
             max_width: None,
+            mute_audio: false,
         })
         .expect("strip metadata on full-range mp4");
         let stripped_meta = probe_video_metadata(&stripped_mp4).expect("probe stripped");
@@ -272,13 +279,14 @@ fn end_to_end_native_exports_codec_resize_metadata_and_telemetry() {
 
         let rot_out = work.join("rotated_resized.mp4");
         run_export(&ExportRequest {
-            input: rotated_audio_mp4,
+            input: rotated_audio_mp4.clone(),
             output: rot_out.clone(),
             format: ExportFormat::Mp4,
             fps: 24,
             start_sec: Some(0.1),
             end_sec: Some(1.0),
             max_width: Some(180),
+            mute_audio: false,
         })
         .expect("export rotated audio mp4");
         let rot_meta = probe_video_metadata(&rot_out).expect("probe rotated out");
@@ -291,18 +299,63 @@ fn end_to_end_native_exports_codec_resize_metadata_and_telemetry() {
         );
         expected_events += 1;
 
+        let muted_out = work.join("rotated_muted.mp4");
+        run_export(&ExportRequest {
+            input: rotated_audio_mp4.clone(),
+            output: muted_out.clone(),
+            format: ExportFormat::Mp4,
+            fps: 30,
+            start_sec: None,
+            end_sec: None,
+            max_width: None,
+            mute_audio: true,
+        })
+        .expect("export muted mp4");
+        let muted_meta = probe_video_metadata(&muted_out).expect("probe muted mp4");
+        assert!(
+            !muted_meta.has_audio,
+            "mute_audio=true must strip audio track from MP4 output"
+        );
+        assert!(
+            muted_meta.height > muted_meta.width,
+            "muted export must preserve rotation orientation"
+        );
+        expected_events += 1;
+
         let out_webm = work.join("out.webm");
         let webm_res = run_export(&ExportRequest {
-            input: src_mp4.clone(),
-            output: out_webm,
+            input: rotated_audio_mp4.clone(),
+            output: out_webm.clone(),
             format: ExportFormat::Webm,
             fps: 24,
             start_sec: Some(0.0),
             end_sec: Some(0.8),
             max_width: Some(320),
+            mute_audio: true,
         })
-        .expect("export webm");
+        .expect("export muted webm");
         assert!(webm_res.output_bytes > 500);
+        // Confirm ffmpeg probe detects audio in the input, and finds ZERO audio streams in the muted WebM.
+        let src_has_audio_probe = Command::new(&ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(&rotated_audio_mp4)
+            .args(["-map", "0:a:0", "-t", "0.1", "-f", "null", "-"])
+            .output()
+            .expect("probe source audio via ffmpeg");
+        assert!(
+            src_has_audio_probe.status.success(),
+            "sanity check: source fixture must have an audio stream"
+        );
+        let webm_has_audio_probe = Command::new(&ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(&out_webm)
+            .args(["-map", "0:a:0", "-f", "null", "-"])
+            .output()
+            .expect("probe muted webm audio via ffmpeg");
+        assert!(
+            !webm_has_audio_probe.status.success(),
+            "mute_audio=true WebM output must contain zero audio streams"
+        );
         expected_events += 1;
     }
 
@@ -316,6 +369,7 @@ fn end_to_end_native_exports_codec_resize_metadata_and_telemetry() {
             start_sec: Some(0.0),
             end_sec: Some(0.6),
             max_width: None,
+            mute_audio: false,
         },
         None,
         true,
