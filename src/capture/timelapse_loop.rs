@@ -139,12 +139,11 @@ where
             let mut guard = match lock.lock() {
                 Ok(g) => g,
                 Err(_) => {
-                    duplicate_single_frame_if_needed(
+                    return Ok(finalize_stopped_loop(
                         frames_written,
                         &mut held_first_frame,
                         &mut write_frame,
-                    );
-                    return Ok(LoopExit::Stopped);
+                    ));
                 }
             };
             while !guard.stop_requested {
@@ -165,24 +164,22 @@ where
         };
 
         let Some(inflight) = inflight_opt else {
-            duplicate_single_frame_if_needed(
+            return Ok(finalize_stopped_loop(
                 frames_written,
                 &mut held_first_frame,
                 &mut write_frame,
-            );
-            return Ok(LoopExit::Stopped);
+            ));
         };
 
         let capture_res = await_capture(inflight);
         // If stop was requested while the capture was in flight, discard the returned frame
         // without writing it to disk so post-stop screen content can never enter the MP4.
         if sync.is_cancelled() {
-            duplicate_single_frame_if_needed(
+            return Ok(finalize_stopped_loop(
                 frames_written,
                 &mut held_first_frame,
                 &mut write_frame,
-            );
-            return Ok(LoopExit::Stopped);
+            ));
         }
 
         match capture_res {
@@ -203,13 +200,16 @@ where
                 consecutive_failures += 1;
                 if consecutive_failures >= MAX_CONSECUTIVE_CAPTURE_FAILURES {
                     let captured = frames_written.load(Ordering::Relaxed);
-                    duplicate_single_frame_if_needed(
+                    let closing_note = match duplicate_single_frame_if_needed(
                         frames_written,
                         &mut held_first_frame,
                         &mut write_frame,
-                    );
+                    ) {
+                        Ok(()) => String::new(),
+                        Err(w_err) => format!("; closing frame write also failed: {w_err}"),
+                    };
                     return Ok(LoopExit::AbortedAfterPartialCapture(format!(
-                        "Timelapse stopped after {consecutive_failures} consecutive capture failures ({captured} frames captured): {err}"
+                        "Timelapse stopped after {consecutive_failures} consecutive capture failures ({captured} frames captured): {err}{closing_note}"
                     )));
                 }
             }
@@ -222,18 +222,36 @@ where
     }
 }
 
+fn finalize_stopped_loop<W>(
+    frames_written: &AtomicU64,
+    held_first_frame: &mut Option<RgbaFrame>,
+    write_frame: &mut W,
+) -> LoopExit
+where
+    W: FnMut(&RgbaFrame) -> Result<(), String>,
+{
+    match duplicate_single_frame_if_needed(frames_written, held_first_frame, write_frame) {
+        Ok(()) => LoopExit::Stopped,
+        Err(w_err) => LoopExit::AbortedAfterPartialCapture(format!(
+            "Failed writing closing frame after {} frame(s): {w_err}",
+            frames_written.load(Ordering::Relaxed)
+        )),
+    }
+}
+
 fn duplicate_single_frame_if_needed<W>(
     frames_written: &AtomicU64,
     held_first_frame: &mut Option<RgbaFrame>,
     write_frame: &mut W,
-) where
+) -> Result<(), String>
+where
     W: FnMut(&RgbaFrame) -> Result<(), String>,
 {
     if frames_written.load(Ordering::Relaxed) == 1 {
         if let Some(frame) = held_first_frame.take() {
-            if write_frame(&frame).is_ok() {
-                frames_written.fetch_add(1, Ordering::Relaxed);
-            }
+            write_frame(&frame)?;
+            frames_written.fetch_add(1, Ordering::Relaxed);
         }
     }
+    Ok(())
 }

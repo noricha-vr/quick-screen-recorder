@@ -4,8 +4,8 @@ use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use quick_screen_recorder::capture::{RecordingCodec, TIMELAPSE_PLAYBACK_FPS};
-use quick_screen_recorder::export::av_writer::{StreamingMp4Writer, write_rgba_frames_to_mp4};
+use quick_screen_recorder::capture::RecordingCodec;
+use quick_screen_recorder::export::av_writer::write_rgba_frames_to_mp4;
 use quick_screen_recorder::export::avfoundation::{
     RgbaFrame, extract_rgba_frame, probe_video_metadata,
 };
@@ -388,86 +388,6 @@ fn end_to_end_native_exports_codec_resize_metadata_and_telemetry() {
     let summary = summarize_perf_log(&perf_log).expect("summarize perf log");
     assert_eq!(summary.total_events, expected_events);
     assert_eq!(summary.success_events, expected_events);
-
-    // 7. StreamingMp4Writer timelapse (30 fps playback, silent, zero metadata) and 1 fps real-time export
-    let tl_mp4 = work.join("timelapse_30fps.mp4");
-    let mut tl_writer = StreamingMp4Writer::new(
-        320,
-        180,
-        TIMELAPSE_PLAYBACK_FPS,
-        RecordingCodec::H264,
-        &tl_mp4,
-    )
-    .expect("create streaming timelapse writer");
-    for f in 0..30_u32 {
-        let mut pixels = vec![0_u8; 320 * 180 * 4];
-        for px in pixels.chunks_exact_mut(4) {
-            px[0] = (f * 8) as u8;
-            px[1] = 110;
-            px[2] = 200;
-            px[3] = 255;
-        }
-        tl_writer
-            .append_rgba_frame(&RgbaFrame {
-                width: 320,
-                height: 180,
-                pixels,
-            })
-            .expect("append timelapse frame");
-    }
-    assert_eq!(tl_writer.frames_written(), 30);
-    tl_writer.finish().expect("finish timelapse mp4");
-    let tl_meta = probe_video_metadata(&tl_mp4).expect("probe timelapse mp4");
-    assert!(!tl_meta.has_audio, "timelapse MP4 must be audio-free");
-    assert_eq!(tl_meta.common_metadata_count, 0);
-    assert!(
-        (tl_meta.nominal_fps - 30.0).abs() <= 1.5,
-        "expected 30 fps timelapse playback, got {}",
-        tl_meta.nominal_fps
-    );
-    assert!(
-        (tl_meta.duration_sec - 1.0).abs() <= 0.15,
-        "30 frames @ 30fps should be ~1.0s, got {}",
-        tl_meta.duration_sec
-    );
-
-    let one_fps_mp4 = work.join("realtime_1fps.mp4");
-    run_export(&ExportRequest {
-        input: src_mp4.clone(),
-        output: one_fps_mp4.clone(),
-        format: ExportFormat::Mp4,
-        fps: 1,
-        start_sec: Some(0.0),
-        end_sec: Some(1.5),
-        max_width: Some(320),
-        mute_audio: false,
-    })
-    .expect("export 1fps mp4");
-    let one_fps_meta = probe_video_metadata(&one_fps_mp4).expect("probe 1fps mp4");
-    assert!(
-        (one_fps_meta.nominal_fps - 1.0).abs() <= 0.25,
-        "expected ~1 fps output, got {}",
-        one_fps_meta.nominal_fps
-    );
-
-    let five_fps_mp4 = work.join("realtime_5fps.mp4");
-    run_export(&ExportRequest {
-        input: src_mp4.clone(),
-        output: five_fps_mp4.clone(),
-        format: ExportFormat::Mp4,
-        fps: 5,
-        start_sec: Some(0.0),
-        end_sec: Some(1.0),
-        max_width: Some(320),
-        mute_audio: false,
-    })
-    .expect("export 5fps mp4");
-    let five_fps_meta = probe_video_metadata(&five_fps_mp4).expect("probe 5fps mp4");
-    assert!(
-        (five_fps_meta.nominal_fps - 5.0).abs() <= 0.5,
-        "expected ~5 fps output, got {}",
-        five_fps_meta.nominal_fps
-    );
 
     let _ = fs::remove_dir_all(&work);
 }

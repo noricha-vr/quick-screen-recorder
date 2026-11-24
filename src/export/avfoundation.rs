@@ -21,7 +21,7 @@ use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString, NSURL};
 use crate::capture::RecordingCodec;
 use crate::export::av_decode::cgimage_to_rgba_sized;
 pub use crate::export::av_decode::{RgbaFrame, extract_rgba_frame, stream_rgba_sequence};
-use crate::export::av_writer::stream_rgba_frames_to_mp4;
+use crate::export::av_writer::StreamingMp4Writer;
 use crate::export::{ExportFormat, ExportRequest, SharedExportProgress, set_progress_permille};
 use crate::geometry::scaled_even_dimensions;
 
@@ -188,8 +188,8 @@ fn stream_video_only_transcode(
     progress: Option<&SharedExportProgress>,
 ) -> Result<(), String> {
     let frame_step = 1.0 / f64::from(fps);
-    let duration = (end_sec - start_sec).max(frame_step);
-    let total_frames = ((duration * f64::from(fps)).round() as usize).max(1);
+    let duration = (end_sec - start_sec).max(0.02);
+    let total_frames = transcode_frame_count(duration, fps);
 
     let asset = open_restricted_asset(&req.input)?;
     let generator = unsafe { AVAssetImageGenerator::assetImageGeneratorWithAsset(&asset) };
@@ -209,44 +209,42 @@ fn stream_video_only_transcode(
         _ => RecordingCodec::H264,
     };
     let mut last_good: Option<RgbaFrame> = None;
+    let mut writer = StreamingMp4Writer::new(target_w, target_h, fps, target_codec, &req.output)?;
 
-    let res = stream_rgba_frames_to_mp4(
-        target_w,
-        target_h,
-        total_frames,
-        fps,
-        target_codec,
-        &req.output,
-        |idx| {
-            let t = (start_sec + (idx as f64) * frame_step).min(meta.duration_sec);
-            #[allow(deprecated)]
-            let cg_res = unsafe {
-                generator.copyCGImageAtTime_actualTime_error(secs_to_cmtime(t), ptr::null_mut())
-            };
-            let decoded = match cg_res {
-                Ok(cg_img) => {
-                    let frame =
-                        cgimage_to_rgba_sized(&cg_img, target_w as usize, target_h as usize)?;
-                    last_good = Some(frame.clone());
-                    frame
-                }
-                Err(_) if last_good.is_some() => last_good.clone().unwrap(),
-                Err(e) => {
-                    return Err(format!(
-                        "Failed decoding video frame {idx}: {}",
-                        e.localizedDescription()
-                    ));
-                }
-            };
-            let p = 50 + (((idx + 1) * 910) / total_frames.max(1)) as u32;
-            set_progress_permille(progress, p);
-            Ok(decoded)
-        },
-    );
-    if res.is_ok() {
-        set_progress_permille(progress, 975);
+    for idx in 0..total_frames {
+        let t = (start_sec + (idx as f64) * frame_step).min(meta.duration_sec);
+        #[allow(deprecated)]
+        let cg_res = unsafe {
+            generator.copyCGImageAtTime_actualTime_error(secs_to_cmtime(t), ptr::null_mut())
+        };
+        let decoded = match cg_res {
+            Ok(cg_img) => {
+                let frame = cgimage_to_rgba_sized(&cg_img, target_w as usize, target_h as usize)?;
+                last_good = Some(frame.clone());
+                frame
+            }
+            Err(_) if last_good.is_some() => last_good.clone().unwrap(),
+            Err(e) => {
+                return Err(format!(
+                    "Failed decoding video frame {idx}: {}",
+                    e.localizedDescription()
+                ));
+            }
+        };
+        writer.append_rgba_frame(&decoded)?;
+        let p = 50 + (((idx + 1) * 910) / total_frames.max(1)) as u32;
+        set_progress_permille(progress, p);
     }
-    res
+    writer.finish_with_duration(Some(duration))?;
+    set_progress_permille(progress, 975);
+    Ok(())
+}
+
+fn transcode_frame_count(duration_sec: f64, fps: u32) -> usize {
+    let exact = duration_sec.max(0.02) * f64::from(fps.max(1));
+    // Include every frame slot whose PTS `i / fps` falls inside `[0, duration_sec)`,
+    // guarding against floating-point overshoot on exact multiples like `1.0 * 30`.
+    ((exact - 1e-3).floor().max(0.0) as usize) + 1
 }
 
 fn run_export_session(
@@ -454,5 +452,21 @@ fn cmtime_to_secs(t: CMTime) -> f64 {
         0.0
     } else {
         (t.value as f64) / f64::from(t.timescale)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::transcode_frame_count;
+
+    #[test]
+    fn transcode_frame_count_matches_slots_inside_trimmed_duration() {
+        assert_eq!(transcode_frame_count(0.7, 1), 1);
+        assert_eq!(transcode_frame_count(1.0, 1), 1);
+        assert_eq!(transcode_frame_count(1.5, 1), 2);
+        assert_eq!(transcode_frame_count(2.0, 1), 2);
+        assert_eq!(transcode_frame_count(1.0, 5), 5);
+        assert_eq!(transcode_frame_count(1.0, 30), 30);
+        assert_eq!(transcode_frame_count(0.6, 24), 15);
     }
 }

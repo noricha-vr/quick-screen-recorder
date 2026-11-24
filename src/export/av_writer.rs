@@ -170,14 +170,34 @@ impl StreamingMp4Writer {
     }
 
     pub fn finish(self) -> Result<(), String> {
+        self.finish_with_duration(None)
+    }
+
+    /// Finalizes the MP4 container. When `target_duration_secs` is provided, sets
+    /// `endSessionAtSourceTime` to preserve trimmed clip duration (even at low FPS where
+    /// `frames_written / fps` would otherwise round up or extend the clip).
+    pub fn finish_with_duration(self, target_duration_secs: Option<f64>) -> Result<(), String> {
         if self.frames_written == 0 {
             return Err("Cannot finalize MP4 with zero frames".to_string());
         }
-        let end_pts = CMTime {
-            value: self.frames_written as i64,
-            timescale: self.timescale,
-            flags: CMTimeFlags(1),
-            epoch: 0,
+        let end_pts = match target_duration_secs {
+            Some(secs) if secs.is_finite() && secs > 0.0 => {
+                let last_pts_secs = ((self.frames_written - 1) as f64) / f64::from(self.timescale);
+                let min_end_ticks = (last_pts_secs * 6000.0).floor() as i64 + 1;
+                let requested_ticks = (secs * 6000.0).round() as i64;
+                CMTime {
+                    value: requested_ticks.max(min_end_ticks),
+                    timescale: 6000,
+                    flags: CMTimeFlags(1),
+                    epoch: 0,
+                }
+            }
+            _ => CMTime {
+                value: self.frames_written as i64,
+                timescale: self.timescale,
+                flags: CMTimeFlags(1),
+                epoch: 0,
+            },
         };
         let (tx, rx) = mpsc::sync_channel::<()>(1);
         let block = RcBlock::new(move || {

@@ -322,3 +322,44 @@ fn stop_timeout_exceeds_writer_finish_and_recovers_delayed_finalization() {
     assert_eq!(pending.poll(), StopPollState::Finished);
     assert_eq!(pending.finish(), Ok(expected));
 }
+
+#[test]
+fn single_frame_stop_propagates_closing_frame_write_error() {
+    let sync = SyncState::new();
+    let sync_worker = Arc::clone(&sync);
+    let frames_written = Arc::new(AtomicU64::new(0));
+    let frames_worker = Arc::clone(&frames_written);
+    let (init_tx, init_rx) = mpsc::sync_channel::<Result<(), String>>(0);
+
+    let handle = thread::spawn(move || {
+        let mut write_calls = 0_u32;
+        run_timelapse_loop(
+            Duration::from_secs(60),
+            &sync_worker,
+            &frames_worker,
+            init_tx,
+            || (),
+            |()| Ok(dummy_frame(5)),
+            |_| {
+                write_calls += 1;
+                if write_calls == 1 {
+                    Ok(())
+                } else {
+                    Err("encoder input queue closed".to_string())
+                }
+            },
+        )
+    });
+
+    assert_eq!(init_rx.recv_timeout(Duration::from_secs(2)), Ok(Ok(())));
+    sync.signal_stop();
+
+    match handle.join().expect("join worker") {
+        Ok(LoopExit::AbortedAfterPartialCapture(err)) => {
+            assert!(err.contains("closing frame"), "got: {err}");
+            assert!(err.contains("encoder input queue closed"), "got: {err}");
+        }
+        other => panic!("expected AbortedAfterPartialCapture, got {other:?}"),
+    }
+    assert_eq!(frames_written.load(Ordering::Relaxed), 1);
+}
