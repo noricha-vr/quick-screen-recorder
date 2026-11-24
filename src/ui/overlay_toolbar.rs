@@ -434,6 +434,8 @@ pub fn append_tagged_popup_item(
     item.setTag(tag);
     item.setEnabled(true);
     if let Some(menu) = popup.menu() {
+        // Required so AppKit does not disable actionless NSMenuItems added directly to NSPopUpButton's menu.
+        menu.setAutoenablesItems(false);
         menu.addItem(&item);
     }
 }

@@ -364,21 +364,16 @@ impl PendingRecordingStop {
             .lock()
             .map(|g| (g.finished, g.stream_stopped))
             .unwrap_or((true, true));
-        if finished {
+        let (state, should_send_stop) = evaluate_stop_poll(
+            finished,
+            stream_stopped,
+            self.stop_capture_sent,
+            self.stop_initiated_at.elapsed(),
+        );
+        if should_send_stop {
             self.send_stop_capture();
-            if stream_stopped {
-                return StopPollState::Finished;
-            }
         }
-        let elapsed = self.stop_initiated_at.elapsed();
-        if !self.stop_capture_sent && elapsed >= STOP_FALLBACK_AFTER {
-            self.send_stop_capture();
-        }
-        if elapsed >= STOP_TIMEOUT {
-            StopPollState::TimedOut
-        } else {
-            StopPollState::Pending
-        }
+        state
     }
 
     /// Stops the underlying capture stream (if not already stopped), verifies both trailer
@@ -441,3 +436,27 @@ impl PendingRecordingStop {
         });
     }
 }
+
+/// Pure transition table for [`PendingRecordingStop::poll`].
+/// Returns `(next_poll_state, should_send_stop_capture)`.
+fn evaluate_stop_poll(
+    finished: bool,
+    stream_stopped: bool,
+    stop_capture_sent: bool,
+    elapsed: Duration,
+) -> (StopPollState, bool) {
+    if finished && stream_stopped {
+        return (StopPollState::Finished, !stop_capture_sent);
+    }
+    let should_send_stop = !stop_capture_sent && (finished || elapsed >= STOP_FALLBACK_AFTER);
+    let state = if elapsed >= STOP_TIMEOUT {
+        StopPollState::TimedOut
+    } else {
+        StopPollState::Pending
+    };
+    (state, should_send_stop)
+}
+
+#[cfg(test)]
+#[path = "recorder_tests.rs"]
+mod tests;
