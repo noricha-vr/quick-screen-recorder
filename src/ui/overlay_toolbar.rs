@@ -3,8 +3,8 @@ use objc2::runtime::AnyObject;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSBox, NSBoxType, NSButton, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSFont,
-    NSMenuItem, NSPopUpButton, NSSegmentSwitchTracking, NSSegmentedControl, NSTextAlignment,
-    NSTextField, NSView,
+    NSPopUpButton, NSSegmentSwitchTracking, NSSegmentedControl, NSTextAlignment, NSTextField,
+    NSView,
 };
 use objc2_foundation::{NSArray, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
@@ -338,7 +338,7 @@ fn build_row_two(
 
     let mic_popup = NSPopUpButton::new(mtm);
     for (idx, item) in mic_items.iter().enumerate() {
-        append_tagged_popup_item(mtm, &mic_popup, &item.menu_title(), idx as isize);
+        append_tagged_popup_item(&mic_popup, &item.menu_title(), idx as isize);
     }
     if !mic_items.is_empty() {
         mic_popup.selectItemAtIndex(selected_mic_idx.min(mic_items.len() - 1) as isize);
@@ -413,30 +413,17 @@ fn build_row_two(
     bar.addSubview(&clicks_chk);
 }
 
-/// Appends an individual `NSMenuItem` directly to `popup.menu()` with an explicit `tag`.
-/// Unlike `NSPopUpButton::addItemWithTitle`, AppKit never deduplicates items added to the
-/// underlying `NSMenu`, so duplicate device/window titles or names matching `"Off"` cannot
-/// collapse entries or shift model indices.
-pub fn append_tagged_popup_item(
-    mtm: MainThreadMarker,
-    popup: &NSPopUpButton,
-    title: &str,
-    tag: isize,
-) {
-    let item = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str(title),
-            None,
-            &NSString::from_str(""),
-        )
-    };
-    item.setTag(tag);
-    item.setEnabled(true);
-    if let Some(menu) = popup.menu() {
-        // Required so AppKit does not disable actionless NSMenuItems added directly to NSPopUpButton's menu.
-        menu.setAutoenablesItems(false);
-        menu.addItem(&item);
+/// Appends an item via AppKit's standard `addItemWithTitle:` using a guaranteed-unique
+/// placeholder title, then immediately renames the newly appended `lastItem()` and sets its `tag`.
+/// This keeps AppKit's internal `_popUpItemAction:` target/action dispatch intact while preventing
+/// `addItemWithTitle:` from deduplicating identical device/window titles or names matching `"Off"`.
+pub fn append_tagged_popup_item(popup: &NSPopUpButton, title: &str, tag: isize) {
+    let placeholder = format!("\u{1f}qsr-item-{}-{tag}", popup.numberOfItems());
+    popup.addItemWithTitle(&NSString::from_str(&placeholder));
+    if let Some(item) = popup.lastItem() {
+        item.setTitle(&NSString::from_str(title));
+        item.setTag(tag);
+        item.setEnabled(true);
     }
 }
 

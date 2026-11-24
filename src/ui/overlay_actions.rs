@@ -96,19 +96,10 @@ pub fn build_toolbar_actions(
                     }
                     SelectionMode::Window => {
                         if st.windows.is_empty() {
-                            if let Some(m) = MainThreadMarker::new() {
-                                append_tagged_popup_item(m, &tp_mode, "No windows available", -1);
-                            }
+                            append_tagged_popup_item(&tp_mode, "No windows available", -1);
                         } else {
-                            if let Some(m) = MainThreadMarker::new() {
-                                for (i, w) in st.windows.iter().enumerate() {
-                                    append_tagged_popup_item(
-                                        m,
-                                        &tp_mode,
-                                        &w.display_label(),
-                                        i as isize,
-                                    );
-                                }
+                            for (i, w) in st.windows.iter().enumerate() {
+                                append_tagged_popup_item(&tp_mode, &w.display_label(), i as isize);
                             }
                             let idx = st.selected_window_idx.min(st.windows.len() - 1);
                             tp_mode.selectItemAtIndex(idx as isize);
@@ -129,15 +120,12 @@ pub fn build_toolbar_actions(
                         }
                     }
                     SelectionMode::Screen => {
-                        if let Some(m) = MainThreadMarker::new() {
-                            for (i, d) in st.displays.iter().enumerate() {
-                                append_tagged_popup_item(
-                                    m,
-                                    &tp_mode,
-                                    &format!("Display {} ({}×{})", i + 1, d.width, d.height),
-                                    i as isize,
-                                );
-                            }
+                        for (i, d) in st.displays.iter().enumerate() {
+                            append_tagged_popup_item(
+                                &tp_mode,
+                                &format!("Display {} ({}×{})", i + 1, d.width, d.height),
+                                i as isize,
+                            );
                         }
                         if st.screen_display_id != st.overlay_display_id && !st.demo_backdrop {
                             let target_did = st.screen_display_id;
