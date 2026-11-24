@@ -5,6 +5,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-11-24
+
+### Changed
+
+- **Onboarding completion footer buttons**:
+  - Promoted `Show in Finder` to the right-side primary button (`Return`), which reveals the saved clip in Finder and automatically closes the Quick Start guide.
+  - Replaced `Done` with `Close` (`Esc`) as the left-side secondary button.
+
 ## [0.5.2] - 2026-11-24
 
 ### Fixed

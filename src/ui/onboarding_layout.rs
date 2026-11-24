@@ -356,8 +356,10 @@ pub fn apply_step_ui(
             ui.body_label.setStringValue(&NSString::from_str(
                 "Click \"Open Settings →\" in the banner above, toggle Quick Screen Recorder ON, then click \"Quit & Reopen\" when macOS prompts.",
             ));
+            ui.secondary_btn.setHidden(false);
             ui.secondary_btn
                 .setTitle(&NSString::from_str("Skip Tutorial"));
+            ui.secondary_btn.setKeyEquivalent(&NSString::from_str(""));
             ui.primary_btn.setKeyEquivalent(&NSString::from_str(""));
             ui.primary_btn.setHidden(!permission_granted);
             ui.waiting_label.setHidden(permission_granted);
@@ -371,8 +373,10 @@ pub fn apply_step_ui(
             ui.body_label.setStringValue(&NSString::from_str(
                 "Click ◉ Rec in the top-right menu bar → New Recording... (or press ⇧⌘6) to try a short recording and save your first clip.",
             ));
+            ui.secondary_btn.setHidden(false);
             ui.secondary_btn
                 .setTitle(&NSString::from_str("Skip Tutorial"));
+            ui.secondary_btn.setKeyEquivalent(&NSString::from_str(""));
             ui.primary_btn.setHidden(false);
             ui.waiting_label.setHidden(true);
             ui.primary_btn
@@ -384,8 +388,10 @@ pub fn apply_step_ui(
             ui.body_label.setStringValue(&NSString::from_str(
                 "Recording now! Click ● 00:xx in the top-right menu bar → Stop Recording (or press ⇧⌘6) to open the Trim & Export editor.",
             ));
+            ui.secondary_btn.setHidden(false);
             ui.secondary_btn
                 .setTitle(&NSString::from_str("Skip Tutorial"));
+            ui.secondary_btn.setKeyEquivalent(&NSString::from_str(""));
             ui.primary_btn.setHidden(false);
             ui.waiting_label.setHidden(true);
             ui.primary_btn
@@ -395,17 +401,62 @@ pub fn apply_step_ui(
             ui.primary_btn.setKeyEquivalent(&NSString::from_str(""));
         }
         OnboardingStep::Completed => {
+            let footer = completed_footer_spec(saved_path.is_some());
             ui.body_label.setStringValue(&NSString::from_str(
                 "Your clip is saved. Start a new recording anytime from ◉ Rec in your menu bar or press ⇧⌘6.",
             ));
-            ui.secondary_btn
-                .setTitle(&NSString::from_str("Show in Finder"));
+            if let Some(sec_title) = footer.secondary_title {
+                ui.secondary_btn.setHidden(false);
+                ui.secondary_btn.setTitle(&NSString::from_str(sec_title));
+                ui.secondary_btn
+                    .setKeyEquivalent(&NSString::from_str("\u{1b}"));
+            } else {
+                ui.secondary_btn.setHidden(true);
+                ui.secondary_btn.setKeyEquivalent(&NSString::from_str(""));
+            }
             ui.primary_btn.setHidden(false);
             ui.waiting_label.setHidden(true);
-            ui.primary_btn.setTitle(&NSString::from_str("Done"));
+            ui.primary_btn
+                .setTitle(&NSString::from_str(footer.primary_title));
             ui.primary_btn
                 .setBezelColor(Some(&NSColor::systemBlueColor()));
             ui.primary_btn.setKeyEquivalent(&NSString::from_str("\r"));
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CompletedFooterSpec {
+    pub secondary_title: Option<&'static str>,
+    pub primary_title: &'static str,
+}
+
+pub(crate) fn completed_footer_spec(has_saved_path: bool) -> CompletedFooterSpec {
+    if has_saved_path {
+        CompletedFooterSpec {
+            secondary_title: Some("Close"),
+            primary_title: "Show in Finder",
+        }
+    } else {
+        CompletedFooterSpec {
+            secondary_title: None,
+            primary_title: "Close",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_footer_promotes_show_in_finder_to_primary_and_close_to_secondary() {
+        let with_file = completed_footer_spec(true);
+        assert_eq!(with_file.secondary_title, Some("Close"));
+        assert_eq!(with_file.primary_title, "Show in Finder");
+
+        let without_file = completed_footer_spec(false);
+        assert_eq!(without_file.secondary_title, None);
+        assert_eq!(without_file.primary_title, "Close");
     }
 }

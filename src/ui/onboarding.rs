@@ -144,18 +144,19 @@ impl OnboardingWindow {
                         }
                         OnboardingStep::StartRecording => (cbs_pri.on_start_recording)(m),
                         OnboardingStep::RecordingInProgress => (cbs_pri.on_stop_recording)(m),
-                        OnboardingStep::Completed => (cbs_pri.on_done)(m),
+                        OnboardingStep::Completed => {
+                            let saved = st_pri.borrow().saved_path.clone();
+                            if let Some(p) = saved {
+                                reveal_in_finder(&p);
+                            }
+                            (cbs_pri.on_done)(m);
+                        }
                     }
                 }),
                 on_secondary: Box::new(move |m| {
-                    let (step, saved) = {
-                        let s = st_sec.borrow();
-                        (s.step, s.saved_path.clone())
-                    };
+                    let step = st_sec.borrow().step;
                     if step == OnboardingStep::Completed {
-                        if let Some(p) = saved {
-                            reveal_in_finder(&p);
-                        }
+                        (cbs_sec.on_done)(m);
                     } else {
                         (cbs_sec.on_skip)(m);
                     }
