@@ -213,6 +213,9 @@ pub fn run_export_with_options(
                         elapsed_ms,
                         output_bytes: 0,
                         ok: false,
+                        finalize_ms: None,
+                        audio_mode: None,
+                        forced_timeout: None,
                     });
                     return Err(err);
                 }
@@ -228,6 +231,9 @@ pub fn run_export_with_options(
                 elapsed_ms,
                 output_bytes: bytes,
                 ok: true,
+                finalize_ms: None,
+                audio_mode: None,
+                forced_timeout: None,
             });
             Ok(ExportResult {
                 output_path: if prevent_overwrite {
@@ -250,6 +256,9 @@ pub fn run_export_with_options(
                 elapsed_ms,
                 output_bytes: 0,
                 ok: false,
+                finalize_ms: None,
+                audio_mode: None,
+                forced_timeout: None,
             });
             Err(err)
         }

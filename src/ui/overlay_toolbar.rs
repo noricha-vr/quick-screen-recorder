@@ -111,6 +111,7 @@ pub fn populate_toolbar_controls(
     mtm: MainThreadMarker,
     bar: &NSView,
     actions: &OverlayToolbarActions,
+    mode_seg: &NSSegmentedControl,
     aspect_popup: &NSPopUpButton,
     w_field: &NSTextField,
     x_lbl: &NSTextField,
@@ -129,6 +130,7 @@ pub fn populate_toolbar_controls(
         mtm,
         bar,
         actions,
+        mode_seg,
         aspect_popup,
         w_field,
         x_lbl,
@@ -198,17 +200,10 @@ fn build_elevated_shell(mtm: MainThreadMarker, bar: &NSView) {
     bar.addSubview(&row_div);
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_row_one(
+pub fn create_mode_segmented_control(
     mtm: MainThreadMarker,
-    bar: &NSView,
     actions: &OverlayToolbarActions,
-    aspect_popup: &NSPopUpButton,
-    w_field: &NSTextField,
-    x_lbl: &NSTextField,
-    h_field: &NSTextField,
-    target_popup: &NSPopUpButton,
-) {
+) -> Retained<NSSegmentedControl> {
     let labels = NSArray::from_retained_slice(&[
         NSString::from_str("Area"),
         NSString::from_str("Window"),
@@ -224,11 +219,26 @@ fn build_row_one(
         )
     };
     seg.setSelectedSegment(0);
+    seg
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_row_one(
+    mtm: MainThreadMarker,
+    bar: &NSView,
+    actions: &OverlayToolbarActions,
+    seg: &NSSegmentedControl,
+    aspect_popup: &NSPopUpButton,
+    w_field: &NSTextField,
+    x_lbl: &NSTextField,
+    h_field: &NSTextField,
+    target_popup: &NSPopUpButton,
+) {
     seg.setFrame(NSRect::new(
         NSPoint::new(12.0, 49.0),
         NSSize::new(178.0, 28.0),
     ));
-    bar.addSubview(&seg);
+    bar.addSubview(seg);
 
     aspect_popup.setFrame(NSRect::new(
         NSPoint::new(198.0, 49.0),

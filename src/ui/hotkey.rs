@@ -111,19 +111,31 @@ where
     }
 }
 
-/// Registers a local AppKit keyDown monitor that intercepts Escape (keyCode 53) when `on_escape` returns `true`.
+/// Registers a local AppKit keyDown monitor that intercepts Escape (keyCode 53) when `on_escape`
+/// returns `true`. Ignores Escape while AppKit is tracking a popup menu (`NSEventTrackingRunLoopMode`)
+/// or modal panel (`NSModalPanelRunLoopMode`) so Escape closes menus/sheets instead of the overlay.
 pub fn register_local_escape_monitor<F>(on_escape: F)
 where
     F: Fn() -> bool + 'static,
 {
     use block2::RcBlock;
-    use objc2_app_kit::{NSEvent, NSEventMask};
+    use objc2_app_kit::{
+        NSEvent, NSEventMask, NSEventTrackingRunLoopMode, NSModalPanelRunLoopMode,
+    };
+    use objc2_foundation::NSRunLoop;
     use std::ptr::NonNull;
 
     let block = RcBlock::new(move |ev: NonNull<NSEvent>| -> *mut NSEvent {
         let event = unsafe { ev.as_ref() };
-        if event.keyCode() == 53 && on_escape() {
-            return ptr::null_mut();
+        if event.keyCode() == 53 {
+            let mode = NSRunLoop::currentRunLoop().currentMode();
+            let in_menu_or_modal = mode.as_deref().is_some_and(|m| unsafe {
+                m.isEqualToString(NSEventTrackingRunLoopMode)
+                    || m.isEqualToString(NSModalPanelRunLoopMode)
+            });
+            if !in_menu_or_modal && on_escape() {
+                return ptr::null_mut();
+            }
         }
         ev.as_ptr()
     });

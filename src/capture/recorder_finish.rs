@@ -1,9 +1,8 @@
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::Instant;
 
-use crate::capture::recorder::{
-    STOP_FALLBACK_AFTER, STOP_STREAM_CONFIRM_TIMEOUT, STOP_TIMEOUT, StopPollState,
-};
+use super::stop::{RemovePhase, STOP_STREAM_CONFIRM_TIMEOUT};
+use crate::capture::recorder::StopPollState;
 use crate::export::avfoundation::{extract_rgba_frame, probe_video_metadata};
 use crate::fs_safety::{ExclusiveStagingDir, format_tilde_path};
 use crate::staging::{
@@ -11,30 +10,36 @@ use crate::staging::{
 };
 
 /// Pure transition table for [`crate::capture::recorder::PendingRecordingStop::poll`].
-/// Returns `(next_poll_state, should_send_stop_capture)`.
+///
+/// Never triggers `stopCapture` prematurely while `SCRecordingOutput` is finalizing/mixing audio;
+/// the serial stop worker owns all `removeRecordingOutput` / `stopCapture` transitions and shares
+/// `stop_capture_sent_at` and `finalize_deadline` with GUI/CLI polling.
 pub(super) fn evaluate_stop_poll(
+    now: Instant,
     finished: bool,
-    stream_stopped: bool,
-    stop_sent_elapsed: Option<Duration>,
-    total_elapsed: Duration,
-) -> (StopPollState, bool) {
-    if finished && stream_stopped {
-        return (StopPollState::Finished, stop_sent_elapsed.is_none());
+    stream_settled: bool,
+    remove_phase: RemovePhase,
+    stop_capture_sent_at: Option<Instant>,
+    finalize_deadline: Instant,
+) -> StopPollState {
+    if finished && stream_settled {
+        return StopPollState::Finished;
     }
-    if stop_sent_elapsed.is_none() && (finished || total_elapsed >= STOP_FALLBACK_AFTER) {
-        return (StopPollState::Pending, true);
+    if let Some(sent_at) = stop_capture_sent_at {
+        let sent_for = now.saturating_duration_since(sent_at);
+        if sent_for < STOP_STREAM_CONFIRM_TIMEOUT {
+            return StopPollState::Pending;
+        }
+        if finished || remove_phase == RemovePhase::Failed || now >= finalize_deadline {
+            return StopPollState::TimedOut;
+        }
+        return StopPollState::Pending;
     }
-    let timed_out = match stop_sent_elapsed {
-        Some(sent_for) if finished => sent_for >= STOP_STREAM_CONFIRM_TIMEOUT,
-        Some(sent_for) => total_elapsed >= STOP_TIMEOUT && sent_for >= STOP_STREAM_CONFIRM_TIMEOUT,
-        None => false,
-    };
-    let state = if timed_out {
-        StopPollState::TimedOut
-    } else {
-        StopPollState::Pending
-    };
-    (state, false)
+    // Safety valve if `removeRecordingOutput_error` itself hangs indefinitely in `replayd`:
+    if now >= finalize_deadline + STOP_STREAM_CONFIRM_TIMEOUT {
+        return StopPollState::TimedOut;
+    }
+    StopPollState::Pending
 }
 
 /// Strictly verifies that `path` is a non-empty playable video file with at least one playable
@@ -55,26 +60,11 @@ pub fn is_valid_salvageable_mp4(path: &Path) -> bool {
         && extract_rgba_frame(path, 0.0, Some(64)).is_ok()
 }
 
-fn format_stop_error_with_preservation(
-    base_err: &str,
-    staging: &mut ExclusiveStagingDir,
-    recovery_dir: Result<PathBuf, String>,
-) -> String {
-    if is_valid_salvageable_mp4(staging.staged_file()) {
-        return match preserve_staged_permanently(staging, recovery_dir) {
-            Ok(saved_path) => format!(
-                "{base_err}. Playable footage was preserved at {}",
-                format_tilde_path(&saved_path)
-            ),
-            Err((rec_err, kept_path)) => format!(
-                "{base_err} (recovery failed: {rec_err}). Playable footage was preserved in staging at {}",
-                format_tilde_path(&kept_path)
-            ),
-        };
-    }
-    // Stream stop was not cleanly confirmed (or writer never flushed yet): keep the staging
-    // directory untouched in place with `.qsr-keep` so `ExclusiveStagingDir::drop` never deletes
-    // a file while a delayed writer could still be opening or flushing it.
+fn retain_staging_with_error(base_err: &str, staging: &mut ExclusiveStagingDir) -> String {
+    // Whenever stream stop is unconfirmed or finalization timed out / forced stop, `replayd`
+    // (or `RPAudioMixUtility`) may still be flushing the staged file in the background.
+    // Never delete or move the file out from under the writer: retain it untouched in place
+    // with `.qsr-keep` so neither Drop nor 24h cache pruning deletes it.
     let retained = staging.retain_staged_in_place();
     format!(
         "{base_err}. Staging path retained untouched at {}",
@@ -107,17 +97,22 @@ pub(crate) fn commit_staged_to_recovery_directly(
 
 /// Resolves staging ownership at the end of `PendingRecordingStop::finish`:
 /// - Whenever `stop_issue` is `Some` (stream stop failed, timed out, or start never settled),
-///   `staging` is NEVER deleted on drop: playable MP4s move to permanent recovery, and incomplete
-///   or unconfirmed staging paths are retained in place via `.qsr-keep`.
-/// - When `preserve_directly` is `true` (GUI auto-stop / quit-save), preserves directly from
-///   staging to recovery (or protected staging on double failure) without touching prunable cache.
-/// - Otherwise commits normally or salvages without overwriting existing target files.
+///   `staging` is retained untouched in place via `.qsr-keep` (no synchronous AVFoundation decode
+///   or rename while a writer/mixer could still be active).
+/// - Whenever `forced_stop_on_timeout` is `true` and recording did not finish cleanly without
+///   error, `staging` is ALSO retained untouched in place via `.qsr-keep` so background offline
+///   mixing (`RPAudioMixUtility`) can finish writing safely without Drop deleting the file.
+/// - Whenever `finished == false`, `staging` is retained untouched in place via `.qsr-keep`.
+/// - When `preserve_directly` is `true` (GUI auto-stop / quit-save), commits cleanly finished
+///   footage directly into permanent recovery without touching prunable cache.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn finalize_stop_staging_outcome(
     staging: &mut ExclusiveStagingDir,
     output_path: PathBuf,
     finished: bool,
     finish_err: Option<String>,
     stop_issue: Option<String>,
+    forced_stop_on_timeout: bool,
     preserve_directly: bool,
     recovery_dir: Result<PathBuf, String>,
 ) -> Result<(PathBuf, u64, Option<String>), String> {
@@ -129,10 +124,25 @@ pub(super) fn finalize_stop_staging_outcome(
             ),
             (None, true) => stop_err,
         };
-        return Err(format_stop_error_with_preservation(
-            &base_err,
+        return Err(retain_staging_with_error(&base_err, staging));
+    }
+
+    if forced_stop_on_timeout && (!finished || finish_err.is_some()) {
+        let base_err = match finish_err {
+            Some(err) => {
+                format!("Timed out waiting for recording finalization before forcing stop ({err})")
+            }
+            None => {
+                "Timed out waiting for MP4 recording output to flush container trailer".to_string()
+            }
+        };
+        return Err(retain_staging_with_error(&base_err, staging));
+    }
+
+    if !finished {
+        return Err(retain_staging_with_error(
+            "Timed out waiting for MP4 recording output to flush container trailer",
             staging,
-            recovery_dir,
         ));
     }
 
@@ -142,22 +152,6 @@ pub(super) fn finalize_stop_staging_outcome(
             salvaged_warn = Some(format!("Recording ended early: {err}"));
         } else {
             return Err(format!("Recording finalization error: {err}"));
-        }
-    } else if !finished {
-        if is_valid_salvageable_mp4(staging.staged_file()) {
-            salvaged_warn = Some(
-                "Timed out waiting for recording finish callback; salvaged playable footage"
-                    .to_string(),
-            );
-        } else {
-            // Even when stream stop succeeded, macOS may still be flushing the MP4 trailer
-            // asynchronously after `finished` timed out — retain staging in place instead of
-            // deleting a potentially salvageable recording on drop.
-            let retained = staging.retain_staged_in_place();
-            return Err(format!(
-                "Timed out waiting for MP4 recording output to flush container trailer. Staging path retained untouched at {}",
-                format_tilde_path(&retained)
-            ));
         }
     }
 
@@ -172,96 +166,136 @@ pub(super) fn finalize_stop_staging_outcome(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use super::super::stop::{
+        STOP_DUAL_AUDIO_MAX, STOP_DUAL_AUDIO_MIN, STOP_SINGLE_AUDIO_MAX, STOP_SINGLE_AUDIO_MIN,
+        compute_finalize_timeout,
+    };
     use super::*;
 
     #[test]
-    fn stop_poll_state_machine_handles_ordering_fallback_delay_and_timeout() {
+    fn compute_finalize_timeout_scales_and_clamps_by_audio_mode() {
         assert_eq!(
-            evaluate_stop_poll(false, false, None, Duration::from_millis(500)),
-            (StopPollState::Pending, false)
+            compute_finalize_timeout(5_000, false),
+            STOP_SINGLE_AUDIO_MIN
         );
         assert_eq!(
-            evaluate_stop_poll(true, false, None, Duration::from_millis(120)),
-            (StopPollState::Pending, true)
+            compute_finalize_timeout(120_000, false),
+            Duration::from_secs(60)
         );
+        assert_eq!(
+            compute_finalize_timeout(u64::MAX, false),
+            STOP_SINGLE_AUDIO_MAX
+        );
+
+        // Dual audio (`System + Mic`): 18.6s clip gets >= 60s; 2min gets 4min; huge clamps to 10min.
+        assert_eq!(compute_finalize_timeout(18_600, true), STOP_DUAL_AUDIO_MIN);
+        assert_eq!(
+            compute_finalize_timeout(120_000, true),
+            Duration::from_secs(240)
+        );
+        assert_eq!(
+            compute_finalize_timeout(u64::MAX, true),
+            STOP_DUAL_AUDIO_MAX
+        );
+    }
+
+    #[test]
+    fn stop_poll_waits_past_two_seconds_for_dual_audio_mixing_and_respects_confirm_window() {
+        let t0 = Instant::now();
+        let deadline = t0 + Duration::from_secs(60);
+
+        // At 2s, 8s, 30s while mixer is running (`finished == false`, `stop_capture_sent_at == None`):
+        // MUST remain Pending (never time out or abort prematurely).
+        for secs in [2, 8, 30, 59] {
+            assert_eq!(
+                evaluate_stop_poll(
+                    t0 + Duration::from_secs(secs),
+                    false,
+                    false,
+                    RemovePhase::Succeeded,
+                    None,
+                    deadline,
+                ),
+                StopPollState::Pending
+            );
+        }
+
+        // Once `finished == true` at 7.9s and worker sends `stopCapture`:
+        // waits up to STOP_STREAM_CONFIRM_TIMEOUT (5s) for `stream_settled`.
+        let sent_at = t0 + Duration::from_millis(7_900);
         assert_eq!(
             evaluate_stop_poll(
-                true,
-                true,
-                Some(Duration::from_millis(60)),
-                Duration::from_millis(180)
-            ),
-            (StopPollState::Finished, false)
-        );
-        assert_eq!(
-            evaluate_stop_poll(true, false, None, Duration::from_secs(15)),
-            (StopPollState::Pending, true)
-        );
-        assert_eq!(
-            evaluate_stop_poll(
+                sent_at + Duration::from_secs(2),
                 true,
                 false,
-                Some(Duration::from_millis(100)),
-                Duration::from_secs(15)
+                RemovePhase::Succeeded,
+                Some(sent_at),
+                deadline,
             ),
-            (StopPollState::Pending, false)
+            StopPollState::Pending
         );
         assert_eq!(
             evaluate_stop_poll(
+                sent_at + Duration::from_millis(120),
                 true,
                 true,
-                Some(Duration::from_millis(150)),
-                Duration::from_secs(15)
+                RemovePhase::Succeeded,
+                Some(sent_at),
+                deadline,
             ),
-            (StopPollState::Finished, false)
-        );
-        assert_eq!(
-            evaluate_stop_poll(false, false, None, STOP_FALLBACK_AFTER),
-            (StopPollState::Pending, true)
-        );
-        assert_eq!(
-            evaluate_stop_poll(false, false, None, Duration::from_secs(14)),
-            (StopPollState::Pending, true)
+            StopPollState::Finished
         );
         assert_eq!(
             evaluate_stop_poll(
-                false,
-                false,
-                Some(Duration::from_secs(1)),
-                Duration::from_secs(15)
-            ),
-            (StopPollState::Pending, false)
-        );
-        assert_eq!(
-            evaluate_stop_poll(
-                false,
-                true,
-                Some(Duration::from_secs(1)),
-                Duration::from_secs(3)
-            ),
-            (StopPollState::Pending, false)
-        );
-        assert_eq!(
-            evaluate_stop_poll(
-                true,
-                true,
-                Some(Duration::from_secs(2)),
-                Duration::from_secs(4)
-            ),
-            (StopPollState::Finished, false)
-        );
-        assert_eq!(
-            evaluate_stop_poll(false, true, Some(STOP_STREAM_CONFIRM_TIMEOUT), STOP_TIMEOUT),
-            (StopPollState::TimedOut, false)
-        );
-        assert_eq!(
-            evaluate_stop_poll(
+                sent_at + STOP_STREAM_CONFIRM_TIMEOUT,
                 true,
                 false,
-                Some(STOP_STREAM_CONFIRM_TIMEOUT),
-                Duration::from_secs(6)
+                RemovePhase::Succeeded,
+                Some(sent_at),
+                deadline,
             ),
-            (StopPollState::TimedOut, false)
+            StopPollState::TimedOut
+        );
+
+        // When `removeRecordingOutput` failed immediately, `stopCapture` confirm timeout expires
+        // after 5s instead of waiting the full 60s finalize deadline.
+        let fail_sent = t0 + Duration::from_millis(20);
+        assert_eq!(
+            evaluate_stop_poll(
+                fail_sent + Duration::from_secs(2),
+                false,
+                true,
+                RemovePhase::Failed,
+                Some(fail_sent),
+                deadline,
+            ),
+            StopPollState::Pending
+        );
+        assert_eq!(
+            evaluate_stop_poll(
+                fail_sent + STOP_STREAM_CONFIRM_TIMEOUT,
+                false,
+                true,
+                RemovePhase::Failed,
+                Some(fail_sent),
+                deadline,
+            ),
+            StopPollState::TimedOut
+        );
+
+        // Safety valve: if `removeRecordingOutput` itself hangs beyond `deadline + 5s`, time out.
+        assert_eq!(
+            evaluate_stop_poll(
+                deadline + STOP_STREAM_CONFIRM_TIMEOUT,
+                false,
+                false,
+                RemovePhase::InFlight,
+                None,
+                deadline,
+            ),
+            StopPollState::TimedOut
         );
     }
 
@@ -284,7 +318,6 @@ mod tests {
         fs::create_dir_all(&cache_dir).expect("mkdir cache");
         fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)).expect("chmod cache");
 
-        // 1. Primary recovery: caller times out and drops `done_rx` BEFORE worker finishes encoding.
         let target = cache_dir.join("capture-timeout.mp4");
         let staging =
             ExclusiveStagingDir::create_in_cache_root(&cache_dir, &target, "mp4", false, true)
@@ -320,8 +353,6 @@ mod tests {
             b"hours-of-delayed-timelapse"
         );
 
-        // 2. Double-failure fallback after timeout: recovery fails + cache_dir read-only ->
-        //    protected staging survives drop AND expired cache pruning!
         let target2 = cache_dir.join("capture-timeout2.mp4");
         let staging2 =
             ExclusiveStagingDir::create_in_cache_root(&cache_dir, &target2, "mp4", false, true)

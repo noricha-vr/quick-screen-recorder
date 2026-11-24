@@ -25,6 +25,12 @@ pub struct PerfEvent {
     pub elapsed_ms: u64,
     pub output_bytes: u64,
     pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalize_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forced_timeout: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -253,6 +259,9 @@ mod tests {
                     elapsed_ms: ms,
                     output_bytes: 65_536,
                     ok: true,
+                    finalize_ms: None,
+                    audio_mode: None,
+                    forced_timeout: None,
                 },
             )
             .expect("append perf");

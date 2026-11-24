@@ -42,6 +42,10 @@ pub enum DemoMode {
     Overlay {
         screenshot_out: Option<PathBuf>,
     },
+    OverlayWindow {
+        screenshot_out: Option<PathBuf>,
+    },
+    VerifyOverlayLive,
     Editor {
         input: PathBuf,
         screenshot_out: Option<PathBuf>,
@@ -111,6 +115,19 @@ fn parse_gui_flags(args: &[String]) -> Result<Command, String> {
                 demo_mode = Some(DemoMode::Overlay {
                     screenshot_out: shot,
                 });
+            }
+            "--demo-overlay-window" => {
+                let mut shot = None;
+                if args.get(i + 1).is_some_and(|s| !s.starts_with("--")) {
+                    i += 1;
+                    shot = Some(PathBuf::from(&args[i]));
+                }
+                demo_mode = Some(DemoMode::OverlayWindow {
+                    screenshot_out: shot,
+                });
+            }
+            "--verify-overlay-live" => {
+                demo_mode = Some(DemoMode::VerifyOverlayLive);
             }
             "--demo-editor" => {
                 i += 1;

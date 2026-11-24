@@ -53,14 +53,14 @@ Electron（Chromium + Node.js）ベースの画面録画ツールと異なり、
 git clone https://github.com/noricha-vr/quick-screen-recorder.git
 cd quick-screen-recorder
 
-# Release ビルドと dist/QuickScreenRecorder.app の作成
+# Release ビルドと dist/QuickScreenRecorder.app の作成（ad-hoc 署名）
 make bundle
 
 # 起動（メニューバーに「◉ Rec」が表示されます）
 open dist/QuickScreenRecorder.app
 
-# アプリケーションフォルダへ配置する場合
-cp -R dist/QuickScreenRecorder.app /Applications/
+# /Applications へ安全に導入（ad-hoc の署名ハッシュ変化時は ScreenCapture / Microphone の古い TCC を自動リセット）
+make install
 ```
 
 初回起動時に **Quick Start** ウィンドウが自動で開き、画面収録権限の確認・システム設定のワンクリック起動・許可後のグリーン確認から、右上メニューバーでの試し録画〜書き出し保存まで順番に案内します。
