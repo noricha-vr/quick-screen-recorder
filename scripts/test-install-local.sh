@@ -248,12 +248,14 @@ fi
 assert_log_lines 0
 [[ ! -e "$APPS_DIR/QuickScreenRecorder.app" ]]
 
-# 15. Refuses installing into dist/ (including dist/. and dist/../dist aliases).
+# 15. Refuses installing into dist/ (including dist/., dist/../dist, and case-insensitive DIST aliases).
 mkdir -p "$ROOT_DIR/dist"
-for bad_target in "$ROOT_DIR/dist" "$ROOT_DIR/dist/." "$ROOT_DIR/dist/../dist"; do
-  if run_inst --target-dir "$bad_target" --source-app "$SRC_V4" --sign-identity "Developer ID Application: Local" >/dev/null 2>&1; then
-    echo "FAIL: must refuse installing into $bad_target" >&2
-    exit 1
+for bad_target in "$ROOT_DIR/dist" "$ROOT_DIR/dist/." "$ROOT_DIR/dist/../dist" "$ROOT_DIR/DIST"; do
+  if [[ -d "$bad_target" ]]; then
+    if run_inst --target-dir "$bad_target" --source-app "$SRC_V4" --sign-identity "Developer ID Application: Local" >/dev/null 2>&1; then
+      echo "FAIL: must refuse installing into $bad_target" >&2
+      exit 1
+    fi
   fi
 done
 

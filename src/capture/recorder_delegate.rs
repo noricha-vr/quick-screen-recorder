@@ -32,9 +32,36 @@ pub(super) fn is_cleanly_stopped(s: &DelegateSignal) -> bool {
 
 /// Allocates a fresh monotonic stop generation and clears prior stop completion state so any
 /// older in-flight stop callback can never mark this newer stop request as completed.
+#[cfg(test)]
 pub(super) fn begin_stop_generation(signal: &Arc<(Mutex<DelegateSignal>, Condvar)>) -> u64 {
     let (lock, _) = &**signal;
     if let Ok(mut guard) = lock.lock() {
+        guard.stop_gen = guard.stop_gen.wrapping_add(1);
+        guard.stream_stopped = false;
+        guard.stream_stop_error = None;
+        guard.stop_gen
+    } else {
+        0
+    }
+}
+
+/// Ensures the dispatched stop generation is never behind `signal.stop_gen`. If an earlier
+/// pre-start worker called `begin_stop_generation` after a delayed start bumped `stop_gen` to
+/// `preferred_gen`, allocates a fresh strictly newer generation under the same `signal` mutex
+/// so the post-start stop callback can never be dropped as stale.
+pub(super) fn ensure_latest_stop_generation(
+    signal: &Arc<(Mutex<DelegateSignal>, Condvar)>,
+    preferred_gen: Option<u64>,
+) -> u64 {
+    let (lock, _) = &**signal;
+    if let Ok(mut guard) = lock.lock() {
+        if let Some(g) = preferred_gen {
+            if guard.stop_gen == g {
+                guard.stream_stopped = false;
+                guard.stream_stop_error = None;
+                return g;
+            }
+        }
         guard.stop_gen = guard.stop_gen.wrapping_add(1);
         guard.stream_stopped = false;
         guard.stream_stop_error = None;

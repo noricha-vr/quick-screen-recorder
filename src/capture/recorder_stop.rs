@@ -1,7 +1,7 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use super::delegate::{DelegateSignal, begin_stop_generation};
+use super::delegate::{DelegateSignal, ensure_latest_stop_generation};
 
 /// Minimum finalization budget for single-audio or silent recordings.
 pub(super) const STOP_SINGLE_AUDIO_MIN: Duration = Duration::from_secs(30);
@@ -306,20 +306,24 @@ impl StopControl {
                 let Ok(mut st) = self.state.lock() else {
                     return;
                 };
-                if let Some(late_gen) = st.pending_late_start_gen
-                    && st.remove_phase == RemovePhase::Failed
-                    && st.stop_capture_sent_at.is_none()
-                    && st.late_start_remove_retried_gen != Some(late_gen)
-                {
-                    st.late_start_remove_retried_gen = Some(late_gen);
-                    st.remove_phase = RemovePhase::Idle;
-                    st.forced_stop_on_timeout = false;
+                let should_retry_remove = match st.pending_late_start_gen {
+                    Some(late_gen)
+                        if st.remove_phase == RemovePhase::Failed
+                            && st.stop_capture_sent_at.is_none()
+                            && st.late_start_remove_retried_gen != Some(late_gen) =>
+                    {
+                        st.late_start_remove_retried_gen = Some(late_gen);
+                        st.remove_phase = RemovePhase::Idle;
+                        st.forced_stop_on_timeout = false;
+                        true
+                    }
+                    _ => false,
+                };
+                if should_retry_remove {
                     Step3Action::RetryRemove
                 } else if st.stop_capture_sent_at.is_none() {
-                    let expected_gen = st
-                        .pending_late_start_gen
-                        .take()
-                        .unwrap_or_else(|| begin_stop_generation(signal));
+                    let expected_gen =
+                        ensure_latest_stop_generation(signal, st.pending_late_start_gen.take());
                     st.stop_capture_sent_at = Some(now_fn());
                     st.stop_capture_gen = Some(expected_gen);
                     self.cvar.notify_all();

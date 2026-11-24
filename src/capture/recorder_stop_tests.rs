@@ -186,6 +186,10 @@ fn late_start_reschedules_cleanly_without_double_remove_when_pre_start_remove_su
 
     // Delayed `startCapture` arrives later with `late_gen = 99`: MUST NOT call `do_remove` a
     // second time because pre-start remove already succeeded, and MUST dispatch `stopCapture(99)`.
+    {
+        let mut g = signal.0.lock().unwrap();
+        g.stop_gen = 99;
+    }
     assert!(ctrl.register_late_start_stop(99, t_cancel + Duration::from_millis(40), &signal));
     ctrl.run_serial_worker_loop(
         &signal,
@@ -230,11 +234,12 @@ fn late_start_retries_remove_only_when_pre_start_remove_failed() {
     assert_eq!(ctrl.snapshot().remove_phase, RemovePhase::Failed);
 
     // Delayed `startCapture` completes (`late_gen = 7`) and writer finishes cleanly after remove.
-    assert!(ctrl.register_late_start_stop(7, t_cancel + Duration::from_millis(40), &signal));
     {
         let mut g = signal.0.lock().unwrap();
+        g.stop_gen = 7;
         g.finished = true;
     }
+    assert!(ctrl.register_late_start_stop(7, t_cancel + Duration::from_millis(40), &signal));
     ctrl.run_serial_worker_loop(
         &signal,
         || {
@@ -276,11 +281,12 @@ fn late_start_arriving_between_failed_remove_and_first_stop_retries_remove_and_w
                     // First pre-start remove fails; delayed `startCapture` arrives RIGHT BEFORE
                     // the worker reaches Step 3 (so `stop_capture_sent_at` is still `None`).
                     let now = *clk_w.lock().unwrap();
-                    let _ = ctrl_w.register_late_start_stop(42, now, &sig_w);
                     if let Ok(mut g) = sig_w.0.lock() {
                         g.start_completed = true;
                         g.started = true;
+                        g.stop_gen = 42;
                     }
+                    let _ = ctrl_w.register_late_start_stop(42, now, &sig_w);
                     false
                 } else {
                     // Second remove (post-start) succeeds; worker MUST now wait for `finished`.
@@ -333,6 +339,9 @@ fn late_start_repeated_remove_failure_bounds_retry_and_still_stops_stream() {
         || {
             let n = remove_calls.fetch_add(1, Ordering::SeqCst);
             if n == 0 {
+                if let Ok(mut g) = signal.0.lock() {
+                    g.stop_gen = 77;
+                }
                 let _ = ctrl.register_late_start_stop(77, t_cancel, &signal);
             }
             // Keep failing remove even on the post-start retry: MUST NOT infinite-loop!
@@ -349,6 +358,68 @@ fn late_start_repeated_remove_failure_bounds_retry_and_still_stops_stream() {
     assert_eq!(*stop_gens.lock().unwrap(), vec![77]);
     assert_eq!(ctrl.snapshot().remove_phase, RemovePhase::Failed);
     assert!(!ctrl.snapshot().worker_running);
+}
+
+#[test]
+fn late_start_generation_inversion_allocates_newer_gen_so_post_start_callback_succeeds() {
+    use crate::capture::recorder::delegate::{
+        record_stop_callback_for_gen, wait_for_stream_stopped,
+    };
+
+    let t0 = Instant::now();
+    let ctrl = Arc::new(StopControl::new(t0, false));
+    let signal = Arc::new((Mutex::new(DelegateSignal::default()), Condvar::new()));
+
+    // 1. Pre-start cancel starts. Delayed `startCapture` bumps `stop_gen` to 1, BUT BEFORE
+    //    `register_late_start_stop(1)` runs, the pre-start worker dispatches stopCapture, bumping
+    //    `signal.stop_gen` from 1 -> 2 (and pre-start stop fails with an error).
+    let t_cancel = t0 + Duration::from_millis(50);
+    assert!(ctrl.register_stop_request(StopMode::StartupAbort, t_cancel));
+    {
+        let mut g = signal.0.lock().unwrap();
+        g.start_completed = true;
+        g.stop_gen = 1; // delayed start already bumped stop_gen to 1
+    }
+
+    let stop_gens = Arc::new(Mutex::new(Vec::<u64>::new()));
+    let gens_c = Arc::clone(&stop_gens);
+    let sig_c = Arc::clone(&signal);
+    ctrl.run_serial_worker_loop(
+        &signal,
+        || false,
+        move |g| {
+            gens_c.lock().unwrap().push(g);
+            // Pre-start worker got gen 2 (newer than delayed start's 1) and failed!
+            let _ = record_stop_callback_for_gen(&sig_c, g, Some("pre-start failure".to_string()));
+        },
+        || t_cancel,
+    );
+    assert_eq!(*stop_gens.lock().unwrap(), vec![2]);
+
+    // 2. Now delayed start's `register_late_start_stop(1)` runs with stale preferred_gen=1:
+    //    `ensure_latest_stop_generation` MUST notice `signal.stop_gen (2) != 1`, allocate gen 3,
+    //    clear the prior error, and accept the post-start stop callback for gen 3!
+    assert!(ctrl.register_late_start_stop(1, t_cancel + Duration::from_millis(20), &signal));
+    {
+        let mut g = signal.0.lock().unwrap();
+        g.finished = true;
+    }
+    let gens_c2 = Arc::clone(&stop_gens);
+    let sig_c2 = Arc::clone(&signal);
+    ctrl.run_serial_worker_loop(
+        &signal,
+        || true,
+        move |g| {
+            gens_c2.lock().unwrap().push(g);
+            assert!(
+                record_stop_callback_for_gen(&sig_c2, g, None),
+                "post-start callback for allocated gen {g} must NOT be rejected as stale"
+            );
+        },
+        || t_cancel + Duration::from_millis(20),
+    );
+    assert_eq!(*stop_gens.lock().unwrap(), vec![2, 3]);
+    assert!(wait_for_stream_stopped(&signal, Duration::from_millis(20)));
 }
 
 #[test]

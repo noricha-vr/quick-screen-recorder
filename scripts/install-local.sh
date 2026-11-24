@@ -117,12 +117,36 @@ REAL_TARGET_DIR="$(cd "$TARGET_DIR" && pwd -P)"
 reject_newlines "resolved target directory" "$REAL_TARGET_DIR"
 
 DIST_DIR="$ROOT_DIR/dist"
-if [[ -e "$DIST_DIR" ]]; then
-  REAL_DIST_DIR="$(cd "$DIST_DIR" && pwd -P)"
-else
-  REAL_DIST_DIR="$DIST_DIR"
-fi
-if [[ "$REAL_TARGET_DIR" == "$REAL_DIST_DIR" || "$REAL_TARGET_DIR" == "$REAL_DIST_DIR/"* ]]; then
+is_inside_dist_dir() {
+  /usr/bin/python3 - "$1" "$2" << 'PY'
+import os, sys
+
+target = os.path.realpath(sys.argv[1])
+dist = os.path.realpath(sys.argv[2])
+
+# 1. Device/inode ancestor check catches case-insensitive APFS aliases (e.g. DIST vs dist) and symlinks.
+if os.path.exists(dist):
+    cur = target
+    while True:
+        try:
+            if os.path.samefile(cur, dist):
+                sys.exit(0)
+        except OSError:
+            pass
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+
+# 2. Case-folded fallback when dist/ does not exist yet.
+t_low = os.path.normcase(target).lower()
+d_low = os.path.normcase(dist).lower()
+if t_low == d_low or t_low.startswith(d_low.rstrip(os.sep) + os.sep):
+    sys.exit(0)
+sys.exit(1)
+PY
+}
+if is_inside_dist_dir "$REAL_TARGET_DIR" "$DIST_DIR"; then
   echo "ERROR: Refusing to install into dist/ (public bundle directory must remain untouched and ad-hoc)" >&2
   exit 1
 fi
@@ -297,6 +321,7 @@ trap cleanup_install EXIT
 OLD_EXISTED=0
 OLD_IS_ADHOC=0
 OLD_FINGERPRINT=""
+OLD_DEV_INO=""
 if [[ -e "$TARGET_APP" || -L "$TARGET_APP" ]]; then
   if [[ -L "$TARGET_APP" || ! -d "$TARGET_APP" ]]; then
     echo "ERROR: Refusing to replace non-directory or symlink at $(sanitize_print "$TARGET_APP")" >&2
@@ -308,6 +333,7 @@ if [[ -e "$TARGET_APP" || -L "$TARGET_APP" ]]; then
     exit 1
   fi
   OLD_EXISTED=1
+  OLD_DEV_INO="$(stat -f '%d:%i' "$TARGET_APP")"
   if old_sig="$(inspect_signature_fingerprint "$TARGET_APP" 2>/dev/null)"; then
     OLD_IS_ADHOC="${old_sig%%|*}"
     OLD_FINGERPRINT="${old_sig#*|}"
@@ -343,6 +369,13 @@ assert_app_not_running
 if [[ "$OLD_EXISTED" -eq 1 ]]; then
   atomic_renamex swap "$STAGE_APP" "$TARGET_APP"
   SWAPPED_OLD_IN_STAGE=1
+  # Verify the swapped-out directory is the exact inode we inspected before swap; if another
+  # process replaced TARGET_APP mid-copy, roll back immediately without deleting it!
+  swapped_dev_ino="$(stat -f '%d:%i' "$STAGE_APP" 2>/dev/null || true)"
+  if [[ -z "$OLD_DEV_INO" || "$swapped_dev_ino" != "$OLD_DEV_INO" ]]; then
+    echo "ERROR: Destination changed concurrently during install; rolling back safely." >&2
+    exit 1
+  fi
 else
   atomic_renamex excl "$STAGE_APP" "$TARGET_APP"
 fi
