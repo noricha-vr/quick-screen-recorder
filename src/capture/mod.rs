@@ -9,7 +9,6 @@ mod timelapse_frame;
 mod timelapse_loop;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -17,7 +16,8 @@ use serde::{Deserialize, Serialize};
 pub use cadence::{CaptureCadence, TIMELAPSE_PLAYBACK_FPS};
 use recorder::{PendingRecordingStop, RecordingSession, StopPollState};
 pub use system_events::{
-    SystemInterruptMonitor, SystemInterruptReason, current_session_interrupt, pump_current_runloop,
+    InterruptLatch, StopHook, SystemInterruptMonitor, SystemInterruptReason, UnlockMonitor,
+    current_session_interrupt, pump_current_runloop,
 };
 use timelapse::{PendingTimelapseStop, TimelapseSession};
 
@@ -162,7 +162,19 @@ pub enum PendingStop {
 
 impl ActiveRecording {
     pub fn start(config: &CaptureConfig, output_path: &Path) -> Result<Self, String> {
-        if let Some(reason) = current_session_interrupt() {
+        Self::start_with_interrupt(config, output_path, None)
+    }
+
+    pub fn start_with_interrupt(
+        config: &CaptureConfig,
+        output_path: &Path,
+        interrupt_latch: Option<InterruptLatch>,
+    ) -> Result<Self, String> {
+        if let Some(reason) = interrupt_latch
+            .as_ref()
+            .and_then(InterruptLatch::reason)
+            .or_else(current_session_interrupt)
+        {
             return Err(format!(
                 "Cannot start recording because {}",
                 reason.clause()
@@ -173,10 +185,9 @@ impl ActiveRecording {
                 config,
                 output_path,
             )?)),
-            CaptureCadence::Timelapse { .. } => Ok(Self::Timelapse(TimelapseSession::start(
-                config,
-                output_path,
-            )?)),
+            CaptureCadence::Timelapse { .. } => Ok(Self::Timelapse(
+                TimelapseSession::start_with_interrupt(config, output_path, interrupt_latch)?,
+            )),
         }
     }
 
@@ -201,12 +212,12 @@ impl ActiveRecording {
         }
     }
 
-    /// Optional thread-safe immediate stop hook (used by `SystemInterruptMonitor` so timelapse
-    /// workers stop capturing frames instantaneously on lock/sleep before UI/CLI timers tick).
-    pub fn stop_hook(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+    /// Thread-safe immediate stop hook for BOTH real-time (`SCStream`) and interval timelapse,
+    /// invoked directly from the background system-interrupt queue without waiting for the GUI thread.
+    pub fn stop_hook(&self) -> StopHook {
         match self {
-            Self::RealTime(_) => None,
-            Self::Timelapse(s) => Some(s.stop_hook()),
+            Self::RealTime(s) => s.stop_hook(),
+            Self::Timelapse(s) => s.stop_hook(),
         }
     }
 

@@ -27,6 +27,7 @@ fn delayed_init_after_caller_timeout_cancels_without_continuing_capture() {
         &sync,
         &frames_written,
         init_tx,
+        || false,
         || {
             dispatches += 1;
             dispatches
@@ -49,6 +50,7 @@ fn delayed_init_after_caller_timeout_cancels_without_continuing_capture() {
         &sync,
         &frames_written,
         init_tx2,
+        || false,
         || {
             dispatches2 += 1;
             dispatches2
@@ -79,6 +81,7 @@ fn start_cancel_during_inflight_frame0_discards_frame_without_writing() {
             &sync_worker,
             &frames_worker,
             init_tx,
+            || false,
             || {
                 let _ = dispatched_tx.send(());
             },
@@ -126,6 +129,7 @@ fn stop_immediately_after_start_and_never_captures_after_stop_requested() {
             &sync_worker,
             &frames_worker,
             init_tx,
+            || false,
             || dispatches_worker.fetch_add(1, Ordering::SeqCst) + 1,
             |_| Ok(dummy_frame(1)),
             |_| Ok(()),
@@ -169,6 +173,7 @@ fn stop_during_inflight_interval_capture_discards_returned_frame() {
             &sync_worker,
             &frames_worker,
             init_tx,
+            || false,
             || {
                 seq += 1;
                 if seq == 2 {
@@ -223,6 +228,7 @@ fn stop_serialized_before_tick_expiry_prevents_dispatching_second_capture() {
             &sync_worker,
             &frames_worker,
             init_tx,
+            || false,
             || dispatches_worker.fetch_add(1, Ordering::SeqCst) + 1,
             |_| Ok(dummy_frame(7)),
             |_| Ok(()),
@@ -265,6 +271,7 @@ fn consecutive_capture_failures_preserve_partial_frames_and_report_error() {
             &sync_worker,
             &frames_worker,
             init_tx,
+            || false,
             || {
                 calls += 1;
                 calls
@@ -404,6 +411,7 @@ fn single_frame_stop_propagates_closing_frame_write_error() {
             &sync_worker,
             &frames_worker,
             init_tx,
+            || false,
             || (),
             |()| Ok(dummy_frame(5)),
             |_| {

@@ -122,17 +122,24 @@ fn execute(command: Command) -> Result<(), String> {
                 excluded_window_ids: Vec::new(),
                 source_app_name: None,
             };
-            let session = ActiveRecording::start(&cfg, &output)?;
-            let monitor = SystemInterruptMonitor::start_headless(session.stop_hook());
+            // Arm system-interrupt monitoring BEFORE startup so lock/sleep events during
+            // initialization are captured rather than missed.
+            let monitor = SystemInterruptMonitor::start_headless();
+            let session =
+                ActiveRecording::start_with_interrupt(&cfg, &output, Some(monitor.latch()))?;
+            monitor.attach_stop_hook(session.stop_hook());
             let deadline = Instant::now() + Duration::from_secs_f64(duration_sec);
-            let mut interrupted_by = None;
-            while Instant::now() < deadline && !session.has_ended_unexpectedly() {
+            let mut interrupted_by = monitor.poll_interrupt();
+            while interrupted_by.is_none()
+                && Instant::now() < deadline
+                && !session.has_ended_unexpectedly()
+            {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                pump_current_runloop(remaining.min(Duration::from_millis(250)));
                 if let Some(reason) = monitor.poll_interrupt() {
                     interrupted_by = Some(reason);
                     break;
                 }
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                pump_current_runloop(remaining.min(Duration::from_millis(250)));
             }
             if interrupted_by.is_none() {
                 interrupted_by = monitor.poll_interrupt();

@@ -11,21 +11,21 @@ use objc2_core_media::{CMTime, CMTimeFlags};
 use objc2_foundation::{NSError, NSString, NSURL};
 use objc2_screen_capture_kit::{
     SCRecordingOutput, SCRecordingOutputConfiguration, SCStream, SCStreamConfiguration,
-    SCStreamErrorCode,
 };
 
 #[path = "recorder_delegate.rs"]
 mod delegate;
 
-use delegate::{DelegateSignal, RecordingDelegate};
+use delegate::{DelegateSignal, RecordingDelegate, SendableStreamStop, StreamStopControl};
 
 use crate::capture::filter::build_filter_and_dimensions;
 use crate::capture::shareable::query_shareable_content_for_capture;
+use crate::capture::system_events::StopHook;
 use crate::capture::{CaptureConfig, RecordingCodec, RecordingOutcome};
-use crate::export::avfoundation::probe_video_metadata;
-use crate::fs_safety::ExclusiveStagingDir;
+use crate::export::avfoundation::{extract_rgba_frame, probe_video_metadata};
+use crate::fs_safety::{ExclusiveStagingDir, format_tilde_path};
 use crate::observe::{PerfEvent, PerfKind, now_unix_secs, record_perf_event};
-use crate::staging::commit_or_recover_default;
+use crate::staging::{commit_or_recover_default, commit_or_recover_salvaged_default};
 
 const STOP_FALLBACK_AFTER: Duration = Duration::from_secs(2);
 const STOP_TIMEOUT: Duration = Duration::from_secs(12);
@@ -36,6 +36,7 @@ pub struct RecordingSession {
     recording_output: Retained<SCRecordingOutput>,
     _delegate: Retained<RecordingDelegate>,
     signal: Arc<(Mutex<DelegateSignal>, Condvar)>,
+    stop_control: Arc<StreamStopControl>,
     staging: ExclusiveStagingDir,
     output_path: PathBuf,
     started_at: Instant,
@@ -57,6 +58,7 @@ pub struct PendingRecordingStop {
     _recording_output: Retained<SCRecordingOutput>,
     _delegate: Retained<RecordingDelegate>,
     signal: Arc<(Mutex<DelegateSignal>, Condvar)>,
+    stop_control: Arc<StreamStopControl>,
     staging: ExclusiveStagingDir,
     output_path: PathBuf,
     elapsed_ms: u64,
@@ -212,6 +214,7 @@ impl RecordingSession {
             recording_output,
             _delegate: delegate,
             signal,
+            stop_control: Arc::new(StreamStopControl::default()),
             staging,
             output_path: output_path.to_path_buf(),
             started_at: Instant::now(),
@@ -233,19 +236,30 @@ impl RecordingSession {
         self.signal.0.lock().map(|g| g.finished).unwrap_or(false)
     }
 
+    /// Thread-safe immediate stop hook that removes `SCRecordingOutput` and stops `SCStream`
+    /// directly from the background system-interrupt queue without waiting for the GUI main thread.
+    pub fn stop_hook(&self) -> StopHook {
+        let stopper = SendableStreamStop::new(
+            self.stream.clone(),
+            self.recording_output.clone(),
+            Arc::clone(&self.signal),
+            Arc::clone(&self.stop_control),
+        );
+        Arc::new(move || stopper.stop_now(STOP_FALLBACK_AFTER))
+    }
+
     /// Initiates recording finalization without blocking the caller's thread or AppKit runloop.
     pub fn begin_stop(self) -> PendingRecordingStop {
         let elapsed_ms = self.started_at.elapsed().as_millis() as u64;
-        let remove_failed = unsafe {
-            self.stream
-                .removeRecordingOutput_error(&self.recording_output)
-                .is_err()
-        };
+        let remove_failed = self
+            .stop_control
+            .trigger_remove_once(&self.stream, &self.recording_output);
         let mut pending = PendingRecordingStop {
             stream: self.stream,
             _recording_output: self.recording_output,
             _delegate: self._delegate,
             signal: self.signal,
+            stop_control: self.stop_control,
             staging: self.staging,
             output_path: self.output_path,
             elapsed_ms,
@@ -288,32 +302,8 @@ impl PendingRecordingStop {
     fn send_stop_capture(&mut self) {
         if self.stop_capture_sent_at.is_none() {
             self.stop_capture_sent_at = Some(Instant::now());
-            let sig = Arc::clone(&self.signal);
-            let stop_block = RcBlock::new(move |err: *mut NSError| {
-                let stop_err = if !err.is_null() {
-                    let ns_err = unsafe { &*err };
-                    // `-3808` (AttemptToStopStreamState) means macOS already stopped the stream.
-                    if ns_err.code() == SCStreamErrorCode::AttemptToStopStreamState.0 {
-                        None
-                    } else {
-                        Some(ns_err.localizedDescription().to_string())
-                    }
-                } else {
-                    None
-                };
-                let (lock, cvar) = &*sig;
-                if let Ok(mut guard) = lock.lock() {
-                    guard.stream_stopped = true;
-                    if stop_err.is_some() {
-                        guard.stream_stop_error = stop_err;
-                    }
-                    cvar.notify_all();
-                }
-            });
-            unsafe {
-                self.stream
-                    .stopCaptureWithCompletionHandler(Some(&stop_block));
-            }
+            self.stop_control
+                .trigger_stop_capture_once(&self.stream, &self.signal);
         }
     }
 
@@ -339,7 +329,8 @@ impl PendingRecordingStop {
     }
 
     /// Stops the underlying capture stream (if not already stopped), verifies both trailer
-    /// finalization and stream stop completion, commits/recovers the MP4, and records telemetry.
+    /// finalization and stream stop completion independently, commits/recovers the MP4, and
+    /// records telemetry. Salvaged clips never overwrite an existing file and never mask stream-stop errors.
     pub fn finish(mut self) -> Result<RecordingOutcome, String> {
         self.send_stop_capture();
         let (finished, finish_err, stream_stopped, stream_stop_err) = self
@@ -361,37 +352,60 @@ impl PendingRecordingStop {
                 None,
             ));
 
-        // If macOS aborted the output (e.g. screen lock beat our notification by milliseconds)
-        // but AVFoundation already flushed a valid playable MP4, salvage it with a warning.
-        let mut partial_warn: Option<String> = None;
+        let stop_issue = if let Some(err) = stream_stop_err {
+            Some(format!("Failed to stop screen/audio capture stream: {err}"))
+        } else if !stream_stopped {
+            Some("Timed out confirming capture stream stopped".to_string())
+        } else {
+            None
+        };
+
+        let mut salvaged_warn: Option<String> = None;
         if let Some(err) = finish_err {
             if is_valid_salvageable_mp4(self.staging.staged_file()) {
-                partial_warn = Some(format!("Recording ended early: {err}"));
+                salvaged_warn = Some(format!("Recording ended early: {err}"));
             } else {
                 self.record_perf(0, false);
-                return Err(format!("Recording finalization error: {err}"));
+                return Err(match stop_issue {
+                    Some(stop_err) => format!("Recording finalization error: {err}; {stop_err}"),
+                    None => format!("Recording finalization error: {err}"),
+                });
             }
         } else if !finished {
             self.record_perf(0, false);
-            return Err(
-                "Timed out waiting for MP4 recording output to flush container trailer".to_string(),
-            );
-        }
-        if let Some(err) = stream_stop_err {
-            if partial_warn.is_none() {
-                self.record_perf(0, false);
-                return Err(format!("Failed to stop screen/audio capture stream: {err}"));
-            }
-        } else if !stream_stopped && partial_warn.is_none() {
-            self.record_perf(0, false);
-            return Err("Timed out confirming capture stream stopped".to_string());
+            return Err(match stop_issue {
+                Some(stop_err) => format!(
+                    "Timed out waiting for MP4 recording output to flush container trailer; {stop_err}"
+                ),
+                None => "Timed out waiting for MP4 recording output to flush container trailer"
+                    .to_string(),
+            });
         }
 
-        let (final_path, size, final_warning) = match commit_or_recover_default(
-            &mut self.staging,
-            self.output_path.clone(),
-            partial_warn,
-        ) {
+        // Salvaged or stop-error clips use non-overwriting publish so existing target files are never replaced.
+        let use_non_overwrite = salvaged_warn.is_some() || stop_issue.is_some();
+        let commit_res = if use_non_overwrite {
+            commit_or_recover_salvaged_default(
+                &mut self.staging,
+                self.output_path.clone(),
+                salvaged_warn,
+            )
+        } else {
+            commit_or_recover_default(&mut self.staging, self.output_path.clone(), None)
+        };
+
+        if let Some(stop_err) = stop_issue {
+            self.record_perf(0, false);
+            return Err(match commit_res {
+                Ok((saved_path, _, _)) => format!(
+                    "{stop_err}. Playable footage was still preserved at {}",
+                    format_tilde_path(&saved_path)
+                ),
+                Err(com_err) => format!("{stop_err}; {com_err}"),
+            });
+        }
+
+        let (final_path, size, final_warning) = match commit_res {
             Ok(v) => v,
             Err(err) => {
                 self.record_perf(0, false);
@@ -448,9 +462,22 @@ fn evaluate_stop_poll(
     (state, false)
 }
 
-fn is_valid_salvageable_mp4(path: &Path) -> bool {
-    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() > 0)
-        && probe_video_metadata(path).is_ok()
+/// Strictly verifies that `path` is a non-empty playable video file with at least one playable
+/// video track and a decodable initial frame (rejecting non-video files and truncated MP4s).
+pub fn is_valid_salvageable_mp4(path: &Path) -> bool {
+    let Ok(meta_fs) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !meta_fs.is_file() || meta_fs.len() == 0 {
+        return false;
+    }
+    let Ok(meta) = probe_video_metadata(path) else {
+        return false;
+    };
+    meta.has_video
+        && meta.is_playable
+        && meta.duration_sec >= 0.05
+        && extract_rgba_frame(path, 0.0, Some(64)).is_ok()
 }
 
 #[cfg(test)]

@@ -21,7 +21,8 @@ use io_helpers::{
     stage_once_on_dest_volume,
 };
 pub use io_helpers::{
-    commit_or_recover_default, commit_or_recover_staging, preserve_capture_to_recovery,
+    commit_or_recover_default, commit_or_recover_salvaged_default, commit_or_recover_staging,
+    commit_or_recover_staging_with_policy, preserve_capture_to_recovery,
     preserve_recording_on_quit,
 };
 
@@ -427,9 +428,8 @@ impl ExclusiveStagingDir {
         ))
     }
 
-    /// Disarms automatic cleanup on drop AND exempts the preserved staging directory from
-    /// 24-hour startup cache pruning by writing a `.qsr-keep` marker via `stage_dir_fd` and
-    /// renaming `.qsr-work-*` to `qsr-preserved-*` inside our private `0700` cache directory.
+    /// Disarms automatic drop cleanup and exempts staging from 24h startup pruning via
+    /// `.qsr-keep` marker (created on `stage_dir_fd`) and `qsr-preserved-*` rename.
     pub fn retain_staged_file(&mut self) -> PathBuf {
         let _ = fs::set_permissions(&self.staged_file, fs::Permissions::from_mode(0o600));
         // Create `.qsr-keep` via pinned `stage_dir_fd` so startup pruning skips this directory

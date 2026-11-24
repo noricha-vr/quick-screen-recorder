@@ -73,30 +73,33 @@ pub(crate) enum LoopExit {
 
 /// Pure, testable two-phase capture loop.
 /// `dispatch_capture` is invoked ONLY while holding `sync.control`'s mutex after verifying
-/// stop/cancel is false, so no capture request can ever start after `signal_stop()` or
-/// `signal_start_cancelled()` returns. Any in-flight capture completing after stop/cancel is
-/// discarded without calling `write_frame`.
-pub(crate) fn run_timelapse_loop<T, D, A, W>(
+/// stop/cancel and `is_interrupted()` are false, so no capture request can ever start after
+/// stop/cancel or macOS screen lock/sleep (even if OS notifications are delayed). Any in-flight
+/// capture completing after stop/cancel or lock/sleep is discarded without calling `write_frame`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_timelapse_loop<T, I, D, A, W>(
     interval: Duration,
     sync: &SyncState,
     frames_written: &AtomicU64,
     init_tx: mpsc::SyncSender<Result<(), String>>,
+    mut is_interrupted: I,
     mut dispatch_capture: D,
     mut await_capture: A,
     mut write_frame: W,
 ) -> Result<LoopExit, String>
 where
+    I: FnMut() -> bool,
     D: FnMut() -> T,
     A: FnMut(T) -> Result<RgbaFrame, String>,
     W: FnMut(&RgbaFrame) -> Result<(), String>,
 {
-    // Atomically check start cancellation and dispatch Frame 0 under the same mutex.
+    // Atomically check start cancellation and session lock state before dispatching Frame 0.
     let first_inflight = {
         let guard = match sync.control.0.lock() {
             Ok(g) => g,
             Err(_) => return Ok(LoopExit::CancelledBeforeStart),
         };
-        if guard.start_cancelled || guard.stop_requested {
+        if guard.start_cancelled || guard.stop_requested || is_interrupted() {
             return Ok(LoopExit::CancelledBeforeStart);
         }
         dispatch_capture()
@@ -105,14 +108,14 @@ where
     let first_frame = match await_capture(first_inflight) {
         Ok(f) => f,
         Err(e) => {
-            if sync.is_start_cancelled() {
+            if sync.is_start_cancelled() || is_interrupted() {
                 return Ok(LoopExit::CancelledBeforeStart);
             }
             let _ = init_tx.send(Err(e.clone()));
             return Err(e);
         }
     };
-    if sync.is_cancelled() {
+    if sync.is_cancelled() || is_interrupted() {
         return Ok(LoopExit::CancelledBeforeStart);
     }
     if let Err(e) = write_frame(&first_frame) {
@@ -156,7 +159,7 @@ where
                     .unwrap_or_else(|p| p.into_inner());
                 guard = next_guard;
             }
-            if guard.stop_requested {
+            if guard.stop_requested || is_interrupted() {
                 None
             } else {
                 Some(dispatch_capture())
@@ -172,9 +175,9 @@ where
         };
 
         let capture_res = await_capture(inflight);
-        // If stop was requested while the capture was in flight, discard the returned frame
-        // without writing it to disk so post-stop screen content can never enter the MP4.
-        if sync.is_cancelled() {
+        // If stop or screen lock/sleep occurred while capture was in flight, discard the frame
+        // without writing it to disk so post-stop/post-lock screen content can never enter the MP4.
+        if sync.is_cancelled() || is_interrupted() {
             return Ok(finalize_stopped_loop(
                 frames_written,
                 &mut held_first_frame,
@@ -254,4 +257,95 @@ where
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::thread;
+
+    use super::*;
+
+    fn dummy(tag: u8) -> RgbaFrame {
+        RgbaFrame {
+            width: 4,
+            height: 4,
+            pixels: vec![tag; 4 * 4 * 4],
+        }
+    }
+
+    #[test]
+    fn delayed_notification_session_lock_blocks_dispatch_and_discards_inflight_frames() {
+        let sync = SyncState::new();
+        let sync_w = Arc::clone(&sync);
+        let frames = Arc::new(AtomicU64::new(0));
+        let frames_w = Arc::clone(&frames);
+        let locked = Arc::new(AtomicBool::new(false));
+        let locked_w = Arc::clone(&locked);
+        let dispatches = Arc::new(AtomicU64::new(0));
+        let dispatches_w = Arc::clone(&dispatches);
+        let (init_tx, init_rx) = mpsc::sync_channel::<Result<(), String>>(0);
+
+        let handle = thread::spawn(move || {
+            run_timelapse_loop(
+                Duration::from_millis(25),
+                &sync_w,
+                &frames_w,
+                init_tx,
+                || locked_w.load(Ordering::Acquire),
+                || dispatches_w.fetch_add(1, Ordering::SeqCst) + 1,
+                |n| Ok(dummy(n as u8)),
+                |_| Ok(()),
+            )
+        });
+        assert_eq!(init_rx.recv_timeout(Duration::from_secs(2)), Ok(Ok(())));
+        locked.store(true, Ordering::Release);
+        assert_eq!(handle.join().unwrap(), Ok(LoopExit::Stopped));
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+
+        let sync2 = SyncState::new();
+        let sync2_w = Arc::clone(&sync2);
+        let frames2 = Arc::new(AtomicU64::new(0));
+        let frames2_w = Arc::clone(&frames2);
+        let locked2 = Arc::new(AtomicBool::new(false));
+        let locked2_w = Arc::clone(&locked2);
+        let tags = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let tags_w = Arc::clone(&tags);
+        let (d2_tx, d2_rx) = mpsc::sync_channel::<()>(1);
+        let (rel_tx, rel_rx) = mpsc::sync_channel::<()>(1);
+        let (init_tx2, init_rx2) = mpsc::sync_channel::<Result<(), String>>(0);
+
+        let h2 = thread::spawn(move || {
+            let mut seq = 0_u8;
+            run_timelapse_loop(
+                Duration::from_millis(5),
+                &sync2_w,
+                &frames2_w,
+                init_tx2,
+                || locked2_w.load(Ordering::Acquire),
+                || {
+                    seq += 1;
+                    if seq == 2 {
+                        let _ = d2_tx.send(());
+                    }
+                    seq
+                },
+                |n| {
+                    if n == 2 {
+                        let _ = rel_rx.recv();
+                    }
+                    Ok(dummy(n))
+                },
+                |f| {
+                    tags_w.lock().unwrap().push(f.pixels[0]);
+                    Ok(())
+                },
+            )
+        });
+        assert_eq!(init_rx2.recv_timeout(Duration::from_secs(2)), Ok(Ok(())));
+        d2_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        locked2.store(true, Ordering::Release);
+        rel_tx.send(()).unwrap();
+        assert_eq!(h2.join().unwrap(), Ok(LoopExit::Stopped));
+        assert_eq!(*tags.lock().unwrap(), vec![1, 1]);
+    }
 }

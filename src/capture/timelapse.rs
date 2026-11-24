@@ -11,6 +11,7 @@ use crate::capture::cadence::TIMELAPSE_PLAYBACK_FPS;
 use crate::capture::filter::build_filter_and_dimensions;
 use crate::capture::recorder::StopPollState;
 use crate::capture::shareable::query_shareable_content_for_capture;
+use crate::capture::system_events::{InterruptLatch, StopHook, current_session_interrupt};
 use crate::capture::timelapse_frame::{FRAME_CAPTURE_TIMEOUT, dispatch_screenshot_frame};
 use crate::capture::timelapse_loop::{LoopExit, SyncState, run_timelapse_loop};
 use crate::capture::{CaptureConfig, RecordingCodec, RecordingOutcome};
@@ -49,6 +50,14 @@ pub struct PendingTimelapseStop {
 
 impl TimelapseSession {
     pub fn start(config: &CaptureConfig, output_path: &Path) -> Result<Self, String> {
+        Self::start_with_interrupt(config, output_path, None)
+    }
+
+    pub fn start_with_interrupt(
+        config: &CaptureConfig,
+        output_path: &Path,
+        interrupt_latch: Option<InterruptLatch>,
+    ) -> Result<Self, String> {
         let interval_secs = config
             .cadence
             .timelapse_interval_secs()
@@ -81,6 +90,7 @@ impl TimelapseSession {
                 sync_worker,
                 frames_worker,
                 committing_worker,
+                interrupt_latch,
                 started_at,
                 init_tx,
             );
@@ -124,7 +134,7 @@ impl TimelapseSession {
     }
 
     /// Returns a thread-safe closure that immediately signals the worker to stop capturing frames.
-    pub fn stop_hook(&self) -> Arc<dyn Fn() + Send + Sync> {
+    pub fn stop_hook(&self) -> StopHook {
         let sync = Arc::clone(&self.sync);
         Arc::new(move || sync.signal_stop())
     }
@@ -215,10 +225,20 @@ fn run_timelapse_worker(
     sync: Arc<SyncState>,
     frames_written: Arc<AtomicU64>,
     committing: Arc<AtomicBool>,
+    interrupt_latch: Option<InterruptLatch>,
     started_at: Instant,
     init_tx: mpsc::SyncSender<Result<(), String>>,
 ) -> Result<RecordingOutcome, String> {
-    if sync.is_start_cancelled() {
+    let is_session_interrupted = || {
+        interrupt_latch
+            .as_ref()
+            .is_some_and(|l| l.reason().is_some())
+            || current_session_interrupt().is_some()
+    };
+    if sync.is_start_cancelled() || is_session_interrupted() {
+        let _ = init_tx.send(Err(
+            "Cannot start timelapse while the screen is locked or sleeping".to_string(),
+        ));
         return Err("Timelapse start cancelled before initialization".to_string());
     }
     // Drain autoreleased Cocoa intermediates created during setup on this non-main Rust thread.
@@ -263,6 +283,7 @@ fn run_timelapse_worker(
         &sync,
         &frames_written,
         init_tx,
+        is_session_interrupted,
         || {
             autoreleasepool(|_| {
                 dispatch_screenshot_frame(&filter, &stream_cfg, pixel_w, pixel_h, &cancel_flag)

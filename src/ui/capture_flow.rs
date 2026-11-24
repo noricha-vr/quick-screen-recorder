@@ -16,7 +16,8 @@ use crate::capture::{ActiveRecording, AudioCaptureMode, CaptureConfig, SystemInt
 use crate::config::Preferences;
 use crate::permissions::{has_screen_capture_permission, open_microphone_settings};
 pub(crate) use crate::ui::capture_stop::{
-    open_editor_for_file, stop_active_recording, stop_active_recording_with_reason,
+    flush_deferred_alerts, open_editor_for_file, stop_active_recording,
+    stop_active_recording_with_reason,
 };
 use crate::ui::folder_picker::show_error_alert;
 use crate::ui::onboarding_visual::OnboardingStep;
@@ -24,6 +25,7 @@ use crate::ui::overlay::SelectorOverlay;
 use crate::ui::{AppRuntime, open_onboarding};
 
 pub(crate) fn toggle_select_or_stop(mtm: MainThreadMarker, runtime: &Rc<RefCell<AppRuntime>>) {
+    flush_deferred_alerts(mtm, runtime);
     let (busy_transition, has_session) = {
         let rt = runtime.borrow();
         (
@@ -231,8 +233,23 @@ fn launch_recording_session(
         }
     };
     let source_app = cfg.source_app_name.clone();
-    match ActiveRecording::start(&cfg, &raw_out) {
+    // Arm lock/sleep monitoring BEFORE starting capture so transitions during initialization
+    // cannot be missed.
+    let rt_int = Rc::clone(runtime);
+    let monitor = SystemInterruptMonitor::start_gui(move |reason| {
+        if let Some(m) = MainThreadMarker::new() {
+            let can_stop = rt_int
+                .try_borrow()
+                .is_ok_and(|r| r.session.is_some() && r.pending_stop.is_none());
+            if can_stop {
+                stop_active_recording_with_reason(m, &rt_int, Some(reason));
+            }
+        }
+    });
+    match ActiveRecording::start_with_interrupt(&cfg, &raw_out, Some(monitor.latch())) {
         Ok(session) => {
+            monitor.attach_stop_hook(session.stop_hook());
+            let early_interrupt = monitor.poll_interrupt();
             {
                 let mut rt = runtime.borrow_mut();
                 rt.temp_files.push(raw_out);
@@ -241,21 +258,7 @@ fn launch_recording_session(
                 if let Some(sb) = &rt.status_bar {
                     sb.set_recording_elapsed(mtm, 0, init_tl_frames);
                 }
-                let stop_hook = session.stop_hook();
-                let rt_int = Rc::clone(runtime);
-                rt.interrupt_monitor = Some(SystemInterruptMonitor::start_gui(
-                    stop_hook,
-                    move |reason| {
-                        if let Some(m) = MainThreadMarker::new() {
-                            let can_stop = rt_int
-                                .try_borrow()
-                                .is_ok_and(|r| r.session.is_some() && r.pending_stop.is_none());
-                            if can_stop {
-                                stop_active_recording_with_reason(m, &rt_int, Some(reason));
-                            }
-                        }
-                    },
-                ));
+                rt.interrupt_monitor = Some(monitor);
                 rt.session = Some(session);
                 let rt_tick = Rc::clone(runtime);
                 let block = RcBlock::new(move |_t: NonNull<NSTimer>| {
@@ -293,6 +296,10 @@ fn launch_recording_session(
                     t
                 });
             }
+            if let Some(reason) = early_interrupt {
+                stop_active_recording_with_reason(mtm, runtime, Some(reason));
+                return;
+            }
             if tutorial_active {
                 open_onboarding(
                     mtm,
@@ -303,6 +310,9 @@ fn launch_recording_session(
                 );
             }
         }
-        Err(err) => show_error_alert(mtm, "Recording Failed to Start", &err),
+        Err(err) => {
+            drop(monitor);
+            show_error_alert(mtm, "Recording Failed to Start", &err);
+        }
     }
 }

@@ -2,11 +2,13 @@ use std::fs::{self, File};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
+use quick_screen_recorder::capture::recorder::is_valid_salvageable_mp4;
 use quick_screen_recorder::capture::{RecordingCodec, TIMELAPSE_PLAYBACK_FPS};
 use quick_screen_recorder::export::av_writer::{StreamingMp4Writer, write_rgba_frames_to_mp4};
 use quick_screen_recorder::export::avfoundation::{RgbaFrame, probe_video_metadata};
 use quick_screen_recorder::export::{ExportFormat, ExportRequest, run_export};
-use quick_screen_recorder::fs_safety::next_unique_token;
+use quick_screen_recorder::fs_safety::{ExclusiveStagingDir, next_unique_token};
+use quick_screen_recorder::staging::commit_or_recover_staging_with_policy;
 
 fn make_temp_dir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("qsr-it-{name}-{}", next_unique_token()));
@@ -222,6 +224,45 @@ fn streaming_timelapse_and_low_fps_exports_preserve_duration_and_cadence() {
             "APNG {label} @ 1 fps should play for {expected_secs}s, got {apng_secs}s"
         );
     }
+
+    // 4. Salvage validator rejects non-video files and truncated/corrupt MP4s, accepts valid MP4,
+    //    and non-overwriting salvage commit never replaces an existing healthy video at output_path.
+    assert!(
+        !is_valid_salvageable_mp4(Path::new("Cargo.toml")),
+        "plain text non-video file must never pass salvage check"
+    );
+    let truncated = work.join("truncated_unfinalized.mp4");
+    let valid_bytes = fs::read(&src_mp4).expect("read valid mp4");
+    fs::write(&truncated, &valid_bytes[..valid_bytes.len().min(512)]).expect("write truncated");
+    assert!(
+        !is_valid_salvageable_mp4(&truncated),
+        "truncated/moov-less MP4 must be rejected by salvage check"
+    );
+    assert!(
+        is_valid_salvageable_mp4(&src_mp4),
+        "valid playable MP4 with decodable video track must pass salvage check"
+    );
+
+    let existing_good = work.join("existing_good.mp4");
+    fs::write(&existing_good, b"pre-existing-healthy-video").expect("write pre-existing");
+    let mut salvage_stage =
+        ExclusiveStagingDir::create_for_target_with_policy(&existing_good, "mp4", true)
+            .expect("stage salvage");
+    fs::copy(&src_mp4, salvage_stage.staged_file()).expect("copy valid clip to stage");
+    let (salvaged_path, _, _) = commit_or_recover_staging_with_policy(
+        &mut salvage_stage,
+        existing_good.clone(),
+        Some("ended early".to_string()),
+        true,
+        Ok(work.join("rec")),
+    )
+    .expect("commit salvaged without overwriting");
+    assert_ne!(salvaged_path, existing_good);
+    assert_eq!(
+        fs::read(&existing_good).unwrap(),
+        b"pre-existing-healthy-video",
+        "salvaged commit must never overwrite an existing file at target path"
+    );
 
     let _ = fs::remove_dir_all(&work);
 }

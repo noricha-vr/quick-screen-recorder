@@ -9,8 +9,8 @@ use objc2_app_kit::NSApplication;
 use objc2_foundation::{NSRunLoop, NSRunLoopCommonModes, NSTimer};
 
 use crate::capture::recorder::StopPollState;
-use crate::capture::{SystemInterruptReason, current_session_interrupt};
-use crate::fs_safety::format_tilde_path;
+use crate::capture::{SystemInterruptReason, UnlockMonitor, current_session_interrupt};
+use crate::fs_safety::{format_tilde_path, sanitize_terminal_text};
 use crate::staging::{preserve_capture_to_recovery, private_recovery_dir};
 use crate::ui::editor::{EditorOpenOptions, EditorWindow};
 use crate::ui::folder_picker::show_error_alert;
@@ -25,13 +25,61 @@ pub(crate) fn should_complete_tutorial_on_save(
     !recording_active && active_tutorial_gen.is_some() && active_tutorial_gen == editor_tutorial_gen
 }
 
-/// Modal `NSAlert::runModal()` calls must be skipped while the screen is locked or sleeping so
-/// logout, sleep, and app termination never hang behind an invisible modal dialog.
-pub(crate) fn should_suppress_modal_alert(
+/// Defer modal `NSAlert::runModal()` calls while the screen is actively locked or entering sleep
+/// so logout, sleep, and termination never hang—errors are queued and displayed upon unlock/wake.
+pub(crate) fn should_defer_error_alert(
     auto_stop_reason: Option<SystemInterruptReason>,
     session_currently_interrupted: bool,
 ) -> bool {
-    auto_stop_reason.is_some() || session_currently_interrupted
+    session_currently_interrupted
+        || matches!(
+            auto_stop_reason,
+            Some(SystemInterruptReason::DisplaySlept | SystemInterruptReason::SystemWillSleep)
+        )
+}
+
+pub(crate) fn queue_or_show_error_alert(
+    mtm: MainThreadMarker,
+    runtime: &Rc<RefCell<AppRuntime>>,
+    title: &str,
+    message: &str,
+    defer: bool,
+) {
+    if !defer {
+        show_error_alert(mtm, title, message);
+        return;
+    }
+    let needs_unlock_monitor = {
+        let mut rt = runtime.borrow_mut();
+        rt.deferred_alerts
+            .push((title.to_string(), message.to_string()));
+        rt.unlock_monitor.is_none()
+    };
+    if needs_unlock_monitor {
+        let rt_unlock = Rc::clone(runtime);
+        let mon = UnlockMonitor::start_gui(move || {
+            if let Some(m) = MainThreadMarker::new() {
+                if current_session_interrupt().is_none() {
+                    flush_deferred_alerts(m, &rt_unlock);
+                }
+            }
+        });
+        runtime.borrow_mut().unlock_monitor = Some(mon);
+    }
+}
+
+pub(crate) fn flush_deferred_alerts(mtm: MainThreadMarker, runtime: &Rc<RefCell<AppRuntime>>) {
+    let alerts: Vec<(String, String)> = {
+        let mut rt = runtime.borrow_mut();
+        if rt.deferred_alerts.is_empty() {
+            return;
+        }
+        let _ = rt.unlock_monitor.take();
+        std::mem::take(&mut rt.deferred_alerts)
+    };
+    for (title, msg) in alerts {
+        show_error_alert(mtm, &title, &msg);
+    }
 }
 
 pub(crate) fn build_auto_stop_notice(
@@ -127,8 +175,8 @@ pub(crate) fn stop_active_recording_with_reason(
         };
         let app_name = captured_cell.borrow_mut().take();
         let should_quit = rt_poll.borrow().quit_after_stop;
-        let suppress_modal =
-            should_suppress_modal_alert(auto_stop_reason, current_session_interrupt().is_some());
+        let defer_modal =
+            should_defer_error_alert(auto_stop_reason, current_session_interrupt().is_some());
 
         match pending.finish() {
             Ok(outcome) => {
@@ -139,21 +187,26 @@ pub(crate) fn stop_active_recording_with_reason(
                         private_recovery_dir(),
                         "Quit-Saved-Recording",
                     );
-                    if !suppress_modal {
-                        let notice = match (rescued, outcome.partial_error) {
-                            (Ok(saved), Some(warn)) => format!(
-                                "Your recording was preserved at {} before quitting (warning: {warn}).",
-                                format_tilde_path(&saved)
-                            ),
-                            (Ok(saved), None) => format!(
-                                "Your recording was preserved at {} before quitting.",
-                                format_tilde_path(&saved)
-                            ),
-                            (Err((rec_err, kept)), _) => format!(
-                                "Could not move recording to recovery ({rec_err}); file was preserved at {}.",
-                                format_tilde_path(&kept)
-                            ),
-                        };
+                    let notice = match (rescued, outcome.partial_error) {
+                        (Ok(saved), Some(warn)) => format!(
+                            "Your recording was preserved at {} before quitting (warning: {warn}).",
+                            format_tilde_path(&saved)
+                        ),
+                        (Ok(saved), None) => format!(
+                            "Your recording was preserved at {} before quitting.",
+                            format_tilde_path(&saved)
+                        ),
+                        (Err((rec_err, kept)), _) => format!(
+                            "Could not move recording to recovery ({rec_err}); file was preserved at {}.",
+                            format_tilde_path(&kept)
+                        ),
+                    };
+                    if defer_modal {
+                        eprintln!(
+                            "QuickScreenRecorder: {}",
+                            sanitize_terminal_text(&notice, false)
+                        );
+                    } else {
                         show_error_alert(m, "Recording Saved Before Quit", &notice);
                     }
                     crate::ui::finish_app_termination(m, &rt_poll);
@@ -178,18 +231,31 @@ pub(crate) fn stop_active_recording_with_reason(
                         outcome.partial_error.as_deref(),
                         rec_err_opt.as_deref(),
                     );
-                    let _ = open_editor_for_file(
+                    if let Err(err) = open_editor_for_file(
                         m,
                         &rt_poll,
                         &editor_path,
                         app_name,
                         tutorial_gen,
                         Some(notice),
-                    );
+                    ) {
+                        let fallback_msg = format!(
+                            "Recording auto-stopped ({}) and was saved at {}, but failed opening the editor: {err}",
+                            reason.short_label(),
+                            format_tilde_path(&editor_path)
+                        );
+                        queue_or_show_error_alert(
+                            m,
+                            &rt_poll,
+                            "Recording Saved — Failed Opening Editor",
+                            &fallback_msg,
+                            defer_modal,
+                        );
+                    }
                     return;
                 }
 
-                let inline_notice = if suppress_modal {
+                let inline_notice = if defer_modal {
                     outcome
                         .partial_error
                         .as_ref()
@@ -205,28 +271,46 @@ pub(crate) fn stop_active_recording_with_reason(
                     tutorial_gen,
                     inline_notice,
                 ) {
-                    if !suppress_modal {
-                        show_error_alert(m, "Failed Opening Editor", &err);
-                    }
+                    queue_or_show_error_alert(
+                        m,
+                        &rt_poll,
+                        "Failed Opening Editor",
+                        &err,
+                        defer_modal,
+                    );
                 }
-                if !suppress_modal {
-                    if let Some(partial_err) = outcome.partial_error {
-                        show_error_alert(
-                            m,
-                            "Recording Saved With Warning",
-                            &format!(
-                                "The recording was saved and opened in the editor, with a warning: {partial_err}"
-                            ),
-                        );
-                    }
+                if let Some(partial_err) = outcome.partial_error {
+                    queue_or_show_error_alert(
+                        m,
+                        &rt_poll,
+                        "Recording Saved With Warning",
+                        &format!(
+                            "The recording was saved and opened in the editor, with a warning: {partial_err}"
+                        ),
+                        defer_modal,
+                    );
                 }
             }
             Err(err) => {
-                if !suppress_modal {
-                    show_error_alert(m, "Recording Error", &err);
-                }
                 if should_quit {
+                    if defer_modal {
+                        eprintln!(
+                            "QuickScreenRecorder recording error on quit: {}",
+                            sanitize_terminal_text(&err, false)
+                        );
+                    } else {
+                        show_error_alert(m, "Recording Error", &err);
+                    }
                     crate::ui::finish_app_termination(m, &rt_poll);
+                } else {
+                    let msg = match auto_stop_reason {
+                        Some(reason) => format!(
+                            "Recording auto-stopped because {}, but saving encountered an error: {err}",
+                            reason.clause()
+                        ),
+                        None => err,
+                    };
+                    queue_or_show_error_alert(m, &rt_poll, "Recording Error", &msg, defer_modal);
                 }
             }
         }
@@ -322,16 +406,25 @@ mod tests {
     }
 
     #[test]
-    fn modal_alerts_are_suppressed_on_screen_lock_and_sleep() {
-        assert!(!should_suppress_modal_alert(None, false));
-        assert!(should_suppress_modal_alert(None, true));
-        assert!(should_suppress_modal_alert(
+    fn modal_alerts_defer_when_locked_or_entering_sleep_and_show_once_unlocked() {
+        assert!(!should_defer_error_alert(None, false));
+        assert!(should_defer_error_alert(None, true));
+        // If screen already unlocked before finalization finished, show immediately.
+        assert!(!should_defer_error_alert(
             Some(SystemInterruptReason::ScreenLocked),
             false
         ));
-        assert!(should_suppress_modal_alert(
-            Some(SystemInterruptReason::SystemWillSleep),
+        assert!(should_defer_error_alert(
+            Some(SystemInterruptReason::ScreenLocked),
             true
+        ));
+        assert!(should_defer_error_alert(
+            Some(SystemInterruptReason::DisplaySlept),
+            false
+        ));
+        assert!(should_defer_error_alert(
+            Some(SystemInterruptReason::SystemWillSleep),
+            false
         ));
     }
 

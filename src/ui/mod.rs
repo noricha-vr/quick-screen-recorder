@@ -29,7 +29,9 @@ use objc2::rc::Retained;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_foundation::NSTimer;
 
-use crate::capture::{ActiveRecording, PendingStop, RecordingCodec, SystemInterruptMonitor};
+use crate::capture::{
+    ActiveRecording, PendingStop, RecordingCodec, SystemInterruptMonitor, UnlockMonitor,
+};
 use crate::cli::DemoMode;
 use crate::config::Preferences;
 use crate::permissions::has_screen_capture_permission;
@@ -64,6 +66,8 @@ pub(crate) struct AppRuntime {
     pub(crate) mic_perm_timer: Option<Retained<NSTimer>>,
     pub(crate) editors: Vec<EditorWindow>,
     pub(crate) temp_files: Vec<PathBuf>,
+    pub(crate) deferred_alerts: Vec<(String, String)>,
+    pub(crate) unlock_monitor: Option<UnlockMonitor>,
     pub(crate) quit_after_stop: bool,
 }
 
@@ -107,6 +111,8 @@ pub fn run_gui(
         mic_perm_timer: None,
         editors: Vec::new(),
         temp_files: Vec::new(),
+        deferred_alerts: Vec::new(),
+        unlock_monitor: None,
         quit_after_stop: false,
     }));
 
@@ -322,6 +328,7 @@ pub(crate) fn finish_app_termination(mtm: MainThreadMarker, runtime: &Rc<RefCell
             t.invalidate();
         }
         let _ = rt.interrupt_monitor.take();
+        let _ = rt.unlock_monitor.take();
         for tmp in rt.temp_files.drain(..) {
             let _ = std::fs::remove_file(tmp);
         }

@@ -290,17 +290,24 @@ pub fn preserve_file_to_recovery_dir(
     ))
 }
 
-/// Commits a finalized staged MP4 to `output_path`. If the destination became unavailable
-/// (e.g. external drive unmounted), rescues the file into `recovery_dir`; if recovery also fails,
-/// disarms drop cleanup and exempts the staged file from cache pruning so footage is never lost.
-pub fn commit_or_recover_staging(
+/// Commits a finalized staged MP4 to `output_path`. When `prevent_overwrite` is `true`, uses
+/// exclusive non-overwriting publish (`RENAME_EXCL` / numeric suffix) so salvaged partial clips
+/// can never replace an existing healthy file. Falls back to `recovery_dir`, and if that also
+/// fails, retains staging exempt from cache pruning.
+pub fn commit_or_recover_staging_with_policy(
     staging: &mut ExclusiveStagingDir,
     output_path: PathBuf,
     partial_error: Option<String>,
+    prevent_overwrite: bool,
     recovery_dir: Result<PathBuf, String>,
 ) -> Result<(PathBuf, u64, Option<String>), String> {
-    match staging.commit() {
-        Ok(size) => Ok((output_path, size, partial_error)),
+    let commit_res = if prevent_overwrite {
+        staging.commit_with_policy(true)
+    } else {
+        staging.commit().map(|size| (output_path, size))
+    };
+    match commit_res {
+        Ok((committed_path, size)) => Ok((committed_path, size, partial_error)),
         Err(com_err) => {
             match recovery_dir.and_then(|rec_dir| staging.preserve_to_recovery_dir(&rec_dir)) {
                 Ok((recovered_path, rec_size)) => {
@@ -332,13 +339,44 @@ pub fn commit_or_recover_staging(
     }
 }
 
+pub fn commit_or_recover_staging(
+    staging: &mut ExclusiveStagingDir,
+    output_path: PathBuf,
+    partial_error: Option<String>,
+    recovery_dir: Result<PathBuf, String>,
+) -> Result<(PathBuf, u64, Option<String>), String> {
+    commit_or_recover_staging_with_policy(staging, output_path, partial_error, false, recovery_dir)
+}
+
 /// Convenience wrapper using the default private local recovery directory.
 pub fn commit_or_recover_default(
     staging: &mut ExclusiveStagingDir,
     output_path: PathBuf,
     partial_error: Option<String>,
 ) -> Result<(PathBuf, u64, Option<String>), String> {
-    commit_or_recover_staging(staging, output_path, partial_error, private_recovery_dir())
+    commit_or_recover_staging_with_policy(
+        staging,
+        output_path,
+        partial_error,
+        false,
+        private_recovery_dir(),
+    )
+}
+
+/// Non-overwriting variant used when salvaging an aborted/partial recording so an existing target
+/// video at `output_path` is never replaced.
+pub fn commit_or_recover_salvaged_default(
+    staging: &mut ExclusiveStagingDir,
+    output_path: PathBuf,
+    partial_error: Option<String>,
+) -> Result<(PathBuf, u64, Option<String>), String> {
+    commit_or_recover_staging_with_policy(
+        staging,
+        output_path,
+        partial_error,
+        true,
+        private_recovery_dir(),
+    )
 }
 
 /// Rescues a finished GUI capture out of `temp_files` into `recovery_dir` so shutdown cleanup,
