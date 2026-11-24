@@ -2,7 +2,7 @@ use std::ffi::c_void;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
@@ -13,18 +13,18 @@ use objc2_app_kit::{
 use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFString, CFType};
 use objc2_core_graphics::CGSessionCopyCurrentDictionary;
 use objc2_foundation::{
-    NSDate, NSDefaultRunLoopMode, NSDistributedNotificationCenter, NSNotificationName,
-    NSObjectProtocol, NSOperationQueue, NSRunLoop, NSString,
+    NSDistributedNotificationCenter, NSNotificationName, NSObjectProtocol, NSOperationQueue,
+    NSString,
 };
 
 #[path = "system_resume.rs"]
 mod resume;
 
-pub use resume::UnlockMonitor;
 #[cfg(test)]
 pub(crate) use resume::{
     ResumeLatch, handle_distributed_lock_notification, handle_distributed_unlock_notification,
 };
+pub use resume::{UnlockMonitor, pump_current_runloop};
 
 const DISTRIBUTED_SCREEN_LOCKED_NAME: &str = "com.apple.screenIsLocked";
 const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -162,29 +162,59 @@ impl InterruptLatch {
     }
 }
 
-/// Evaluates `CGSessionCopyCurrentDictionary` boolean flags into a concrete interrupt reason.
-pub(crate) fn evaluate_session_lock_flags(
+/// Result of probing WindowServer's `CGSessionCopyCurrentDictionary()`, explicitly distinguishing
+/// lookup failures from a confirmed unlocked console session so untrusted distributed unlock
+/// notifications can never fail open when the dictionary is unavailable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionProbeState {
+    ActiveUnlocked,
+    Interrupted(SystemInterruptReason),
+    Unavailable,
+}
+
+/// Evaluates `CGSessionCopyCurrentDictionary` boolean flags into a 3-state probe result.
+pub(crate) fn evaluate_session_state(
+    dict_present: bool,
     screen_is_locked: Option<bool>,
     on_console: Option<bool>,
-) -> Option<SystemInterruptReason> {
+) -> SessionProbeState {
+    if !dict_present {
+        return SessionProbeState::Unavailable;
+    }
     if screen_is_locked == Some(true) {
-        return Some(SystemInterruptReason::ScreenLocked);
+        return SessionProbeState::Interrupted(SystemInterruptReason::ScreenLocked);
     }
     if on_console == Some(false) {
-        return Some(SystemInterruptReason::SessionResigned);
+        return SessionProbeState::Interrupted(SystemInterruptReason::SessionResigned);
     }
-    None
+    // On macOS, `CGSSessionScreenIsLocked` is omitted until the session has been locked at least
+    // once, while `kCGSSessionOnConsoleKey` is `1` on an active unlocked desktop console.
+    if on_console == Some(true) {
+        return SessionProbeState::ActiveUnlocked;
+    }
+    SessionProbeState::Unavailable
 }
 
 /// Synchronously queries macOS WindowServer session state for screen lock or console switch.
 /// Completely independent of AppKit and the main thread's `NSRunLoop`.
-pub fn current_session_interrupt() -> Option<SystemInterruptReason> {
+pub fn current_session_state() -> SessionProbeState {
     autoreleasepool(|_| {
-        let dict = CGSessionCopyCurrentDictionary()?;
+        let Some(dict) = CGSessionCopyCurrentDictionary() else {
+            return SessionProbeState::Unavailable;
+        };
         let locked = cf_dict_bool(&dict, "CGSSessionScreenIsLocked");
-        let on_console = cf_dict_bool(&dict, "kCGSessionOnConsoleKey");
-        evaluate_session_lock_flags(locked, on_console)
+        // Apple's `kCGSessionOnConsoleKey` C constant resolves to `"kCGSSessionOnConsoleKey"`.
+        let on_console = cf_dict_bool(&dict, "kCGSSessionOnConsoleKey");
+        evaluate_session_state(true, locked, on_console)
     })
+}
+
+/// Convenience projection returning `Some(reason)` only when WindowServer confirms lock/resign.
+pub fn current_session_interrupt() -> Option<SystemInterruptReason> {
+    match current_session_state() {
+        SessionProbeState::Interrupted(reason) => Some(reason),
+        SessionProbeState::ActiveUnlocked | SessionProbeState::Unavailable => None,
+    }
 }
 
 fn cf_dict_bool(dict: &CFDictionary, key: &str) -> Option<bool> {
@@ -443,26 +473,6 @@ impl Drop for SystemInterruptMonitor {
             unsafe {
                 ws_center.removeObserver(token.as_ref());
             }
-        }
-    }
-}
-
-/// Pumps the current thread's `NSRunLoop` up to `duration` so CLI sessions receive macOS
-/// workspace/distributed notifications without busy-spinning when no sources are pending.
-pub fn pump_current_runloop(duration: Duration) {
-    if duration.is_zero() {
-        return;
-    }
-    let started = Instant::now();
-    autoreleasepool(|_| {
-        let limit = NSDate::dateWithTimeIntervalSinceNow(duration.as_secs_f64());
-        let rl = NSRunLoop::currentRunLoop();
-        let _ = rl.runMode_beforeDate(unsafe { NSDefaultRunLoopMode }, &limit);
-    });
-    let elapsed = started.elapsed();
-    if let Some(rem) = duration.checked_sub(elapsed) {
-        if !rem.is_zero() {
-            thread::sleep(rem);
         }
     }
 }

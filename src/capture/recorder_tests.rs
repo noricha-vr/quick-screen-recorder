@@ -244,3 +244,47 @@ fn interrupt_after_writer_started_preserves_session_for_normal_stop_and_recovery
     assert!(!cancelled.load(std::sync::atomic::Ordering::Acquire));
     assert_eq!(late_stops.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
+
+#[test]
+fn writer_starting_mid_stop_still_preserves_session_for_recovery() {
+    use std::sync::atomic::Ordering;
+
+    // Case 1: `wait_for_recording_started` sees `started == false`, invokes stop closure, and
+    // `did_start` arrives mid-stop -> must re-check `started` after stop and return Ok(()).
+    let signal = Arc::new((Mutex::new(DelegateSignal::default()), Condvar::new()));
+    let sig_in_stop = Arc::clone(&signal);
+    let res = wait_for_recording_started(
+        &signal,
+        Duration::from_secs(1),
+        || Some("interrupted: screen locked".to_string()),
+        move || {
+            sig_in_stop.0.lock().expect("lock").started = true;
+        },
+    );
+    assert!(
+        res.is_ok(),
+        "writer starting during stop teardown must return Ok so staging is preserved"
+    );
+
+    // Case 2: `wait_for_capture_start_with_interrupt` sees `started == false`, invokes stop
+    // closure, and `did_start` arrives mid-stop -> must re-check after stop and return Ok(()).
+    let (_tx, rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let cancelled = AtomicBool::new(false);
+    let started_flag = Arc::new(AtomicBool::new(false));
+    let started_read = Arc::clone(&started_flag);
+    let started_in_stop = Arc::clone(&started_flag);
+    let res_start_wait = wait_for_capture_start_with_interrupt(
+        &rx,
+        Duration::from_secs(1),
+        &cancelled,
+        || Some("interrupted: screen locked".to_string()),
+        move || started_read.load(Ordering::Acquire),
+        move || {
+            started_in_stop.store(true, Ordering::Release);
+        },
+    );
+    assert!(
+        res_start_wait.is_ok(),
+        "writer starting during capture-start stop teardown must return Ok so staging is preserved"
+    );
+}

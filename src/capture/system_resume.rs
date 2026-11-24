@@ -1,6 +1,8 @@
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use block2::RcBlock;
 use objc2::rc::{Retained, autoreleasepool};
@@ -10,11 +12,11 @@ use objc2_app_kit::{
     NSWorkspaceSessionDidBecomeActiveNotification,
 };
 use objc2_foundation::{
-    NSDistributedNotificationCenter, NSNotification, NSNotificationName, NSObjectProtocol,
-    NSOperationQueue, NSString,
+    NSDate, NSDefaultRunLoopMode, NSDistributedNotificationCenter, NSNotification,
+    NSNotificationName, NSObjectProtocol, NSOperationQueue, NSRunLoop, NSString,
 };
 
-use super::{InterruptLatch, SystemInterruptReason, current_session_interrupt};
+use super::{InterruptLatch, SessionProbeState, SystemInterruptReason, current_session_state};
 
 const DISTRIBUTED_SCREEN_UNLOCKED_NAME: &str = "com.apple.screenIsUnlocked";
 
@@ -27,23 +29,26 @@ pub(crate) fn handle_distributed_lock_notification<P>(
     mut session_probe: P,
 ) -> Option<SystemInterruptReason>
 where
-    P: FnMut() -> Option<SystemInterruptReason>,
+    P: FnMut() -> SessionProbeState,
 {
-    let verified = session_probe()?;
+    let SessionProbeState::Interrupted(verified) = session_probe() else {
+        return None;
+    };
     let _ = latch.trigger(verified);
     latch.reason()
 }
 
 /// Verifies an untrusted distributed `com.apple.screenIsUnlocked` notification against
-/// WindowServer before recording resume state.
+/// WindowServer before recording resume state. Fails closed on both `Interrupted` and
+/// `Unavailable` (e.g. NULL dictionary or missing console keys).
 pub(crate) fn handle_distributed_unlock_notification<P>(
     latch: &InterruptLatch,
     mut session_probe: P,
 ) -> bool
 where
-    P: FnMut() -> Option<SystemInterruptReason>,
+    P: FnMut() -> SessionProbeState,
 {
-    if session_probe().is_some() {
+    if session_probe() != SessionProbeState::ActiveUnlocked {
         return false;
     }
     latch.note_resumed();
@@ -83,7 +88,7 @@ pub(super) fn make_verified_bg_lock_block(
 ) -> RcBlock<dyn Fn(NonNull<NSNotification>)> {
     RcBlock::new(move |_note: NonNull<NSNotification>| {
         autoreleasepool(|_| {
-            let _ = handle_distributed_lock_notification(&latch, current_session_interrupt);
+            let _ = handle_distributed_lock_notification(&latch, current_session_state);
         });
     })
 }
@@ -96,7 +101,7 @@ pub(super) fn make_verified_ui_lock_block(
     RcBlock::new(move |_note: NonNull<NSNotification>| {
         autoreleasepool(|_| {
             if let Some(effective) =
-                handle_distributed_lock_notification(&latch, current_session_interrupt)
+                handle_distributed_lock_notification(&latch, current_session_state)
             {
                 if !ui_fired.swap(true, Ordering::AcqRel) {
                     on_main(effective);
@@ -117,8 +122,7 @@ pub(super) fn register_bg_resume_observers(
     let latch_unlock = latch.clone();
     let dist_block = RcBlock::new(move |_note: NonNull<NSNotification>| {
         autoreleasepool(|_| {
-            let _ =
-                handle_distributed_unlock_notification(&latch_unlock, current_session_interrupt);
+            let _ = handle_distributed_unlock_notification(&latch_unlock, current_session_state);
         });
     });
     let dist_tokens = vec![unsafe {
@@ -208,9 +212,9 @@ impl UnlockMonitor {
         let flag_dist = resumed.clone();
         let b_dist = RcBlock::new(move |_note: NonNull<NSNotification>| {
             autoreleasepool(|_| {
-                // Verify untrusted distributed unlock against live `CGSession` state before
-                // marking resumed or flushing deferred alerts.
-                if current_session_interrupt().is_none() {
+                // Verify untrusted distributed unlock against live `CGSession` state; fail closed
+                // if the session is still locked or WindowServer state is unavailable.
+                if current_session_state() == SessionProbeState::ActiveUnlocked {
                     flag_dist.mark_resumed();
                     f_dist();
                 }
@@ -274,6 +278,26 @@ impl Drop for UnlockMonitor {
             unsafe {
                 ws_center.removeObserver(token.as_ref());
             }
+        }
+    }
+}
+
+/// Pumps the current thread's `NSRunLoop` up to `duration` so CLI sessions receive macOS
+/// workspace/distributed notifications without busy-spinning when no sources are pending.
+pub fn pump_current_runloop(duration: Duration) {
+    if duration.is_zero() {
+        return;
+    }
+    let started = Instant::now();
+    autoreleasepool(|_| {
+        let limit = NSDate::dateWithTimeIntervalSinceNow(duration.as_secs_f64());
+        let rl = NSRunLoop::currentRunLoop();
+        let _ = rl.runMode_beforeDate(unsafe { NSDefaultRunLoopMode }, &limit);
+    });
+    let elapsed = started.elapsed();
+    if let Some(rem) = duration.checked_sub(elapsed) {
+        if !rem.is_zero() {
+            thread::sleep(rem);
         }
     }
 }

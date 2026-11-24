@@ -149,9 +149,9 @@ impl SendableStreamStop {
 
 /// Coordinates a potentially delayed `startCaptureWithCompletionHandler` result with concurrent
 /// system-interrupt cancellation so startup never blocks 8 seconds on lock/sleep and late start
-/// completions can never leave a stream running. If the hardware recording writer has already
-/// started writing frames (`writer_started()`), returns `Ok(())` so the caller hands ownership of
-/// `staging` to normal stop/recovery instead of dropping captured footage.
+/// completions can never leave a stream running. Checks `writer_started()` AFTER stop teardown
+/// completes so even if `recordingOutputDidStartRecording:` fires mid-stop, ownership of `staging`
+/// stays with `RecordingSession` for normal stop/recovery instead of dropping captured footage.
 pub(super) fn wait_for_capture_start_with_interrupt<F, W, S>(
     rx: &mpsc::Receiver<Result<(), String>>,
     timeout: Duration,
@@ -168,32 +168,36 @@ where
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(msg) = check_interrupted() {
+            if !writer_started() {
+                cancelled_after_start.store(true, Ordering::Release);
+            }
+            trigger_immediate_stop();
             if writer_started() {
-                trigger_immediate_stop();
                 return Ok(());
             }
-            cancelled_after_start.store(true, Ordering::Release);
-            trigger_immediate_stop();
             return Err(msg);
         }
         let rem = deadline.saturating_duration_since(Instant::now());
         if rem.is_zero() {
+            if !writer_started() {
+                cancelled_after_start.store(true, Ordering::Release);
+            }
+            trigger_immediate_stop();
             if writer_started() {
                 return Ok(());
             }
-            cancelled_after_start.store(true, Ordering::Release);
-            trigger_immediate_stop();
             return Err("Timed out starting ScreenCaptureKit stream".to_string());
         }
         match rx.recv_timeout(rem.min(Duration::from_millis(25))) {
             Ok(Ok(())) => {
                 if let Some(msg) = check_interrupted() {
+                    if !writer_started() {
+                        cancelled_after_start.store(true, Ordering::Release);
+                    }
+                    trigger_immediate_stop();
                     if writer_started() {
-                        trigger_immediate_stop();
                         return Ok(());
                     }
-                    cancelled_after_start.store(true, Ordering::Release);
-                    trigger_immediate_stop();
                     return Err(msg);
                 }
                 return Ok(());
@@ -201,11 +205,13 @@ where
             Ok(Err(err)) => return Err(err),
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if !writer_started() {
+                    cancelled_after_start.store(true, Ordering::Release);
+                }
+                trigger_immediate_stop();
                 if writer_started() {
                     return Ok(());
                 }
-                cancelled_after_start.store(true, Ordering::Release);
-                trigger_immediate_stop();
                 return Err("ScreenCaptureKit start handler disconnected".to_string());
             }
         }
@@ -305,6 +311,10 @@ where
         if let Some(msg) = check_interrupted() {
             drop(guard);
             trigger_stop();
+            // Re-check `started` AFTER stop teardown in case `did_start` arrived mid-stop.
+            if lock.lock().map(|g| g.started).unwrap_or(false) {
+                return Ok(());
+            }
             return Err(msg);
         }
         let rem = deadline.saturating_duration_since(Instant::now());
@@ -326,10 +336,16 @@ where
     if let Some(err) = guard.error.clone() {
         drop(guard);
         trigger_stop();
+        if lock.lock().map(|g| g.started).unwrap_or(false) {
+            return Ok(());
+        }
         return Err(format!("Recording output failed to start: {err}"));
     }
     drop(guard);
     trigger_stop();
+    if lock.lock().map(|g| g.started).unwrap_or(false) {
+        return Ok(());
+    }
     Err("Timed out waiting for hardware recording writer to start".to_string())
 }
 

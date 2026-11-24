@@ -81,20 +81,41 @@ fn watchdog_triggers_stop_hook_while_main_thread_is_blocked() {
 }
 
 #[test]
-fn evaluate_session_lock_flags_detects_lock_and_console_resign() {
-    assert_eq!(evaluate_session_lock_flags(None, None), None);
-    assert_eq!(evaluate_session_lock_flags(Some(false), Some(true)), None);
+fn evaluate_session_state_distinguishes_unlocked_locked_resigned_and_unavailable() {
+    // NULL dictionary or missing console key must be `Unavailable`, NEVER `ActiveUnlocked`.
     assert_eq!(
-        evaluate_session_lock_flags(Some(true), Some(true)),
-        Some(SystemInterruptReason::ScreenLocked)
+        evaluate_session_state(false, None, None),
+        SessionProbeState::Unavailable
     );
     assert_eq!(
-        evaluate_session_lock_flags(Some(false), Some(false)),
-        Some(SystemInterruptReason::SessionResigned)
+        evaluate_session_state(true, None, None),
+        SessionProbeState::Unavailable
     );
     assert_eq!(
-        evaluate_session_lock_flags(Some(true), Some(false)),
-        Some(SystemInterruptReason::ScreenLocked)
+        evaluate_session_state(true, Some(false), None),
+        SessionProbeState::Unavailable
+    );
+    // Active unlocked desktop console (macOS omits `CGSSessionScreenIsLocked` before first lock).
+    assert_eq!(
+        evaluate_session_state(true, None, Some(true)),
+        SessionProbeState::ActiveUnlocked
+    );
+    assert_eq!(
+        evaluate_session_state(true, Some(false), Some(true)),
+        SessionProbeState::ActiveUnlocked
+    );
+    // Locked or console-resigned states.
+    assert_eq!(
+        evaluate_session_state(true, Some(true), Some(true)),
+        SessionProbeState::Interrupted(SystemInterruptReason::ScreenLocked)
+    );
+    assert_eq!(
+        evaluate_session_state(true, Some(false), Some(false)),
+        SessionProbeState::Interrupted(SystemInterruptReason::SessionResigned)
+    );
+    assert_eq!(
+        evaluate_session_state(true, Some(true), Some(false)),
+        SessionProbeState::Interrupted(SystemInterruptReason::ScreenLocked)
     );
 }
 
@@ -127,26 +148,40 @@ fn spoofed_distributed_lock_and_unlock_notifications_are_ignored_when_session_di
         stop_clone.fetch_add(1, Ordering::SeqCst);
     }));
 
-    // Spoofed `com.apple.screenIsLocked` while WindowServer says session is active/unlocked -> ignored!
-    assert_eq!(handle_distributed_lock_notification(&latch, || None), None);
+    // Spoofed `com.apple.screenIsLocked` while unlocked or unavailable -> ignored!
+    assert_eq!(
+        handle_distributed_lock_notification(&latch, || SessionProbeState::ActiveUnlocked),
+        None
+    );
+    assert_eq!(
+        handle_distributed_lock_notification(&latch, || SessionProbeState::Unavailable),
+        None
+    );
     assert!(!latch.is_interrupted());
     assert_eq!(stop_calls.load(Ordering::SeqCst), 0);
 
     // Genuine lock confirmed by WindowServer -> latches and fires stop hook once.
     assert_eq!(
-        handle_distributed_lock_notification(&latch, || Some(SystemInterruptReason::ScreenLocked)),
+        handle_distributed_lock_notification(&latch, || SessionProbeState::Interrupted(
+            SystemInterruptReason::ScreenLocked
+        )),
         Some(SystemInterruptReason::ScreenLocked)
     );
     assert_eq!(stop_calls.load(Ordering::SeqCst), 1);
 
-    // Spoofed `com.apple.screenIsUnlocked` while WindowServer says still locked -> ignored!
+    // Spoofed `com.apple.screenIsUnlocked` while locked OR while session state is Unavailable -> ignored!
     assert!(!handle_distributed_unlock_notification(&latch, || {
-        Some(SystemInterruptReason::ScreenLocked)
+        SessionProbeState::Interrupted(SystemInterruptReason::ScreenLocked)
+    }));
+    assert!(!handle_distributed_unlock_notification(&latch, || {
+        SessionProbeState::Unavailable
     }));
     assert!(!latch.has_resumed_after_interrupt());
 
-    // Genuine unlock confirmed by WindowServer -> marks resumed.
-    assert!(handle_distributed_unlock_notification(&latch, || None));
+    // Genuine unlock confirmed by WindowServer (`ActiveUnlocked`) -> marks resumed.
+    assert!(handle_distributed_unlock_notification(&latch, || {
+        SessionProbeState::ActiveUnlocked
+    }));
     assert!(latch.has_resumed_after_interrupt());
 }
 
