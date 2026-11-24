@@ -4,6 +4,7 @@ mod filter;
 pub mod recorder;
 pub mod shareable;
 pub mod timelapse;
+mod timelapse_frame;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -133,6 +134,15 @@ pub struct CaptureConfig {
     pub source_app_name: Option<String>,
 }
 
+/// Final result of a completed recording session.
+/// When `partial_error` is `Some`, already-captured frames were still finalized and committed to
+/// `output_path`, while callers must surface the early-stop error to the user / exit non-zero.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordingOutcome {
+    pub output_path: PathBuf,
+    pub partial_error: Option<String>,
+}
+
 /// Unified handle for either real-time (`SCRecordingOutput`) or interval timelapse capture.
 pub enum ActiveRecording {
     RealTime(RecordingSession),
@@ -186,9 +196,12 @@ impl ActiveRecording {
         }
     }
 
-    pub fn stop(self) -> Result<PathBuf, String> {
+    pub fn stop(self) -> Result<RecordingOutcome, String> {
         match self {
-            Self::RealTime(s) => s.stop(),
+            Self::RealTime(s) => Ok(RecordingOutcome {
+                output_path: s.stop()?,
+                partial_error: None,
+            }),
             Self::Timelapse(s) => s.stop(),
         }
     }
@@ -202,9 +215,12 @@ impl PendingStop {
         }
     }
 
-    pub fn finish(self) -> Result<PathBuf, String> {
+    pub fn finish(self) -> Result<RecordingOutcome, String> {
         match self {
-            Self::RealTime(p) => p.finish(),
+            Self::RealTime(p) => Ok(RecordingOutcome {
+                output_path: p.finish()?,
+                partial_error: None,
+            }),
             Self::Timelapse(p) => p.finish(),
         }
     }

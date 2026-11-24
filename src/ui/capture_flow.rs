@@ -354,11 +354,20 @@ pub(crate) fn stop_active_recording(mtm: MainThreadMarker, runtime: &Rc<RefCell<
         };
         let app_name = captured_cell.borrow_mut().take();
         match pending.finish() {
-            Ok(saved_path) => {
+            Ok(outcome) => {
                 if let Err(err) =
-                    open_editor_for_file(m, &rt_poll, &saved_path, app_name, tutorial_gen)
+                    open_editor_for_file(m, &rt_poll, &outcome.output_path, app_name, tutorial_gen)
                 {
                     show_error_alert(m, "Failed Opening Editor", &err);
+                }
+                if let Some(partial_err) = outcome.partial_error {
+                    show_error_alert(
+                        m,
+                        "Recording Stopped Early",
+                        &format!(
+                            "Captured frames were saved and opened in the editor, but recording ended early: {partial_err}"
+                        ),
+                    );
                 }
             }
             Err(err) => show_error_alert(m, "Recording Error", &err),

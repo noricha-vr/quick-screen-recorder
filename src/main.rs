@@ -1,6 +1,6 @@
 use std::process::ExitCode;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use quick_screen_recorder::capture::shareable::query_shareable_content;
 use quick_screen_recorder::capture::{ActiveRecording, CaptureConfig, CaptureTarget};
@@ -122,9 +122,18 @@ fn execute(command: Command) -> Result<(), String> {
                 source_app_name: None,
             };
             let session = ActiveRecording::start(&cfg, &output)?;
-            thread::sleep(Duration::from_secs_f64(duration_sec));
-            let saved = session.stop()?;
-            let safe_saved = sanitize_terminal_text(&saved.display().to_string(), false);
+            let deadline = Instant::now() + Duration::from_secs_f64(duration_sec);
+            while Instant::now() < deadline && !session.has_ended_unexpectedly() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                thread::sleep(remaining.min(Duration::from_millis(250)));
+            }
+            let outcome = session.stop()?;
+            let safe_saved =
+                sanitize_terminal_text(&outcome.output_path.display().to_string(), false);
+            if let Some(partial_err) = outcome.partial_error {
+                println!("Saved partial recording -> {safe_saved}");
+                return Err(partial_err);
+            }
             println!("Recorded -> {safe_saved}");
             Ok(())
         }
