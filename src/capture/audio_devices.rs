@@ -221,4 +221,38 @@ mod tests {
         let (_, idx_off) = build_mic_menu_model(&MicInputPreference::Off, &devs);
         assert_eq!(idx_off, 0);
     }
+
+    #[test]
+    fn mic_menu_model_keeps_duplicate_and_reserved_names_distinct_by_id() {
+        let devs = vec![
+            MicDeviceInfo {
+                id: "dev-a".into(),
+                name: "Off".into(),
+                is_default: true,
+            },
+            MicDeviceInfo {
+                id: "dev-b".into(),
+                name: "Off".into(),
+                is_default: false,
+            },
+        ];
+        let (items, idx_b) = build_mic_menu_model(
+            &MicInputPreference::Device {
+                id: "dev-b".into(),
+                name: "Off".into(),
+            },
+            &devs,
+        );
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0], MicMenuItem::Off);
+        assert_eq!(items[1].menu_title(), "System (Off)");
+        assert_eq!(idx_b, 3);
+        assert_eq!(
+            items[idx_b].to_preference(),
+            MicInputPreference::Device {
+                id: "dev-b".into(),
+                name: "Off".into(),
+            }
+        );
+    }
 }

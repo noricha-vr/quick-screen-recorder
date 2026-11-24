@@ -324,8 +324,8 @@ fn end_to_end_native_exports_codec_resize_metadata_and_telemetry() {
 
         let out_webm = work.join("out.webm");
         let webm_res = run_export(&ExportRequest {
-            input: rotated_audio_mp4,
-            output: out_webm,
+            input: rotated_audio_mp4.clone(),
+            output: out_webm.clone(),
             format: ExportFormat::Webm,
             fps: 24,
             start_sec: Some(0.0),
@@ -335,6 +335,27 @@ fn end_to_end_native_exports_codec_resize_metadata_and_telemetry() {
         })
         .expect("export muted webm");
         assert!(webm_res.output_bytes > 500);
+        // Confirm ffmpeg probe detects audio in the input, and finds ZERO audio streams in the muted WebM.
+        let src_has_audio_probe = Command::new(&ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(&rotated_audio_mp4)
+            .args(["-map", "0:a:0", "-t", "0.1", "-f", "null", "-"])
+            .output()
+            .expect("probe source audio via ffmpeg");
+        assert!(
+            src_has_audio_probe.status.success(),
+            "sanity check: source fixture must have an audio stream"
+        );
+        let webm_has_audio_probe = Command::new(&ffmpeg)
+            .args(["-v", "error", "-i"])
+            .arg(&out_webm)
+            .args(["-map", "0:a:0", "-f", "null", "-"])
+            .output()
+            .expect("probe muted webm audio via ffmpeg");
+        assert!(
+            !webm_has_audio_probe.status.success(),
+            "mute_audio=true WebM output must contain zero audio streams"
+        );
         expected_events += 1;
     }
 

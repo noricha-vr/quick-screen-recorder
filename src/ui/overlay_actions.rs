@@ -4,7 +4,7 @@ use std::rc::Rc;
 use objc2::MainThreadMarker;
 use objc2::rc::Retained;
 use objc2_app_kit::{NSPopUpButton, NSScreen, NSTextField, NSView, NSWindow};
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSPoint, NSRect, NSSize};
 
 use crate::capture::{AudioCaptureMode, CaptureConfig, CaptureTarget};
 use crate::config::Preferences;
@@ -12,7 +12,9 @@ use crate::geometry::{AspectRatio, Rect, apply_aspect_to_rect, compute_toolbar_o
 use crate::ui::overlay::{
     OverlayState, SelectionMode, StartCaptureCallback, extract_nsscreen_display_id, nsrect_to_rect,
 };
-use crate::ui::overlay_toolbar::{OverlayToolbarActions, TOOLBAR_H, TOOLBAR_W, ToolbarActionIvars};
+use crate::ui::overlay_toolbar::{
+    OverlayToolbarActions, TOOLBAR_H, TOOLBAR_W, ToolbarActionIvars, append_tagged_popup_item,
+};
 
 #[allow(clippy::too_many_arguments)]
 pub fn build_toolbar_actions(
@@ -94,10 +96,19 @@ pub fn build_toolbar_actions(
                     }
                     SelectionMode::Window => {
                         if st.windows.is_empty() {
-                            tp_mode.addItemWithTitle(&NSString::from_str("No windows available"));
+                            if let Some(m) = MainThreadMarker::new() {
+                                append_tagged_popup_item(m, &tp_mode, "No windows available", -1);
+                            }
                         } else {
-                            for w in &st.windows {
-                                tp_mode.addItemWithTitle(&NSString::from_str(&w.display_label()));
+                            if let Some(m) = MainThreadMarker::new() {
+                                for (i, w) in st.windows.iter().enumerate() {
+                                    append_tagged_popup_item(
+                                        m,
+                                        &tp_mode,
+                                        &w.display_label(),
+                                        i as isize,
+                                    );
+                                }
                             }
                             let idx = st.selected_window_idx.min(st.windows.len() - 1);
                             tp_mode.selectItemAtIndex(idx as isize);
@@ -118,13 +129,15 @@ pub fn build_toolbar_actions(
                         }
                     }
                     SelectionMode::Screen => {
-                        for (i, d) in st.displays.iter().enumerate() {
-                            tp_mode.addItemWithTitle(&NSString::from_str(&format!(
-                                "Display {} ({}×{})",
-                                i + 1,
-                                d.width,
-                                d.height
-                            )));
+                        if let Some(m) = MainThreadMarker::new() {
+                            for (i, d) in st.displays.iter().enumerate() {
+                                append_tagged_popup_item(
+                                    m,
+                                    &tp_mode,
+                                    &format!("Display {} ({}×{})", i + 1, d.width, d.height),
+                                    i as isize,
+                                );
+                            }
                         }
                         if st.screen_display_id != st.overlay_display_id && !st.demo_backdrop {
                             let target_did = st.screen_display_id;
@@ -170,9 +183,12 @@ pub fn build_toolbar_actions(
                 cv_size.setNeedsDisplay(true);
             }),
             on_target_pick: Box::new(move |idx| {
+                if idx < 0 {
+                    return;
+                }
                 let mut st = st_pick.borrow_mut();
                 let is_demo = st.demo_backdrop;
-                let u = idx.max(0) as usize;
+                let u = idx as usize;
                 match st.mode {
                     SelectionMode::Window => {
                         if st.window_overlay_rect(u).is_none() && !st.demo_backdrop {
@@ -215,8 +231,11 @@ pub fn build_toolbar_actions(
                 st_sys_audio.borrow_mut().capture_system_audio = on;
             }),
             on_mic: Box::new(move |idx| {
+                if idx < 0 {
+                    return;
+                }
                 let mut st = st_mic.borrow_mut();
-                if let Some(item) = st.mic_items.get(idx.max(0) as usize) {
+                if let Some(item) = st.mic_items.get(idx as usize) {
                     st.mic_input = item.to_preference();
                 }
             }),

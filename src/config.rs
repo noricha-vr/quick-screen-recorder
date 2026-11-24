@@ -16,29 +16,43 @@ use crate::geometry::{AspectRatio, Rect};
 pub const APP_SUPPORT_DIR_NAME: &str = "QuickScreenRecorder";
 const MAX_PREFS_BYTES: u64 = 65_536;
 
-const fn default_true() -> bool {
-    true
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct Preferences {
     pub fps: u32,
     pub show_cursor: bool,
     pub highlight_clicks: bool,
     pub audio_mode: AudioCaptureMode,
-    #[serde(default = "default_true")]
     pub capture_system_audio: bool,
-    #[serde(default)]
     pub mic_input: MicInputPreference,
     pub aspect_ratio: AspectRatio,
     pub last_region: Rect,
     pub recording_codec: RecordingCodec,
     pub default_export_format: ExportFormat,
     pub export_max_width: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub export_dir: Option<PathBuf>,
-    #[serde(default)]
     pub onboarding_completed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPreferences {
+    fps: u32,
+    show_cursor: bool,
+    highlight_clicks: bool,
+    audio_mode: AudioCaptureMode,
+    #[serde(default)]
+    capture_system_audio: Option<bool>,
+    #[serde(default)]
+    mic_input: Option<MicInputPreference>,
+    aspect_ratio: AspectRatio,
+    last_region: Rect,
+    recording_codec: RecordingCodec,
+    default_export_format: ExportFormat,
+    export_max_width: Option<u32>,
+    #[serde(default)]
+    export_dir: Option<PathBuf>,
+    #[serde(default)]
+    onboarding_completed: bool,
 }
 
 impl Default for Preferences {
@@ -62,6 +76,17 @@ impl Default for Preferences {
 }
 
 impl Preferences {
+    /// Fail-closed defaults used when an existing preferences file cannot be read or parsed safely,
+    /// ensuring corrupted/tampered config never silently enables system audio or microphone capture.
+    pub fn fail_closed_defaults() -> Self {
+        Self {
+            audio_mode: AudioCaptureMode::None,
+            capture_system_audio: false,
+            mic_input: MicInputPreference::Off,
+            ..Self::default()
+        }
+    }
+
     /// Resolves the pre-selected persistent export destination directory, defaulting to `~/Movies/Quick Screen Recorder`.
     pub fn resolved_export_dir(&self) -> Option<PathBuf> {
         if let Some(dir) = &self.export_dir {
@@ -71,6 +96,7 @@ impl Preferences {
         }
         default_movies_export_dir()
     }
+
     pub fn default_path() -> Option<PathBuf> {
         let home = valid_home_dir()?;
         Some(
@@ -82,9 +108,18 @@ impl Preferences {
     }
 
     pub fn load() -> Self {
-        Self::default_path()
-            .and_then(|p| Self::load_from(&p).ok())
-            .unwrap_or_default()
+        match Self::default_path() {
+            Some(path) => Self::load_or_default_at(&path),
+            None => Self::fail_closed_defaults(),
+        }
+    }
+
+    pub fn load_or_default_at(path: &Path) -> Self {
+        match Self::load_from(path) {
+            Ok(prefs) => prefs,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Self::default(),
+            Err(_) => Self::fail_closed_defaults(),
+        }
     }
 
     pub fn load_from(path: &Path) -> io::Result<Self> {
@@ -110,20 +145,42 @@ impl Preferences {
             ));
         }
 
-        let mut prefs: Self = serde_json::from_str(&raw)
+        let parsed: RawPreferences = serde_json::from_str(&raw)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        prefs.fps = match prefs.fps {
-            15 | 24 | 30 | 60 | 120 => prefs.fps,
+
+        // Migrate legacy v0.3 preferences cleanly from `audio_mode` so previously disabled audio stays OFF.
+        let capture_system_audio = parsed
+            .capture_system_audio
+            .unwrap_or_else(|| parsed.audio_mode.captures_system());
+        let mic_input = parsed.mic_input.unwrap_or_else(|| {
+            if parsed.audio_mode.captures_mic() {
+                MicInputPreference::SystemDefault
+            } else {
+                MicInputPreference::Off
+            }
+        });
+        let audio_mode = AudioCaptureMode::from_split(capture_system_audio, mic_input.is_enabled());
+        let fps = match parsed.fps {
+            15 | 24 | 30 | 60 | 120 => parsed.fps,
             _ => 60,
         };
-        if prefs
-            .export_dir
-            .as_ref()
-            .is_some_and(|p| !is_usable_export_dir(p))
-        {
-            prefs.export_dir = None;
-        }
-        Ok(prefs)
+        let export_dir = parsed.export_dir.filter(|dir| is_usable_export_dir(dir));
+
+        Ok(Self {
+            fps,
+            show_cursor: parsed.show_cursor,
+            highlight_clicks: parsed.highlight_clicks,
+            audio_mode,
+            capture_system_audio,
+            mic_input,
+            aspect_ratio: parsed.aspect_ratio,
+            last_region: parsed.last_region,
+            recording_codec: parsed.recording_codec,
+            default_export_format: parsed.default_export_format,
+            export_max_width: parsed.export_max_width,
+            export_dir,
+            onboarding_completed: parsed.onboarding_completed,
+        })
     }
 
     pub fn save(&self) -> io::Result<()> {
@@ -163,6 +220,22 @@ impl Preferences {
 mod tests {
     use super::*;
 
+    fn legacy_json_with_audio(audio_mode: &str) -> String {
+        format!(
+            r#"{{
+                "fps": 60,
+                "show_cursor": true,
+                "highlight_clicks": false,
+                "audio_mode": "{audio_mode}",
+                "aspect_ratio": "free",
+                "last_region": {{"x": 100.0, "y": 100.0, "width": 800.0, "height": 600.0}},
+                "recording_codec": "h264",
+                "default_export_format": "mp4",
+                "export_max_width": null
+            }}"#
+        )
+    }
+
     #[test]
     fn preferences_round_trip_and_rejects_symlinks() {
         let dir = std::env::temp_dir().join(format!(
@@ -195,10 +268,6 @@ mod tests {
 
         let custom_dir = dir.join("exports");
         std::fs::create_dir_all(&custom_dir).expect("mkdir exports");
-        std::os::unix::fs::PermissionsExt::set_mode(
-            &mut std::fs::metadata(&custom_dir).unwrap().permissions(),
-            0o700,
-        );
         std::fs::set_permissions(
             &custom_dir,
             std::os::unix::fs::PermissionsExt::from_mode(0o700),
@@ -235,24 +304,74 @@ mod tests {
         assert_eq!(live.recording_codec, RecordingCodec::Hevc);
         assert!(live.onboarding_completed);
 
-        // Legacy v0.3 preferences JSON lacking split audio fields defaults to system audio ON + SystemDefault mic
-        let legacy_json = r#"{
-            "fps": 60,
-            "show_cursor": true,
-            "highlight_clicks": false,
-            "audio_mode": "none",
-            "aspect_ratio": "free",
-            "last_region": {"x": 100.0, "y": 100.0, "width": 800.0, "height": 600.0},
-            "recording_codec": "h264",
-            "default_export_format": "mp4",
-            "export_max_width": null
-        }"#;
-        let legacy_path = dir.join("legacy.json");
-        atomic_write_private(&legacy_path, legacy_json.as_bytes()).expect("write legacy");
-        let migrated = Preferences::load_from(&legacy_path).expect("load legacy");
-        assert!(migrated.capture_system_audio);
-        assert_eq!(migrated.mic_input, MicInputPreference::SystemDefault);
-        assert_eq!(migrated.effective_audio_mode(), AudioCaptureMode::Both);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_audio_migration_preserves_off_and_corrupt_file_fails_closed() {
+        let dir = std::env::temp_dir().join(format!(
+            "qsr-prefs-mig-{}",
+            crate::fs_safety::random_hex_token()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        // Brand-new install (missing file) gets new v0.4.0 defaults (System Audio ON + System Default Mic)
+        let missing = dir.join("does-not-exist.json");
+        let fresh = Preferences::load_or_default_at(&missing);
+        assert!(fresh.capture_system_audio);
+        assert_eq!(fresh.mic_input, MicInputPreference::SystemDefault);
+        assert_eq!(fresh.audio_mode, AudioCaptureMode::Both);
+
+        // Legacy v0.3 preferences preserve each historical audio_mode without turning audio back ON
+        let cases = [
+            (
+                "none",
+                false,
+                MicInputPreference::Off,
+                AudioCaptureMode::None,
+            ),
+            (
+                "system_audio",
+                true,
+                MicInputPreference::Off,
+                AudioCaptureMode::SystemAudio,
+            ),
+            (
+                "microphone",
+                false,
+                MicInputPreference::SystemDefault,
+                AudioCaptureMode::Microphone,
+            ),
+            (
+                "both",
+                true,
+                MicInputPreference::SystemDefault,
+                AudioCaptureMode::Both,
+            ),
+        ];
+        for (mode_str, exp_sys, exp_mic, exp_mode) in cases {
+            let p = dir.join(format!("legacy-{mode_str}.json"));
+            atomic_write_private(&p, legacy_json_with_audio(mode_str).as_bytes()).expect("write");
+            let loaded = Preferences::load_from(&p).expect("load legacy");
+            assert_eq!(loaded.capture_system_audio, exp_sys, "mode={mode_str}");
+            assert_eq!(loaded.mic_input, exp_mic, "mode={mode_str}");
+            assert_eq!(loaded.audio_mode, exp_mode, "mode={mode_str}");
+        }
+
+        // Corrupted existing config fails closed with audio OFF
+        let corrupt = dir.join("corrupt.json");
+        atomic_write_private(&corrupt, b"{not-valid-json").expect("write corrupt");
+        let recovered = Preferences::load_or_default_at(&corrupt);
+        assert!(!recovered.capture_system_audio);
+        assert_eq!(recovered.mic_input, MicInputPreference::Off);
+        assert_eq!(recovered.audio_mode, AudioCaptureMode::None);
+
+        // Symlinked config also fails closed with audio OFF
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink(&corrupt, &link).expect("symlink");
+        let from_link = Preferences::load_or_default_at(&link);
+        assert!(!from_link.capture_system_audio);
+        assert_eq!(from_link.mic_input, MicInputPreference::Off);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

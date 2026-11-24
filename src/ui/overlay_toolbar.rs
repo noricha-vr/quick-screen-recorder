@@ -3,8 +3,8 @@ use objc2::runtime::AnyObject;
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSBox, NSBoxType, NSButton, NSColor, NSControlStateValueOff, NSControlStateValueOn, NSFont,
-    NSPopUpButton, NSSegmentSwitchTracking, NSSegmentedControl, NSTextAlignment, NSTextField,
-    NSView,
+    NSMenuItem, NSPopUpButton, NSSegmentSwitchTracking, NSSegmentedControl, NSTextAlignment,
+    NSTextField, NSView,
 };
 use objc2_foundation::{NSArray, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString};
 
@@ -52,7 +52,11 @@ define_class!(
         }
         #[unsafe(method(targetPicked:))]
         fn target_picked(&self, sender: &NSPopUpButton) {
-            (self.ivars().on_target_pick)(sender.indexOfSelectedItem());
+            let tag = sender
+                .selectedItem()
+                .map(|mi| mi.tag())
+                .unwrap_or_else(|| sender.indexOfSelectedItem());
+            (self.ivars().on_target_pick)(tag);
         }
         #[unsafe(method(fpsChanged:))]
         fn fps_changed(&self, sender: &NSPopUpButton) {
@@ -64,7 +68,11 @@ define_class!(
         }
         #[unsafe(method(micChanged:))]
         fn mic_changed(&self, sender: &NSPopUpButton) {
-            (self.ivars().on_mic)(sender.indexOfSelectedItem());
+            let tag = sender
+                .selectedItem()
+                .map(|mi| mi.tag())
+                .unwrap_or_else(|| sender.indexOfSelectedItem());
+            (self.ivars().on_mic)(tag);
         }
         #[unsafe(method(cursorToggled:))]
         fn cursor_toggled(&self, sender: &NSButton) {
@@ -329,8 +337,8 @@ fn build_row_two(
     bar.addSubview(&mic_lbl);
 
     let mic_popup = NSPopUpButton::new(mtm);
-    for item in mic_items {
-        mic_popup.addItemWithTitle(&NSString::from_str(&item.menu_title()));
+    for (idx, item) in mic_items.iter().enumerate() {
+        append_tagged_popup_item(mtm, &mic_popup, &item.menu_title(), idx as isize);
     }
     if !mic_items.is_empty() {
         mic_popup.selectItemAtIndex(selected_mic_idx.min(mic_items.len() - 1) as isize);
@@ -403,6 +411,31 @@ fn build_row_two(
         NSSize::new(64.0, 20.0),
     ));
     bar.addSubview(&clicks_chk);
+}
+
+/// Appends an individual `NSMenuItem` directly to `popup.menu()` with an explicit `tag`.
+/// Unlike `NSPopUpButton::addItemWithTitle`, AppKit never deduplicates items added to the
+/// underlying `NSMenu`, so duplicate device/window titles or names matching `"Off"` cannot
+/// collapse entries or shift model indices.
+pub fn append_tagged_popup_item(
+    mtm: MainThreadMarker,
+    popup: &NSPopUpButton,
+    title: &str,
+    tag: isize,
+) {
+    let item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str(title),
+            None,
+            &NSString::from_str(""),
+        )
+    };
+    item.setTag(tag);
+    item.setEnabled(true);
+    if let Some(menu) = popup.menu() {
+        menu.addItem(&item);
+    }
 }
 
 fn add_v_sep(mtm: MainThreadMarker, bar: &NSView, x: f64) {

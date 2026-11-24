@@ -11,7 +11,7 @@ use objc2_core_media::{CMTime, CMTimeFlags};
 use objc2_foundation::{NSError, NSObject, NSObjectProtocol, NSString, NSURL};
 use objc2_screen_capture_kit::{
     SCRecordingOutput, SCRecordingOutputConfiguration, SCRecordingOutputDelegate, SCStream,
-    SCStreamConfiguration,
+    SCStreamConfiguration, SCStreamErrorCode,
 };
 
 use crate::capture::filter::build_filter_and_dimensions;
@@ -28,6 +28,8 @@ struct DelegateSignal {
     started: bool,
     finished: bool,
     error: Option<String>,
+    stream_stopped: bool,
+    stream_stop_error: Option<String>,
 }
 
 struct DelegateIvars {
@@ -309,12 +311,12 @@ impl RecordingSession {
                 let (guard, _) = cvar
                     .wait_timeout_while(guard, STOP_FALLBACK_AFTER, |s| !s.finished)
                     .map_err(|_| "Mutex poisoned")?;
-                if !guard.finished {
-                    drop(guard);
-                    pending.send_stop_capture();
-                    let guard = lock.lock().map_err(|_| "Mutex poisoned")?;
-                    let _ = cvar.wait_timeout_while(guard, STOP_TIMEOUT, |s| !s.finished);
-                }
+                drop(guard);
+                pending.send_stop_capture();
+                let remaining = STOP_TIMEOUT.saturating_sub(pending.stop_initiated_at.elapsed());
+                let guard = lock.lock().map_err(|_| "Mutex poisoned")?;
+                let _ = cvar
+                    .wait_timeout_while(guard, remaining, |s| !(s.finished && s.stream_stopped));
             }
         }
         pending.finish()
@@ -325,17 +327,48 @@ impl PendingRecordingStop {
     fn send_stop_capture(&mut self) {
         if !self.stop_capture_sent {
             self.stop_capture_sent = true;
+            let sig = Arc::clone(&self.signal);
+            let stop_block = RcBlock::new(move |err: *mut NSError| {
+                let stop_err = if !err.is_null() {
+                    let ns_err = unsafe { &*err };
+                    // `-3808` (AttemptToStopStreamState) means macOS already stopped the stream.
+                    if ns_err.code() == SCStreamErrorCode::AttemptToStopStreamState.0 {
+                        None
+                    } else {
+                        Some(ns_err.localizedDescription().to_string())
+                    }
+                } else {
+                    None
+                };
+                let (lock, cvar) = &*sig;
+                if let Ok(mut guard) = lock.lock() {
+                    guard.stream_stopped = true;
+                    if stop_err.is_some() {
+                        guard.stream_stop_error = stop_err;
+                    }
+                    cvar.notify_all();
+                }
+            });
             unsafe {
-                self.stream.stopCaptureWithCompletionHandler(None);
+                self.stream
+                    .stopCaptureWithCompletionHandler(Some(&stop_block));
             }
         }
     }
 
     /// Non-blocking poll designed for a short `NSTimer` tick on the main thread.
     pub fn poll(&mut self) -> StopPollState {
-        let finished = self.signal.0.lock().map(|g| g.finished).unwrap_or(true);
+        let (finished, stream_stopped) = self
+            .signal
+            .0
+            .lock()
+            .map(|g| (g.finished, g.stream_stopped))
+            .unwrap_or((true, true));
         if finished {
-            return StopPollState::Finished;
+            self.send_stop_capture();
+            if stream_stopped {
+                return StopPollState::Finished;
+            }
         }
         let elapsed = self.stop_initiated_at.elapsed();
         if !self.stop_capture_sent && elapsed >= STOP_FALLBACK_AFTER {
@@ -348,16 +381,28 @@ impl PendingRecordingStop {
         }
     }
 
-    /// Stops the underlying capture stream (if not already stopped), commits the finalized MP4,
-    /// and records local latency telemetry.
+    /// Stops the underlying capture stream (if not already stopped), verifies both trailer
+    /// finalization and stream stop completion, commits the MP4, and records local telemetry.
     pub fn finish(mut self) -> Result<PathBuf, String> {
         self.send_stop_capture();
-        let (finished, finish_err) = self
+        let (finished, finish_err, stream_stopped, stream_stop_err) = self
             .signal
             .0
             .lock()
-            .map(|g| (g.finished, g.error.clone()))
-            .unwrap_or((false, Some("Recording state lock poisoned".to_string())));
+            .map(|g| {
+                (
+                    g.finished,
+                    g.error.clone(),
+                    g.stream_stopped,
+                    g.stream_stop_error.clone(),
+                )
+            })
+            .unwrap_or((
+                false,
+                Some("Recording state lock poisoned".to_string()),
+                false,
+                None,
+            ));
 
         if let Some(err) = finish_err {
             self.record_perf(0, false);
@@ -368,6 +413,14 @@ impl PendingRecordingStop {
             return Err(
                 "Timed out waiting for MP4 recording output to flush container trailer".to_string(),
             );
+        }
+        if let Some(err) = stream_stop_err {
+            self.record_perf(0, false);
+            return Err(format!("Failed to stop screen/audio capture stream: {err}"));
+        }
+        if !stream_stopped {
+            self.record_perf(0, false);
+            return Err("Timed out confirming capture stream stopped".to_string());
         }
 
         let size = self.staging.commit()?;
