@@ -16,6 +16,7 @@ use crate::fs_safety::{
 #[path = "staging_io.rs"]
 mod io_helpers;
 
+pub use io_helpers::preserve_recording_on_quit;
 use io_helpers::{
     XdevTempGuard, copy_into_pinned_dir_overwrite, fstatat_overwrite_mode, rename_excl_within_dir,
     stage_once_on_dest_volume,

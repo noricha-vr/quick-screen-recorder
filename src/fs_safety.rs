@@ -263,11 +263,13 @@ pub(crate) fn prune_stale_cache_files_in(dir: &Path, max_age: Duration) {
         if !expired {
             continue;
         }
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
         if meta.is_file() {
-            let _ = fs::remove_file(entry.path());
+            if !name_str.starts_with("qsr-preserved-") {
+                let _ = fs::remove_file(entry.path());
+            }
         } else if meta.is_dir() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
             if name_str.starts_with(".qsr-work-") {
                 if let Ok(dfd) = OpenOptions::new()
                     .read(true)

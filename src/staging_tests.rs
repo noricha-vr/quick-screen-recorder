@@ -106,3 +106,56 @@ fn preserve_to_recovery_dir_and_retain_staged_survive_drop_and_cache_pruning() {
     let _ = fs::remove_dir_all(kept_dir);
     let _ = fs::remove_dir_all(&base);
 }
+
+#[test]
+fn quit_during_recording_preserves_video_in_recovery_and_excludes_from_temp_cleanup() {
+    let base = std::env::temp_dir().join(format!("qsr-quit-save-{}", random_hex_token()));
+    let cache_dir = base.join("cache");
+    let rec_dir = base.join("recovered");
+    fs::create_dir_all(&cache_dir).expect("mkdir cache");
+
+    let raw_out = cache_dir.join("capture-active.mp4");
+    let stale_other = cache_dir.join("capture-older.mp4");
+    fs::write(&raw_out, b"hours-of-timelapse-bytes").expect("write active");
+    fs::write(&stale_other, b"old-temp").expect("write stale");
+    let mut temp_files = vec![stale_other.clone(), raw_out.clone()];
+
+    let saved = preserve_recording_on_quit(&raw_out, &mut temp_files, Ok(rec_dir.clone()))
+        .expect("preserve recording on quit");
+    assert!(!temp_files.contains(&raw_out));
+    assert!(!raw_out.exists(), "source temp file should be moved out");
+
+    // Simulate finish_app_termination() draining temp_files.
+    for tmp in temp_files.drain(..) {
+        let _ = fs::remove_file(tmp);
+    }
+    assert!(
+        !stale_other.exists(),
+        "unrelated temp file should be cleaned"
+    );
+    assert_eq!(
+        fs::read(&saved).expect("read quit-saved recording"),
+        b"hours-of-timelapse-bytes"
+    );
+    assert_eq!(
+        fs::symlink_metadata(&saved).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    // If recovery move fails (symlinked recovery dir), raw_out must STILL be removed from
+    // temp_files and renamed to qsr-preserved-* so neither shutdown nor 24h pruning deletes it.
+    let raw_out2 = cache_dir.join("capture-fallback.mp4");
+    fs::write(&raw_out2, b"fallback-bytes").expect("write fallback");
+    let sym_rec = base.join("sym-rec");
+    std::os::unix::fs::symlink(&base, &sym_rec).expect("symlink");
+    let mut temp_files2 = vec![raw_out2.clone()];
+    let (_, kept_fallback) = preserve_recording_on_quit(&raw_out2, &mut temp_files2, Ok(sym_rec))
+        .expect_err("symlink recovery dir must error");
+    for tmp in temp_files2.drain(..) {
+        let _ = fs::remove_file(tmp);
+    }
+    prune_stale_cache_files_in(&cache_dir, Duration::ZERO);
+    assert_eq!(fs::read(&kept_fallback).unwrap(), b"fallback-bytes");
+
+    let _ = fs::remove_dir_all(&base);
+}

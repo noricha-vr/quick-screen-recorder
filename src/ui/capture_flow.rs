@@ -357,15 +357,26 @@ pub(crate) fn stop_active_recording(mtm: MainThreadMarker, runtime: &Rc<RefCell<
         match pending.finish() {
             Ok(outcome) => {
                 if should_quit {
-                    if let Some(partial_err) = outcome.partial_error {
-                        show_error_alert(
-                            m,
-                            "Recording Saved With Warning",
-                            &format!(
-                                "The recording finished saving before quit, with a warning: {partial_err}"
-                            ),
-                        );
-                    }
+                    let rescued = crate::staging::preserve_recording_on_quit(
+                        &outcome.output_path,
+                        &mut rt_poll.borrow_mut().temp_files,
+                        crate::staging::private_recovery_dir(),
+                    );
+                    let notice = match (rescued, outcome.partial_error) {
+                        (Ok(saved), Some(warn)) => format!(
+                            "Your recording was preserved at {} before quitting (warning: {warn}).",
+                            crate::fs_safety::format_tilde_path(&saved)
+                        ),
+                        (Ok(saved), None) => format!(
+                            "Your recording was preserved at {} before quitting.",
+                            crate::fs_safety::format_tilde_path(&saved)
+                        ),
+                        (Err((rec_err, kept)), _) => format!(
+                            "Could not move recording to recovery ({rec_err}); file was preserved at {}.",
+                            crate::fs_safety::format_tilde_path(&kept)
+                        ),
+                    };
+                    show_error_alert(m, "Recording Saved Before Quit", &notice);
                     crate::ui::finish_app_termination(m, &rt_poll);
                     return;
                 }
