@@ -37,6 +37,8 @@ pub struct VideoMetadata {
     pub height: u32,
     pub nominal_fps: f32,
     pub codec_fourcc: u32,
+    pub has_video: bool,
+    pub is_playable: bool,
     pub has_audio: bool,
     pub has_extra_tracks: bool,
     pub common_metadata_count: usize,
@@ -76,6 +78,8 @@ pub fn probe_video_metadata(path: &Path) -> Result<VideoMetadata, String> {
     let mut height = 0_u32;
     let mut nominal_fps = 60.0_f32;
     let mut codec_fourcc = 0_u32;
+    let mut has_video = false;
+    let mut is_playable = unsafe { asset.isPlayable() };
     let mut has_audio = false;
     let mut av_track_count = 0_usize;
     #[allow(deprecated)]
@@ -95,6 +99,8 @@ pub fn probe_video_metadata(path: &Path) -> Result<VideoMetadata, String> {
             av_track_count += tracks.count();
             if tracks.count() > 0 {
                 let track = tracks.objectAtIndex(0);
+                has_video = true;
+                is_playable = is_playable && track.isPlayable();
                 let size = track.naturalSize();
                 let tf = track.preferredTransform();
                 let transformed_w = (size.width * tf.a + size.height * tf.c).abs();
@@ -129,6 +135,8 @@ pub fn probe_video_metadata(path: &Path) -> Result<VideoMetadata, String> {
         height,
         nominal_fps,
         codec_fourcc,
+        has_video,
+        is_playable,
         has_audio,
         has_extra_tracks: total_tracks > av_track_count,
         common_metadata_count,

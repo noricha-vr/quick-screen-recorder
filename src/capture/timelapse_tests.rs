@@ -27,6 +27,7 @@ fn delayed_init_after_caller_timeout_cancels_without_continuing_capture() {
         &sync,
         &frames_written,
         init_tx,
+        || false,
         || {
             dispatches += 1;
             dispatches
@@ -49,6 +50,7 @@ fn delayed_init_after_caller_timeout_cancels_without_continuing_capture() {
         &sync,
         &frames_written,
         init_tx2,
+        || false,
         || {
             dispatches2 += 1;
             dispatches2
@@ -79,6 +81,7 @@ fn start_cancel_during_inflight_frame0_discards_frame_without_writing() {
             &sync_worker,
             &frames_worker,
             init_tx,
+            || false,
             || {
                 let _ = dispatched_tx.send(());
             },
@@ -126,6 +129,7 @@ fn stop_immediately_after_start_and_never_captures_after_stop_requested() {
             &sync_worker,
             &frames_worker,
             init_tx,
+            || false,
             || dispatches_worker.fetch_add(1, Ordering::SeqCst) + 1,
             |_| Ok(dummy_frame(1)),
             |_| Ok(()),
@@ -169,6 +173,7 @@ fn stop_during_inflight_interval_capture_discards_returned_frame() {
             &sync_worker,
             &frames_worker,
             init_tx,
+            || false,
             || {
                 seq += 1;
                 if seq == 2 {
@@ -223,6 +228,7 @@ fn stop_serialized_before_tick_expiry_prevents_dispatching_second_capture() {
             &sync_worker,
             &frames_worker,
             init_tx,
+            || false,
             || dispatches_worker.fetch_add(1, Ordering::SeqCst) + 1,
             |_| Ok(dummy_frame(7)),
             |_| Ok(()),
@@ -265,6 +271,7 @@ fn consecutive_capture_failures_preserve_partial_frames_and_report_error() {
             &sync_worker,
             &frames_worker,
             init_tx,
+            || false,
             || {
                 calls += 1;
                 calls
@@ -304,7 +311,7 @@ fn stop_timeout_exceeds_writer_finish_and_recovers_delayed_finalization() {
 
     let sync = SyncState::new();
     let committing = Arc::new(AtomicBool::new(false));
-    let (done_tx, done_rx) = mpsc::sync_channel::<Result<RecordingOutcome, String>>(1);
+    let (done_tx, done_rx) = mpsc::sync_channel::<Result<TimelapseWorkerDone, String>>(1);
     let mut pending = PendingTimelapseStop {
         sync,
         committing,
@@ -320,7 +327,9 @@ fn stop_timeout_exceeds_writer_finish_and_recovers_delayed_finalization() {
         output_path: PathBuf::from("/tmp/timelapse-final.mp4"),
         partial_error: None,
     };
-    done_tx.send(Ok(expected.clone())).expect("send result");
+    done_tx
+        .send(Ok(TimelapseWorkerDone::Committed(expected.clone())))
+        .expect("send result");
     assert_eq!(pending.poll(), StopPollState::Finished);
     assert_eq!(pending.finish(), Ok(expected));
 }
@@ -329,7 +338,7 @@ fn stop_timeout_exceeds_writer_finish_and_recovers_delayed_finalization() {
 fn slow_cross_volume_commit_does_not_time_out_after_encoder_finishes() {
     let sync = SyncState::new();
     let committing = Arc::new(AtomicBool::new(true));
-    let (done_tx, done_rx) = mpsc::sync_channel::<Result<RecordingOutcome, String>>(1);
+    let (done_tx, done_rx) = mpsc::sync_channel::<Result<TimelapseWorkerDone, String>>(1);
     let mut pending = PendingTimelapseStop {
         sync,
         committing: Arc::clone(&committing),
@@ -351,14 +360,14 @@ fn slow_cross_volume_commit_does_not_time_out_after_encoder_finishes() {
         partial_error: None,
     };
     done_tx
-        .send(Ok(expected.clone()))
+        .send(Ok(TimelapseWorkerDone::Committed(expected.clone())))
         .expect("send commit done");
     assert_eq!(pending.poll(), StopPollState::Finished);
     assert_eq!(pending.finish(), Ok(expected.clone()));
 
     // Direct finish() without polling must also wait through an active commit past timeout.
     let (done_tx_direct, done_rx_direct) =
-        mpsc::sync_channel::<Result<RecordingOutcome, String>>(1);
+        mpsc::sync_channel::<Result<TimelapseWorkerDone, String>>(1);
     let pending_direct = PendingTimelapseStop {
         sync: SyncState::new(),
         committing: Arc::new(AtomicBool::new(true)),
@@ -370,13 +379,13 @@ fn slow_cross_volume_commit_does_not_time_out_after_encoder_finishes() {
     let expected_direct = expected.clone();
     let sender = thread::spawn(move || {
         thread::sleep(Duration::from_millis(45));
-        let _ = done_tx_direct.send(Ok(expected_direct));
+        let _ = done_tx_direct.send(Ok(TimelapseWorkerDone::Committed(expected_direct)));
     });
     assert_eq!(pending_direct.finish(), Ok(expected));
     sender.join().expect("join sender");
 
     // Verify normal timeout still triggers when encoder is NOT yet in commit phase.
-    let (_tx2, rx2) = mpsc::sync_channel::<Result<RecordingOutcome, String>>(1);
+    let (_tx2, rx2) = mpsc::sync_channel::<Result<TimelapseWorkerDone, String>>(1);
     let mut stuck = PendingTimelapseStop {
         sync: SyncState::new(),
         committing: Arc::new(AtomicBool::new(false)),
@@ -404,6 +413,7 @@ fn single_frame_stop_propagates_closing_frame_write_error() {
             &sync_worker,
             &frames_worker,
             init_tx,
+            || false,
             || (),
             |()| Ok(dummy_frame(5)),
             |_| {
@@ -428,4 +438,61 @@ fn single_frame_stop_propagates_closing_frame_write_error() {
         other => panic!("expected AbortedAfterPartialCapture, got {other:?}"),
     }
     assert_eq!(frames_written.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn timelapse_deferred_commit_preserves_on_late_quit_even_after_double_failure() {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = std::env::temp_dir().join(format!(
+        "qsr-tl-latequit-{}",
+        crate::fs_safety::random_hex_token()
+    ));
+    let cache_dir = base.join("cache");
+    fs::create_dir_all(&cache_dir).expect("mkdir cache");
+    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)).expect("chmod cache");
+    let gui_target = cache_dir.join("capture-gui-tl.mp4");
+
+    let staging =
+        ExclusiveStagingDir::create_in_cache_root(&cache_dir, &gui_target, "mp4", false, true)
+            .expect("staging");
+    fs::write(staging.staged_file(), b"encoded-timelapse-bytes").expect("write mp4");
+
+    // Worker has ALREADY finished encoding and sent `ReadyToCommit` BEFORE user clicks Quit!
+    let (done_tx, done_rx) = mpsc::sync_channel::<Result<TimelapseWorkerDone, String>>(1);
+    done_tx
+        .send(Ok(TimelapseWorkerDone::ReadyToCommit {
+            staging: Some(staging),
+            output_path: gui_target.clone(),
+            partial_error: None,
+            codec: RecordingCodec::H264,
+            elapsed: Duration::from_secs(10),
+        }))
+        .expect("send ReadyToCommit");
+    let mut pending = PendingTimelapseStop {
+        sync: SyncState::new(),
+        committing: Arc::new(AtomicBool::new(false)),
+        done_rx,
+        result: None,
+        stop_initiated_at: Instant::now(),
+        timeout: Duration::from_secs(2),
+    };
+    assert_eq!(pending.poll(), StopPollState::Finished);
+
+    // Late Cmd+Q triggers `finish_with_policy(true, Err("EMFILE"))` while cache_dir is 0o500
+    // (double failure: recovery fails AND rename fails) -> must keep protected staging, NEVER
+    // prunable `capture-*.mp4`, and survive expired cache pruning!
+    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o500)).expect("chmod 0500");
+    let outcome = pending
+        .finish_with_policy(true, Err("EMFILE".to_string()))
+        .expect("late-quit preservation returns protected staging path");
+    assert!(!gui_target.exists());
+    fs::set_permissions(&cache_dir, fs::Permissions::from_mode(0o700)).expect("chmod 0700");
+    crate::fs_safety::prune_stale_cache_files_in(&cache_dir, Duration::ZERO);
+    assert_eq!(
+        fs::read(&outcome.output_path).expect("survives prune"),
+        b"encoded-timelapse-bytes"
+    );
+    let _ = fs::remove_dir_all(&base);
 }

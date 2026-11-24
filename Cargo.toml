@@ -1,6 +1,6 @@
 [package]
 name = "quick-screen-recorder"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 rust-version = "1.85"
 description = "Fast, lightweight native screen recorder for macOS built with Rust and ScreenCaptureKit"
@@ -84,6 +84,7 @@ objc2-core-graphics = { version = "=0.3.2", features = [
   "CGColorSpace",
   "CGContext",
   "CGImage",
+  "CGSession",
   "CGWindow",
 ] }
 objc2-core-media = { version = "=0.3.2", features = [
@@ -105,10 +106,13 @@ objc2-foundation = { version = "=0.3.2", features = [
   "NSData",
   "NSDate",
   "NSDictionary",
+  "NSDistributedNotificationCenter",
   "NSError",
   "NSFileManager",
   "NSGeometry",
+  "NSNotification",
   "NSObject",
+  "NSOperation",
   "NSPathUtilities",
   "NSProcessInfo",
   "NSRange",
@@ -117,6 +121,7 @@ objc2-foundation = { version = "=0.3.2", features = [
   "NSTimer",
   "NSURL",
   "NSValue",
+  "block2",
 ] }
 objc2-quartz-core = "=0.3.2"
 objc2-screen-capture-kit = { version = "=0.3.2", features = [

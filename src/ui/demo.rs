@@ -58,6 +58,7 @@ pub fn run_demo_flow(
                     captured_app_name: None,
                     demo_showcase: true,
                     tutorial_hint: false,
+                    initial_notice: None,
                     on_export_dir_change: Rc::new(|_| {}),
                     on_export_saved: Rc::new(|_| {}),
                 },

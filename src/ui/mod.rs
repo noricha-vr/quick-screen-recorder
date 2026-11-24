@@ -1,4 +1,5 @@
 pub mod capture_flow;
+mod capture_stop;
 pub mod clipboard;
 pub mod demo;
 pub mod editor;
@@ -28,7 +29,9 @@ use objc2::rc::Retained;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_foundation::NSTimer;
 
-use crate::capture::{ActiveRecording, PendingStop, RecordingCodec};
+use crate::capture::{
+    ActiveRecording, PendingStop, RecordingCodec, SystemInterruptMonitor, UnlockMonitor,
+};
 use crate::cli::DemoMode;
 use crate::config::Preferences;
 use crate::permissions::has_screen_capture_permission;
@@ -55,6 +58,7 @@ pub(crate) struct AppRuntime {
     pub(crate) next_tutorial_gen: u64,
     pub(crate) overlay: Option<SelectorOverlay>,
     pub(crate) session: Option<ActiveRecording>,
+    pub(crate) interrupt_monitor: Option<SystemInterruptMonitor>,
     pub(crate) pending_stop: Option<PendingStop>,
     pub(crate) active_capture_app: Option<String>,
     pub(crate) rec_timer: Option<Retained<NSTimer>>,
@@ -62,6 +66,8 @@ pub(crate) struct AppRuntime {
     pub(crate) mic_perm_timer: Option<Retained<NSTimer>>,
     pub(crate) editors: Vec<EditorWindow>,
     pub(crate) temp_files: Vec<PathBuf>,
+    pub(crate) deferred_alerts: Vec<(String, String)>,
+    pub(crate) unlock_monitor: Option<UnlockMonitor>,
     pub(crate) quit_after_stop: bool,
 }
 
@@ -97,6 +103,7 @@ pub fn run_gui(
         next_tutorial_gen: 1,
         overlay: None,
         session: None,
+        interrupt_monitor: None,
         pending_stop: None,
         active_capture_app: None,
         rec_timer: None,
@@ -104,6 +111,8 @@ pub fn run_gui(
         mic_perm_timer: None,
         editors: Vec::new(),
         temp_files: Vec::new(),
+        deferred_alerts: Vec::new(),
+        unlock_monitor: None,
         quit_after_stop: false,
     }));
 
@@ -117,7 +126,7 @@ pub fn run_gui(
     install_shortcut_monitors(&runtime);
 
     if let Some(video_path) = open_editor {
-        open_editor_for_file(mtm, &runtime, &video_path, None, None)?;
+        open_editor_for_file(mtm, &runtime, &video_path, None, None, None)?;
     } else if open_selector {
         show_selector(mtm, &runtime);
     } else if show_first_run {
@@ -142,7 +151,7 @@ fn build_status_bar_callbacks(runtime: &Rc<RefCell<AppRuntime>>) -> StatusBarCal
         on_primary_click: Box::new(move |m| toggle_select_or_stop(m, &rt_p)),
         on_open_video: Box::new(move |m| {
             if let Some(path) = choose_video_file(m) {
-                if let Err(err) = open_editor_for_file(m, &rt_o, &path, None, None) {
+                if let Err(err) = open_editor_for_file(m, &rt_o, &path, None, None, None) {
                     show_error_alert(m, "Cannot Open Video", &err);
                 }
             }
@@ -318,6 +327,8 @@ pub(crate) fn finish_app_termination(mtm: MainThreadMarker, runtime: &Rc<RefCell
         if let Some(t) = rt.stop_poll_timer.take() {
             t.invalidate();
         }
+        let _ = rt.interrupt_monitor.take();
+        let _ = rt.unlock_monitor.take();
         for tmp in rt.temp_files.drain(..) {
             let _ = std::fs::remove_file(tmp);
         }

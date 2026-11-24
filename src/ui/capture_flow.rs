@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::rc::Rc;
 use std::sync::mpsc;
@@ -12,18 +11,25 @@ use objc2_foundation::{NSRunLoop, NSRunLoopCommonModes, NSString, NSTimer};
 use crate::capture::audio_devices::{
     MicPermissionStatus, microphone_permission_status, request_microphone_permission_channel,
 };
-use crate::capture::recorder::StopPollState;
 use crate::capture::shareable::query_shareable_content;
-use crate::capture::{ActiveRecording, AudioCaptureMode, CaptureConfig};
+use crate::capture::{
+    ActiveRecording, AudioCaptureMode, CaptureConfig, SystemInterruptMonitor,
+    current_session_interrupt,
+};
 use crate::config::Preferences;
 use crate::permissions::{has_screen_capture_permission, open_microphone_settings};
-use crate::ui::editor::{EditorOpenOptions, EditorWindow};
+pub(crate) use crate::ui::capture_stop::{
+    arm_fresh_unlock_monitor, flush_deferred_alerts, open_editor_for_file,
+    queue_or_show_error_alert, should_defer_error_alert, stop_active_recording,
+    stop_active_recording_with_reason,
+};
 use crate::ui::folder_picker::show_error_alert;
 use crate::ui::onboarding_visual::OnboardingStep;
 use crate::ui::overlay::SelectorOverlay;
-use crate::ui::{AppRuntime, apply_export_dir_change, open_onboarding};
+use crate::ui::{AppRuntime, open_onboarding};
 
 pub(crate) fn toggle_select_or_stop(mtm: MainThreadMarker, runtime: &Rc<RefCell<AppRuntime>>) {
+    flush_deferred_alerts(mtm, runtime);
     let (busy_transition, has_session) = {
         let rt = runtime.borrow();
         (
@@ -97,14 +103,6 @@ pub(crate) fn show_selector(mtm: MainThreadMarker, runtime: &Rc<RefCell<AppRunti
         }
         Err(err) => show_error_alert(mtm, "Overlay Error", &err),
     }
-}
-
-pub(crate) fn should_complete_tutorial_on_save(
-    active_tutorial_gen: Option<u64>,
-    editor_tutorial_gen: Option<u64>,
-    recording_active: bool,
-) -> bool {
-    !recording_active && active_tutorial_gen.is_some() && active_tutorial_gen == editor_tutorial_gen
 }
 
 pub(crate) fn cancel_overlay(runtime: &Rc<RefCell<AppRuntime>>) {
@@ -239,8 +237,24 @@ fn launch_recording_session(
         }
     };
     let source_app = cfg.source_app_name.clone();
-    match ActiveRecording::start(&cfg, &raw_out) {
+    // Arm lock/sleep monitoring BEFORE starting capture so transitions during initialization
+    // cannot be missed.
+    let rt_int = Rc::clone(runtime);
+    let monitor = SystemInterruptMonitor::start_gui(move |reason| {
+        if let Some(m) = MainThreadMarker::new() {
+            let can_stop = rt_int
+                .try_borrow()
+                .is_ok_and(|r| r.session.is_some() && r.pending_stop.is_none());
+            if can_stop {
+                stop_active_recording_with_reason(m, &rt_int, Some(reason));
+            }
+        }
+    });
+    match ActiveRecording::start_with_interrupt(&cfg, &raw_out, Some(monitor.latch()), true) {
         Ok(session) => {
+            monitor.attach_stop_hook(session.stop_hook());
+            let early_interrupt = monitor.poll_interrupt();
+            let early_ended = session.has_ended_unexpectedly();
             {
                 let mut rt = runtime.borrow_mut();
                 rt.temp_files.push(raw_out);
@@ -249,15 +263,20 @@ fn launch_recording_session(
                 if let Some(sb) = &rt.status_bar {
                     sb.set_recording_elapsed(mtm, 0, init_tl_frames);
                 }
+                rt.interrupt_monitor = Some(monitor);
                 rt.session = Some(session);
                 let rt_tick = Rc::clone(runtime);
                 let block = RcBlock::new(move |_t: NonNull<NSTimer>| {
                     let Some(m) = MainThreadMarker::new() else {
                         return;
                     };
-                    let worker_aborted = {
+                    let (interrupt_reason, worker_aborted) = {
                         let r = rt_tick.borrow();
-                        if let (Some(sess), Some(sb)) = (&r.session, &r.status_bar) {
+                        let int_reason = r
+                            .interrupt_monitor
+                            .as_ref()
+                            .and_then(|mon| mon.poll_interrupt());
+                        let aborted = if let (Some(sess), Some(sb)) = (&r.session, &r.status_bar) {
                             sb.set_recording_elapsed(
                                 m,
                                 sess.elapsed().as_secs(),
@@ -266,9 +285,12 @@ fn launch_recording_session(
                             sess.has_ended_unexpectedly()
                         } else {
                             false
-                        }
+                        };
+                        (int_reason, aborted)
                     };
-                    if worker_aborted {
+                    if let Some(reason) = interrupt_reason {
+                        stop_active_recording_with_reason(m, &rt_tick, Some(reason));
+                    } else if worker_aborted {
                         stop_active_recording(m, &rt_tick);
                     }
                 });
@@ -278,6 +300,14 @@ fn launch_recording_session(
                     NSRunLoop::mainRunLoop().addTimer_forMode(&t, NSRunLoopCommonModes);
                     t
                 });
+            }
+            if let Some(reason) = early_interrupt {
+                stop_active_recording_with_reason(mtm, runtime, Some(reason));
+                return;
+            }
+            if early_ended {
+                stop_active_recording(mtm, runtime);
+                return;
             }
             if tutorial_active {
                 open_onboarding(
@@ -289,205 +319,31 @@ fn launch_recording_session(
                 );
             }
         }
-        Err(err) => show_error_alert(mtm, "Recording Failed to Start", &err),
-    }
-}
-
-pub(crate) fn stop_active_recording(mtm: MainThreadMarker, runtime: &Rc<RefCell<AppRuntime>>) {
-    let (session, captured_app, tutorial_gen) = {
-        let mut rt = runtime.borrow_mut();
-        if rt.pending_stop.is_some() {
-            return;
-        }
-        let Some(sess) = rt.session.take() else {
-            return;
-        };
-        if let Some(timer) = rt.rec_timer.take() {
-            timer.invalidate();
-        }
-        if let Some(sb) = &rt.status_bar {
-            sb.set_stopping(mtm);
-        }
-        if let Some(ob) = &rt.onboarding {
-            ob.hide_temporarily();
-        }
-        (sess, rt.active_capture_app.take(), rt.tutorial_generation)
-    };
-
-    // Initiate teardown without blocking the AppKit main runloop; CoreAudio / ScreenCaptureKit
-    // can deliver final audio + video buffers cleanly while NSTimer polls completion.
-    let pending = session.begin_stop();
-    runtime.borrow_mut().pending_stop = Some(pending);
-
-    let captured_cell = RefCell::new(captured_app);
-    let rt_poll = Rc::clone(runtime);
-    let poll_block = RcBlock::new(move |timer: NonNull<NSTimer>| {
-        let poll_state = {
-            let mut rt = rt_poll.borrow_mut();
-            match rt.pending_stop.as_mut() {
-                Some(p) => p.poll(),
-                None => {
-                    unsafe { timer.as_ref().invalidate() };
-                    rt.stop_poll_timer = None;
-                    return;
+        Err(err) => {
+            let early_reason = monitor.poll_interrupt();
+            let latch = monitor.latch();
+            let mut defer_modal = should_defer_error_alert(
+                early_reason,
+                current_session_interrupt().is_some(),
+                latch.has_resumed_after_interrupt(),
+            );
+            if defer_modal {
+                arm_fresh_unlock_monitor(runtime);
+                // Re-check after arming UnlockMonitor and before dropping `monitor` so no wake is missed.
+                defer_modal = should_defer_error_alert(
+                    early_reason,
+                    current_session_interrupt().is_some(),
+                    latch.has_resumed_after_interrupt(),
+                );
+                if !defer_modal {
+                    let mut rt = runtime.borrow_mut();
+                    if rt.deferred_alerts.is_empty() && rt.pending_stop.is_none() {
+                        let _ = rt.unlock_monitor.take();
+                    }
                 }
             }
-        };
-        if poll_state == StopPollState::Pending {
-            return;
+            drop(monitor);
+            queue_or_show_error_alert(mtm, runtime, "Recording Failed to Start", &err, defer_modal);
         }
-
-        unsafe { timer.as_ref().invalidate() };
-        let Some(m) = MainThreadMarker::new() else {
-            return;
-        };
-        let finished_pending = {
-            let mut rt = rt_poll.borrow_mut();
-            rt.stop_poll_timer = None;
-            if let Some(sb) = &rt.status_bar {
-                sb.set_idle(m);
-            }
-            rt.pending_stop.take()
-        };
-        let Some(pending) = finished_pending else {
-            return;
-        };
-        let app_name = captured_cell.borrow_mut().take();
-        let should_quit = rt_poll.borrow().quit_after_stop;
-        match pending.finish() {
-            Ok(outcome) => {
-                if should_quit {
-                    let rescued = crate::staging::preserve_recording_on_quit(
-                        &outcome.output_path,
-                        &mut rt_poll.borrow_mut().temp_files,
-                        crate::staging::private_recovery_dir(),
-                    );
-                    let notice = match (rescued, outcome.partial_error) {
-                        (Ok(saved), Some(warn)) => format!(
-                            "Your recording was preserved at {} before quitting (warning: {warn}).",
-                            crate::fs_safety::format_tilde_path(&saved)
-                        ),
-                        (Ok(saved), None) => format!(
-                            "Your recording was preserved at {} before quitting.",
-                            crate::fs_safety::format_tilde_path(&saved)
-                        ),
-                        (Err((rec_err, kept)), _) => format!(
-                            "Could not move recording to recovery ({rec_err}); file was preserved at {}.",
-                            crate::fs_safety::format_tilde_path(&kept)
-                        ),
-                    };
-                    show_error_alert(m, "Recording Saved Before Quit", &notice);
-                    crate::ui::finish_app_termination(m, &rt_poll);
-                    return;
-                }
-                if let Err(err) =
-                    open_editor_for_file(m, &rt_poll, &outcome.output_path, app_name, tutorial_gen)
-                {
-                    show_error_alert(m, "Failed Opening Editor", &err);
-                }
-                if let Some(partial_err) = outcome.partial_error {
-                    show_error_alert(
-                        m,
-                        "Recording Saved With Warning",
-                        &format!(
-                            "The recording was saved and opened in the editor, with a warning: {partial_err}"
-                        ),
-                    );
-                }
-            }
-            Err(err) => {
-                show_error_alert(m, "Recording Error", &err);
-                if should_quit {
-                    crate::ui::finish_app_termination(m, &rt_poll);
-                }
-            }
-        }
-    });
-
-    let timer = unsafe {
-        let t = NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.035, true, &poll_block);
-        // Register in common modes so menu tracking / modal sheets never pause stop finalization.
-        NSRunLoop::mainRunLoop().addTimer_forMode(&t, NSRunLoopCommonModes);
-        t
-    };
-    runtime.borrow_mut().stop_poll_timer = Some(timer);
-}
-
-pub(crate) fn open_editor_for_file(
-    mtm: MainThreadMarker,
-    runtime: &Rc<RefCell<AppRuntime>>,
-    video_path: &Path,
-    captured_app_name: Option<String>,
-    tutorial_gen: Option<u64>,
-) -> Result<(), String> {
-    let prefs = runtime.borrow().prefs.clone();
-    let (rt_dir, rt_saved) = (Rc::clone(runtime), Rc::clone(runtime));
-    let on_export_saved: Rc<dyn Fn(PathBuf)> = if let Some(editor_gen) = tutorial_gen {
-        Rc::new(move |saved_path| {
-            let celebrate = {
-                let mut rt = rt_saved.borrow_mut();
-                if should_complete_tutorial_on_save(
-                    rt.tutorial_generation,
-                    Some(editor_gen),
-                    rt.session.is_some() || rt.pending_stop.is_some(),
-                ) {
-                    rt.prefs.onboarding_completed = true;
-                    let _ = rt.prefs.save();
-                    rt.tutorial_generation = None;
-                    true
-                } else {
-                    false
-                }
-            };
-            if celebrate {
-                if let Some(m) = MainThreadMarker::new() {
-                    open_onboarding(
-                        m,
-                        &rt_saved,
-                        Some(OnboardingStep::Completed),
-                        Some(saved_path),
-                        false,
-                    );
-                }
-            }
-        })
-    } else {
-        Rc::new(|_| {})
-    };
-    let editor = EditorWindow::open(
-        mtm,
-        video_path,
-        &prefs,
-        EditorOpenOptions {
-            captured_app_name,
-            demo_showcase: false,
-            tutorial_hint: tutorial_gen.is_some(),
-            on_export_dir_change: Rc::new(move |new_dir| {
-                if let Some(m) = MainThreadMarker::new() {
-                    apply_export_dir_change(m, &rt_dir, new_dir);
-                }
-            }),
-            on_export_saved,
-        },
-    )?;
-    let app = NSApplication::sharedApplication(mtm);
-    #[allow(deprecated)]
-    app.activateIgnoringOtherApps(true);
-    runtime.borrow_mut().editors.push(editor);
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unrelated_or_stale_editor_save_never_completes_tutorial() {
-        assert!(!should_complete_tutorial_on_save(Some(1), None, false));
-        assert!(!should_complete_tutorial_on_save(Some(1), None, true));
-        assert!(!should_complete_tutorial_on_save(Some(2), Some(1), false));
-        assert!(!should_complete_tutorial_on_save(Some(2), Some(2), true));
-        assert!(should_complete_tutorial_on_save(Some(2), Some(2), false));
-        assert!(!should_complete_tutorial_on_save(None, Some(2), false));
     }
 }

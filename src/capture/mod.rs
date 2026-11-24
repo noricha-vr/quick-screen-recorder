@@ -3,6 +3,7 @@ pub mod cadence;
 mod filter;
 pub mod recorder;
 pub mod shareable;
+pub mod system_events;
 pub mod timelapse;
 mod timelapse_frame;
 mod timelapse_loop;
@@ -14,6 +15,10 @@ use serde::{Deserialize, Serialize};
 
 pub use cadence::{CaptureCadence, TIMELAPSE_PLAYBACK_FPS};
 use recorder::{PendingRecordingStop, RecordingSession, StopPollState};
+pub use system_events::{
+    InterruptLatch, StopHook, SystemInterruptMonitor, SystemInterruptReason, UnlockMonitor,
+    current_session_interrupt, pump_current_runloop,
+};
 use timelapse::{PendingTimelapseStop, TimelapseSession};
 
 use crate::geometry::Rect;
@@ -157,15 +162,37 @@ pub enum PendingStop {
 
 impl ActiveRecording {
     pub fn start(config: &CaptureConfig, output_path: &Path) -> Result<Self, String> {
+        Self::start_with_interrupt(config, output_path, None, false)
+    }
+
+    pub fn start_with_interrupt(
+        config: &CaptureConfig,
+        output_path: &Path,
+        interrupt_latch: Option<InterruptLatch>,
+        defer_timelapse_commit: bool,
+    ) -> Result<Self, String> {
+        if let Some(reason) = interrupt_latch
+            .as_ref()
+            .and_then(InterruptLatch::reason)
+            .or_else(current_session_interrupt)
+        {
+            return Err(format!(
+                "Cannot start recording because {}",
+                reason.clause()
+            ));
+        }
         match config.cadence.normalized() {
-            CaptureCadence::RealTime { .. } => Ok(Self::RealTime(RecordingSession::start(
-                config,
-                output_path,
-            )?)),
-            CaptureCadence::Timelapse { .. } => Ok(Self::Timelapse(TimelapseSession::start(
-                config,
-                output_path,
-            )?)),
+            CaptureCadence::RealTime { .. } => Ok(Self::RealTime(
+                RecordingSession::start_with_interrupt(config, output_path, interrupt_latch)?,
+            )),
+            CaptureCadence::Timelapse { .. } => {
+                Ok(Self::Timelapse(TimelapseSession::start_with_interrupt(
+                    config,
+                    output_path,
+                    interrupt_latch,
+                    defer_timelapse_commit,
+                )?))
+            }
         }
     }
 
@@ -185,8 +212,17 @@ impl ActiveRecording {
 
     pub fn has_ended_unexpectedly(&self) -> bool {
         match self {
-            Self::RealTime(_) => false,
+            Self::RealTime(s) => s.has_ended_unexpectedly(),
             Self::Timelapse(s) => s.has_worker_exited(),
+        }
+    }
+
+    /// Thread-safe immediate stop hook for BOTH real-time (`SCStream`) and interval timelapse,
+    /// invoked directly from the background system-interrupt queue without waiting for the GUI thread.
+    pub fn stop_hook(&self) -> StopHook {
+        match self {
+            Self::RealTime(s) => s.stop_hook(),
+            Self::Timelapse(s) => s.stop_hook(),
         }
     }
 
@@ -199,10 +235,7 @@ impl ActiveRecording {
 
     pub fn stop(self) -> Result<RecordingOutcome, String> {
         match self {
-            Self::RealTime(s) => Ok(RecordingOutcome {
-                output_path: s.stop()?,
-                partial_error: None,
-            }),
+            Self::RealTime(s) => s.stop(),
             Self::Timelapse(s) => s.stop(),
         }
     }
@@ -218,11 +251,17 @@ impl PendingStop {
 
     pub fn finish(self) -> Result<RecordingOutcome, String> {
         match self {
-            Self::RealTime(p) => Ok(RecordingOutcome {
-                output_path: p.finish()?,
-                partial_error: None,
-            }),
+            Self::RealTime(p) => p.finish(),
             Self::Timelapse(p) => p.finish(),
+        }
+    }
+
+    /// Finalizes and preserves directly from staging into permanent recovery (or protected staging
+    /// on double failure), avoiding prunable cache fallback files.
+    pub fn finish_to_recovery(self) -> Result<RecordingOutcome, String> {
+        match self {
+            Self::RealTime(p) => p.finish_to_recovery(),
+            Self::Timelapse(p) => p.finish_to_recovery(),
         }
     }
 }

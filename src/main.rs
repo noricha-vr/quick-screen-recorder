@@ -1,9 +1,10 @@
 use std::process::ExitCode;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use quick_screen_recorder::capture::shareable::query_shareable_content;
-use quick_screen_recorder::capture::{ActiveRecording, CaptureConfig, CaptureTarget};
+use quick_screen_recorder::capture::{
+    ActiveRecording, CaptureConfig, CaptureTarget, SystemInterruptMonitor, pump_current_runloop,
+};
 use quick_screen_recorder::cli::{Command, parse_args, usage_text};
 use quick_screen_recorder::export::{ExportRequest, run_export};
 use quick_screen_recorder::fs_safety::sanitize_terminal_text;
@@ -121,12 +122,29 @@ fn execute(command: Command) -> Result<(), String> {
                 excluded_window_ids: Vec::new(),
                 source_app_name: None,
             };
-            let session = ActiveRecording::start(&cfg, &output)?;
+            // Arm system-interrupt monitoring BEFORE startup so lock/sleep events during
+            // initialization are captured rather than missed.
+            let monitor = SystemInterruptMonitor::start_headless();
+            let session =
+                ActiveRecording::start_with_interrupt(&cfg, &output, Some(monitor.latch()), false)?;
+            monitor.attach_stop_hook(session.stop_hook());
             let deadline = Instant::now() + Duration::from_secs_f64(duration_sec);
-            while Instant::now() < deadline && !session.has_ended_unexpectedly() {
+            let mut interrupted_by = monitor.poll_interrupt();
+            while interrupted_by.is_none()
+                && Instant::now() < deadline
+                && !session.has_ended_unexpectedly()
+            {
                 let remaining = deadline.saturating_duration_since(Instant::now());
-                thread::sleep(remaining.min(Duration::from_millis(250)));
+                pump_current_runloop(remaining.min(Duration::from_millis(250)));
+                if let Some(reason) = monitor.poll_interrupt() {
+                    interrupted_by = Some(reason);
+                    break;
+                }
             }
+            if interrupted_by.is_none() {
+                interrupted_by = monitor.poll_interrupt();
+            }
+            drop(monitor);
             let outcome = session.stop()?;
             let safe_saved =
                 sanitize_terminal_text(&outcome.output_path.display().to_string(), false);
@@ -134,7 +152,11 @@ fn execute(command: Command) -> Result<(), String> {
                 println!("Saved recording -> {safe_saved}");
                 return Err(partial_err);
             }
-            println!("Recorded -> {safe_saved}");
+            if let Some(reason) = interrupted_by {
+                println!("Auto-stopped ({}) -> {safe_saved}", reason.short_label());
+            } else {
+                println!("Recorded -> {safe_saved}");
+            }
             Ok(())
         }
         Command::Gui {
