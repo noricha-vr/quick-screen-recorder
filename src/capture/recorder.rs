@@ -20,20 +20,17 @@ mod delegate;
 pub use delegate::is_valid_salvageable_mp4;
 use delegate::{
     DelegateSignal, RecordingDelegate, SendableStreamStop, StreamStopControl, evaluate_stop_poll,
-    handle_start_callback_result, wait_for_capture_start_with_interrupt,
-    wait_for_recording_started,
+    format_stop_error_with_preservation, handle_start_callback_result,
+    wait_for_capture_start_with_interrupt, wait_for_recording_started,
 };
 
 use crate::capture::filter::build_filter_and_dimensions;
 use crate::capture::shareable::query_shareable_content_for_capture;
 use crate::capture::system_events::{InterruptLatch, StopHook, current_session_interrupt};
 use crate::capture::{CaptureConfig, RecordingCodec, RecordingOutcome};
-use crate::fs_safety::{ExclusiveStagingDir, format_tilde_path};
+use crate::fs_safety::ExclusiveStagingDir;
 use crate::observe::{PerfEvent, PerfKind, now_unix_secs, record_perf_event};
-use crate::staging::{
-    commit_or_recover_default, commit_or_recover_salvaged_default, preserve_staged_permanently,
-    private_recovery_dir,
-};
+use crate::staging::{commit_or_recover_default, commit_or_recover_salvaged_default};
 
 pub(super) const STOP_FALLBACK_AFTER: Duration = Duration::from_secs(2);
 pub(super) const STOP_TIMEOUT: Duration = Duration::from_secs(12);
@@ -249,19 +246,22 @@ impl RecordingSession {
             stream.startCaptureWithCompletionHandler(Some(&start_block));
         }
 
+        let writer_started = || signal.0.lock().map(|g| g.started).unwrap_or(false);
         wait_for_capture_start_with_interrupt(
             &rx,
             Duration::from_secs(8),
             &cancelled_after_start,
             check_interrupted,
+            writer_started,
             || stopper.stop_now(Duration::from_millis(250)),
         )?;
 
-        wait_for_recording_started(&signal, &stopper, Duration::from_secs(8), check_interrupted)?;
-        if let Some(msg) = check_interrupted() {
+        // Once `wait_for_recording_started` returns `Ok(())`, the hardware writer has started
+        // writing to `staging`. Return `Ok(Self)` even if an interrupt occurred right after start
+        // so the caller's normal stop/recovery path finalizes and preserves captured footage.
+        wait_for_recording_started(&signal, Duration::from_secs(8), check_interrupted, || {
             stopper.stop_now(Duration::from_millis(250));
-            return Err(msg);
-        }
+        })?;
 
         Ok(Self {
             stream,
@@ -440,18 +440,10 @@ impl PendingRecordingStop {
         // directly into permanent recovery (never GUI `temp_files`) before returning `Err`.
         if let Some(stop_err) = stop_issue {
             self.record_perf(0, false);
-            return Err(
-                match preserve_staged_permanently(&mut self.staging, private_recovery_dir()) {
-                    Ok(saved_path) => format!(
-                        "{stop_err}. Playable footage was preserved at {}",
-                        format_tilde_path(&saved_path)
-                    ),
-                    Err((rec_err, kept_path)) => format!(
-                        "{stop_err} (recovery failed: {rec_err}). Playable footage was preserved in staging at {}",
-                        format_tilde_path(&kept_path)
-                    ),
-                },
-            );
+            return Err(format_stop_error_with_preservation(
+                &stop_err,
+                &mut self.staging,
+            ));
         }
 
         // Salvaged clips use non-overwriting publish so existing target files are never replaced.

@@ -53,7 +53,7 @@ pub(crate) fn should_defer_error_alert(
     )
 }
 
-fn arm_fresh_unlock_monitor(runtime: &Rc<RefCell<AppRuntime>>) {
+pub(crate) fn arm_fresh_unlock_monitor(runtime: &Rc<RefCell<AppRuntime>>) {
     if let Some(mon) = &runtime.borrow().unlock_monitor {
         mon.reset_resumed();
         return;
@@ -156,7 +156,7 @@ pub(crate) fn stop_active_recording_with_reason(
     runtime: &Rc<RefCell<AppRuntime>>,
     auto_stop_reason: Option<SystemInterruptReason>,
 ) {
-    let (session, captured_app, tutorial_gen) = {
+    let (session, captured_app, tutorial_gen, prev_monitor) = {
         let mut rt = runtime.borrow_mut();
         if rt.pending_stop.is_some() {
             return;
@@ -164,7 +164,7 @@ pub(crate) fn stop_active_recording_with_reason(
         let Some(sess) = rt.session.take() else {
             return;
         };
-        let _ = rt.interrupt_monitor.take();
+        let prev_mon = rt.interrupt_monitor.take();
         if let Some(timer) = rt.rec_timer.take() {
             timer.invalidate();
         }
@@ -174,14 +174,21 @@ pub(crate) fn stop_active_recording_with_reason(
         if let Some(ob) = &rt.onboarding {
             ob.hide_temporarily();
         }
-        (sess, rt.active_capture_app.take(), rt.tutorial_generation)
+        (
+            sess,
+            rt.active_capture_app.take(),
+            rt.tutorial_generation,
+            prev_mon,
+        )
     };
 
-    // Always reset/arm a fresh unlock/wake monitor on EVERY auto-stop so `has_resumed` from a
-    // previous stop can never bleed into a subsequent sleep auto-stop.
+    // Always reset/arm a fresh unlock/wake monitor on EVERY auto-stop BEFORE dropping `prev_monitor`
+    // so `has_resumed` from a previous stop never leaks and no wake window exists during handoff.
     if auto_stop_reason.is_some() {
         arm_fresh_unlock_monitor(runtime);
     }
+    let prev_latch = prev_monitor.as_ref().map(|mon| mon.latch());
+    let monitor_cell = RefCell::new(prev_monitor);
 
     // Initiate teardown without blocking the AppKit main runloop; CoreAudio / ScreenCaptureKit
     // can deliver final audio + video buffers cleanly while NSTimer polls completion.
@@ -222,7 +229,7 @@ pub(crate) fn stop_active_recording_with_reason(
             return;
         };
         let app_name = captured_cell.borrow_mut().take();
-        let (should_quit, already_resumed) = {
+        let (should_quit, unlock_resumed) = {
             let rt = rt_poll.borrow();
             (
                 rt.quit_after_stop,
@@ -231,6 +238,11 @@ pub(crate) fn stop_active_recording_with_reason(
                     .is_some_and(UnlockMonitor::has_resumed),
             )
         };
+        let already_resumed = unlock_resumed
+            || prev_latch
+                .as_ref()
+                .is_some_and(|l| l.has_resumed_after_interrupt());
+        let _prev_monitor = monitor_cell.borrow_mut().take();
         let defer_modal = should_defer_error_alert(
             auto_stop_reason,
             current_session_interrupt().is_some(),

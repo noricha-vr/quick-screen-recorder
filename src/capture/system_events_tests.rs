@@ -1,4 +1,4 @@
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 
 use super::*;
@@ -116,4 +116,50 @@ fn headless_monitor_registers_and_drops_cleanly() {
     let monitor = SystemInterruptMonitor::start_headless();
     pump_current_runloop(Duration::from_millis(5));
     drop(monitor);
+}
+
+#[test]
+fn spoofed_distributed_lock_and_unlock_notifications_are_ignored_when_session_disagrees() {
+    let latch = InterruptLatch::new();
+    let stop_calls = Arc::new(AtomicUsize::new(0));
+    let stop_clone = Arc::clone(&stop_calls);
+    latch.attach_stop_hook(Arc::new(move || {
+        stop_clone.fetch_add(1, Ordering::SeqCst);
+    }));
+
+    // Spoofed `com.apple.screenIsLocked` while WindowServer says session is active/unlocked -> ignored!
+    assert_eq!(handle_distributed_lock_notification(&latch, || None), None);
+    assert!(!latch.is_interrupted());
+    assert_eq!(stop_calls.load(Ordering::SeqCst), 0);
+
+    // Genuine lock confirmed by WindowServer -> latches and fires stop hook once.
+    assert_eq!(
+        handle_distributed_lock_notification(&latch, || Some(SystemInterruptReason::ScreenLocked)),
+        Some(SystemInterruptReason::ScreenLocked)
+    );
+    assert_eq!(stop_calls.load(Ordering::SeqCst), 1);
+
+    // Spoofed `com.apple.screenIsUnlocked` while WindowServer says still locked -> ignored!
+    assert!(!handle_distributed_unlock_notification(&latch, || {
+        Some(SystemInterruptReason::ScreenLocked)
+    }));
+    assert!(!latch.has_resumed_after_interrupt());
+
+    // Genuine unlock confirmed by WindowServer -> marks resumed.
+    assert!(handle_distributed_unlock_notification(&latch, || None));
+    assert!(latch.has_resumed_after_interrupt());
+}
+
+#[test]
+fn latch_records_resume_only_after_interrupt_not_before() {
+    let latch = InterruptLatch::new();
+    // Unrelated wake before any interrupt must NOT mark resumed.
+    latch.note_resumed();
+    assert!(!latch.has_resumed_after_interrupt());
+
+    // Sleep occurs while main thread is delayed, then wake completes before stop logic runs.
+    assert!(latch.trigger(SystemInterruptReason::DisplaySlept));
+    assert!(!latch.has_resumed_after_interrupt());
+    latch.note_resumed();
+    assert!(latch.has_resumed_after_interrupt());
 }

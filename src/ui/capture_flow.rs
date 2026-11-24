@@ -12,11 +12,15 @@ use crate::capture::audio_devices::{
     MicPermissionStatus, microphone_permission_status, request_microphone_permission_channel,
 };
 use crate::capture::shareable::query_shareable_content;
-use crate::capture::{ActiveRecording, AudioCaptureMode, CaptureConfig, SystemInterruptMonitor};
+use crate::capture::{
+    ActiveRecording, AudioCaptureMode, CaptureConfig, SystemInterruptMonitor,
+    current_session_interrupt,
+};
 use crate::config::Preferences;
 use crate::permissions::{has_screen_capture_permission, open_microphone_settings};
 pub(crate) use crate::ui::capture_stop::{
-    flush_deferred_alerts, open_editor_for_file, stop_active_recording,
+    arm_fresh_unlock_monitor, flush_deferred_alerts, open_editor_for_file,
+    queue_or_show_error_alert, should_defer_error_alert, stop_active_recording,
     stop_active_recording_with_reason,
 };
 use crate::ui::folder_picker::show_error_alert;
@@ -311,8 +315,30 @@ fn launch_recording_session(
             }
         }
         Err(err) => {
+            let early_reason = monitor.poll_interrupt();
+            let latch = monitor.latch();
+            let mut defer_modal = should_defer_error_alert(
+                early_reason,
+                current_session_interrupt().is_some(),
+                latch.has_resumed_after_interrupt(),
+            );
+            if defer_modal {
+                arm_fresh_unlock_monitor(runtime);
+                // Re-check after arming UnlockMonitor and before dropping `monitor` so no wake is missed.
+                defer_modal = should_defer_error_alert(
+                    early_reason,
+                    current_session_interrupt().is_some(),
+                    latch.has_resumed_after_interrupt(),
+                );
+                if !defer_modal {
+                    let mut rt = runtime.borrow_mut();
+                    if rt.deferred_alerts.is_empty() && rt.pending_stop.is_none() {
+                        let _ = rt.unlock_monitor.take();
+                    }
+                }
+            }
             drop(monitor);
-            show_error_alert(mtm, "Recording Failed to Start", &err);
+            queue_or_show_error_alert(mtm, runtime, "Recording Failed to Start", &err, defer_modal);
         }
     }
 }

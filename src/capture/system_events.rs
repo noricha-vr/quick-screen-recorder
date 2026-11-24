@@ -1,11 +1,9 @@
 use std::ffi::c_void;
-use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use block2::RcBlock;
 use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::ProtocolObject;
 use objc2_app_kit::{
@@ -15,16 +13,18 @@ use objc2_app_kit::{
 use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFString, CFType};
 use objc2_core_graphics::CGSessionCopyCurrentDictionary;
 use objc2_foundation::{
-    NSDate, NSDefaultRunLoopMode, NSDistributedNotificationCenter, NSNotification,
-    NSNotificationName, NSObjectProtocol, NSOperationQueue, NSRunLoop, NSString,
+    NSDate, NSDefaultRunLoopMode, NSDistributedNotificationCenter, NSNotificationName,
+    NSObjectProtocol, NSOperationQueue, NSRunLoop, NSString,
 };
 
 #[path = "system_resume.rs"]
 mod resume;
 
-#[cfg(test)]
-pub(crate) use resume::ResumeLatch;
 pub use resume::UnlockMonitor;
+#[cfg(test)]
+pub(crate) use resume::{
+    ResumeLatch, handle_distributed_lock_notification, handle_distributed_unlock_notification,
+};
 
 const DISTRIBUTED_SCREEN_LOCKED_NAME: &str = "com.apple.screenIsLocked";
 const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -63,6 +63,7 @@ impl SystemInterruptReason {
 #[derive(Default)]
 struct CoordinatorState {
     reason: Option<SystemInterruptReason>,
+    resumed_after_interrupt: bool,
     hook: Option<StopHook>,
     hook_invoked: bool,
 }
@@ -90,6 +91,7 @@ impl InterruptLatch {
             Ok(mut guard) => {
                 let first = if guard.reason.is_none() {
                     guard.reason = Some(reason);
+                    guard.resumed_after_interrupt = false;
                     true
                 } else {
                     false
@@ -140,6 +142,23 @@ impl InterruptLatch {
 
     pub fn is_interrupted(&self) -> bool {
         self.reason().is_some()
+    }
+
+    /// Records that macOS unlocked/woke AFTER an interrupt was latched (no-op before any interrupt).
+    pub fn note_resumed(&self) {
+        if let Ok(mut guard) = self.inner.lock() {
+            if guard.reason.is_some() {
+                guard.resumed_after_interrupt = true;
+            }
+        }
+    }
+
+    /// Returns `true` if a wake/unlock event has already been observed after this latch triggered.
+    pub fn has_resumed_after_interrupt(&self) -> bool {
+        self.inner
+            .lock()
+            .map(|g| g.resumed_after_interrupt)
+            .unwrap_or(false)
     }
 }
 
@@ -257,6 +276,7 @@ impl Drop for SessionWatchdog {
 pub struct SystemInterruptMonitor {
     latch: InterruptLatch,
     _bg_queue: Retained<NSOperationQueue>,
+    _resume_queue: Retained<NSOperationQueue>,
     _watchdog: SessionWatchdog,
     distributed_tokens: Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
     workspace_tokens: Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
@@ -283,9 +303,11 @@ impl SystemInterruptMonitor {
         let latch = InterruptLatch::new();
         let bg_queue = NSOperationQueue::new();
         bg_queue.setMaxConcurrentOperationCount(1);
+        let resume_queue = NSOperationQueue::new();
+        resume_queue.setMaxConcurrentOperationCount(1);
 
-        let mut distributed_tokens = Vec::with_capacity(2);
-        let mut workspace_tokens = Vec::with_capacity(6);
+        let mut distributed_tokens = Vec::with_capacity(3);
+        let mut workspace_tokens = Vec::with_capacity(9);
 
         let dist_center = NSDistributedNotificationCenter::defaultCenter();
         let lock_name = NSString::from_str(DISTRIBUTED_SCREEN_LOCKED_NAME);
@@ -307,8 +329,9 @@ impl SystemInterruptMonitor {
             ]
         };
 
-        let bg_lock_block =
-            make_bg_observer_block(latch.clone(), SystemInterruptReason::ScreenLocked);
+        // Verify untrusted distributed `com.apple.screenIsLocked` against live `CGSession` state
+        // so another local process cannot spoof a fake screen-lock stop.
+        let bg_lock_block = resume::make_verified_bg_lock_block(latch.clone());
         distributed_tokens.push(unsafe {
             dist_center.addObserverForName_object_queue_usingBlock(
                 Some(&lock_name),
@@ -318,7 +341,7 @@ impl SystemInterruptMonitor {
             )
         });
         for (name, reason) in workspace_events {
-            let block = make_bg_observer_block(latch.clone(), reason);
+            let block = resume::make_bg_observer_block(latch.clone(), reason);
             workspace_tokens.push(unsafe {
                 ws_center.addObserverForName_object_queue_usingBlock(
                     Some(name),
@@ -332,11 +355,10 @@ impl SystemInterruptMonitor {
         if let Some(cb) = on_main_interrupt {
             let main_queue = NSOperationQueue::mainQueue();
             let ui_fired = Arc::new(AtomicBool::new(false));
-            let ui_lock_block = make_ui_observer_block(
+            let ui_lock_block = resume::make_verified_ui_lock_block(
                 latch.clone(),
                 Arc::clone(&ui_fired),
                 Arc::clone(&cb),
-                SystemInterruptReason::ScreenLocked,
             );
             distributed_tokens.push(unsafe {
                 dist_center.addObserverForName_object_queue_usingBlock(
@@ -347,7 +369,7 @@ impl SystemInterruptMonitor {
                 )
             });
             for (name, reason) in workspace_events {
-                let block = make_ui_observer_block(
+                let block = resume::make_ui_observer_block(
                     latch.clone(),
                     Arc::clone(&ui_fired),
                     Arc::clone(&cb),
@@ -364,6 +386,12 @@ impl SystemInterruptMonitor {
             }
         }
 
+        // Observe wake/unlock on a dedicated background queue from recording start so a fast
+        // sleep->wake while the AppKit main thread is delayed can never be missed.
+        let (res_dist, res_ws) = resume::register_bg_resume_observers(&resume_queue, latch.clone());
+        distributed_tokens.extend(res_dist);
+        workspace_tokens.extend(res_ws);
+
         let watchdog = SessionWatchdog::start(
             WATCHDOG_POLL_INTERVAL,
             latch.clone(),
@@ -373,6 +401,7 @@ impl SystemInterruptMonitor {
         Self {
             latch,
             _bg_queue: bg_queue,
+            _resume_queue: resume_queue,
             _watchdog: watchdog,
             distributed_tokens,
             workspace_tokens,
@@ -416,34 +445,6 @@ impl Drop for SystemInterruptMonitor {
             }
         }
     }
-}
-
-fn make_bg_observer_block(
-    latch: InterruptLatch,
-    reason: SystemInterruptReason,
-) -> RcBlock<dyn Fn(NonNull<NSNotification>)> {
-    RcBlock::new(move |_note: NonNull<NSNotification>| {
-        autoreleasepool(|_| {
-            let _ = latch.trigger(reason);
-        });
-    })
-}
-
-fn make_ui_observer_block(
-    latch: InterruptLatch,
-    ui_fired: Arc<AtomicBool>,
-    on_main: Arc<dyn Fn(SystemInterruptReason) + 'static>,
-    reason: SystemInterruptReason,
-) -> RcBlock<dyn Fn(NonNull<NSNotification>)> {
-    RcBlock::new(move |_note: NonNull<NSNotification>| {
-        autoreleasepool(|_| {
-            let _ = latch.trigger(reason);
-            let effective = latch.reason().unwrap_or(reason);
-            if !ui_fired.swap(true, Ordering::AcqRel) {
-                on_main(effective);
-            }
-        });
-    })
 }
 
 /// Pumps the current thread's `NSRunLoop` up to `duration` so CLI sessions receive macOS

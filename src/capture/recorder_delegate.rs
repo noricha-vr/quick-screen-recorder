@@ -149,27 +149,38 @@ impl SendableStreamStop {
 
 /// Coordinates a potentially delayed `startCaptureWithCompletionHandler` result with concurrent
 /// system-interrupt cancellation so startup never blocks 8 seconds on lock/sleep and late start
-/// completions can never leave a stream running.
-pub(super) fn wait_for_capture_start_with_interrupt<F, S>(
+/// completions can never leave a stream running. If the hardware recording writer has already
+/// started writing frames (`writer_started()`), returns `Ok(())` so the caller hands ownership of
+/// `staging` to normal stop/recovery instead of dropping captured footage.
+pub(super) fn wait_for_capture_start_with_interrupt<F, W, S>(
     rx: &mpsc::Receiver<Result<(), String>>,
     timeout: Duration,
     cancelled_after_start: &AtomicBool,
     mut check_interrupted: F,
+    mut writer_started: W,
     mut trigger_immediate_stop: S,
 ) -> Result<(), String>
 where
     F: FnMut() -> Option<String>,
+    W: FnMut() -> bool,
     S: FnMut(),
 {
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(msg) = check_interrupted() {
+            if writer_started() {
+                trigger_immediate_stop();
+                return Ok(());
+            }
             cancelled_after_start.store(true, Ordering::Release);
             trigger_immediate_stop();
             return Err(msg);
         }
         let rem = deadline.saturating_duration_since(Instant::now());
         if rem.is_zero() {
+            if writer_started() {
+                return Ok(());
+            }
             cancelled_after_start.store(true, Ordering::Release);
             trigger_immediate_stop();
             return Err("Timed out starting ScreenCaptureKit stream".to_string());
@@ -177,6 +188,10 @@ where
         match rx.recv_timeout(rem.min(Duration::from_millis(25))) {
             Ok(Ok(())) => {
                 if let Some(msg) = check_interrupted() {
+                    if writer_started() {
+                        trigger_immediate_stop();
+                        return Ok(());
+                    }
                     cancelled_after_start.store(true, Ordering::Release);
                     trigger_immediate_stop();
                     return Err(msg);
@@ -186,6 +201,9 @@ where
             Ok(Err(err)) => return Err(err),
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if writer_started() {
+                    return Ok(());
+                }
                 cancelled_after_start.store(true, Ordering::Release);
                 trigger_immediate_stop();
                 return Err("ScreenCaptureKit start handler disconnected".to_string());
@@ -267,15 +285,18 @@ impl RecordingDelegate {
 }
 
 /// Waits up to `timeout` for `recordingOutputDidStartRecording:` while polling `check_interrupted`
-/// every 50ms so screen lock/sleep during startup tears down the stream immediately.
-pub(super) fn wait_for_recording_started<F>(
+/// every 50ms so screen lock/sleep before writer startup aborts immediately. Once `guard.started`
+/// becomes `true`, returns `Ok(())` even if an interrupt or delegate failure occurred right after
+/// start so the caller routes `staging` through normal stop/recovery instead of dropping footage.
+pub(super) fn wait_for_recording_started<F, S>(
     signal: &Arc<(Mutex<DelegateSignal>, Condvar)>,
-    stopper: &SendableStreamStop,
     timeout: Duration,
     mut check_interrupted: F,
+    mut trigger_stop: S,
 ) -> Result<(), String>
 where
     F: FnMut() -> Option<String>,
+    S: FnMut(),
 {
     let (lock, cvar) = &**signal;
     let deadline = Instant::now() + timeout;
@@ -283,7 +304,7 @@ where
     while !guard.started && guard.error.is_none() {
         if let Some(msg) = check_interrupted() {
             drop(guard);
-            stopper.stop_now(Duration::from_millis(250));
+            trigger_stop();
             return Err(msg);
         }
         let rem = deadline.saturating_duration_since(Instant::now());
@@ -295,17 +316,21 @@ where
             .map_err(|_| "Mutex poisoned")?;
         guard = next_guard;
     }
+    if guard.started {
+        drop(guard);
+        if check_interrupted().is_some() {
+            trigger_stop();
+        }
+        return Ok(());
+    }
     if let Some(err) = guard.error.clone() {
         drop(guard);
-        stopper.stop_now(Duration::from_millis(250));
+        trigger_stop();
         return Err(format!("Recording output failed to start: {err}"));
     }
-    if !guard.started {
-        drop(guard);
-        stopper.stop_now(Duration::from_millis(250));
-        return Err("Timed out waiting for hardware recording writer to start".to_string());
-    }
-    Ok(())
+    drop(guard);
+    trigger_stop();
+    Err("Timed out waiting for hardware recording writer to start".to_string())
 }
 
 /// Pure transition table for [`crate::capture::recorder::PendingRecordingStop::poll`].
@@ -351,4 +376,23 @@ pub fn is_valid_salvageable_mp4(path: &Path) -> bool {
         && meta.is_playable
         && meta.duration_sec >= 0.05
         && extract_rgba_frame(path, 0.0, Some(64)).is_ok()
+}
+
+pub(super) fn format_stop_error_with_preservation(
+    stop_err: &str,
+    staging: &mut crate::fs_safety::ExclusiveStagingDir,
+) -> String {
+    match crate::staging::preserve_staged_permanently(
+        staging,
+        crate::staging::private_recovery_dir(),
+    ) {
+        Ok(saved_path) => format!(
+            "{stop_err}. Playable footage was preserved at {}",
+            crate::fs_safety::format_tilde_path(&saved_path)
+        ),
+        Err((rec_err, kept_path)) => format!(
+            "{stop_err} (recovery failed: {rec_err}). Playable footage was preserved in staging at {}",
+            crate::fs_safety::format_tilde_path(&kept_path)
+        ),
+    }
 }

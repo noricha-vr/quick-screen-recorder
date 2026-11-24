@@ -143,6 +143,7 @@ fn delayed_start_callback_interrupted_triggers_immediate_and_late_stop() {
                 .reason()
                 .map(|r| format!("interrupted: {}", r.clause()))
         },
+        || false,
         || {
             immediate_stops.fetch_add(1, Ordering::SeqCst);
         },
@@ -167,4 +168,79 @@ fn delayed_start_callback_interrupted_triggers_immediate_and_late_stop() {
         1,
         "delayed start completion after cancellation must trigger forced late-start teardown"
     );
+}
+
+#[test]
+fn interrupt_after_writer_started_preserves_session_for_normal_stop_and_recovery() {
+    use std::sync::atomic::AtomicUsize;
+
+    // Case 1: Writer started before interrupt -> wait_for_recording_started returns Ok(()) so
+    // `RecordingSession` keeps `staging` alive and hands it to normal stop/recovery.
+    let signal = Arc::new((
+        Mutex::new(DelegateSignal {
+            started: true,
+            ..Default::default()
+        }),
+        Condvar::new(),
+    ));
+    let stops = AtomicUsize::new(0);
+    let res = wait_for_recording_started(
+        &signal,
+        Duration::from_secs(1),
+        || Some("interrupted: screen locked".to_string()),
+        || {
+            stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        },
+    );
+    assert!(
+        res.is_ok(),
+        "once writer started, startup must return Ok so caller salvages/saves staging"
+    );
+    assert_eq!(stops.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Case 2: Writer started and also received a delegate error -> still returns Ok(()) so
+    // `PendingRecordingStop::finish` can run strict salvage validation on staging.
+    let err_signal = Arc::new((
+        Mutex::new(DelegateSignal {
+            started: true,
+            error: Some("stream interrupted".to_string()),
+            ..Default::default()
+        }),
+        Condvar::new(),
+    ));
+    let res_err_after_start =
+        wait_for_recording_started(&err_signal, Duration::from_secs(1), || None, || {});
+    assert!(res_err_after_start.is_ok());
+
+    // Case 3: Writer has NOT started when interrupted -> returns Err immediately (no footage lost).
+    let unstarted = Arc::new((Mutex::new(DelegateSignal::default()), Condvar::new()));
+    let unstarted_stops = AtomicUsize::new(0);
+    let res_unstarted = wait_for_recording_started(
+        &unstarted,
+        Duration::from_secs(1),
+        || Some("interrupted: screen locked".to_string()),
+        || {
+            unstarted_stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        },
+    );
+    assert!(res_unstarted.is_err());
+    assert_eq!(unstarted_stops.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // Case 4: `wait_for_capture_start_with_interrupt` preserves Ok(()) if writer already started.
+    let (_tx, rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let cancelled = AtomicBool::new(false);
+    let late_stops = AtomicUsize::new(0);
+    let res_capture_wait = wait_for_capture_start_with_interrupt(
+        &rx,
+        Duration::from_secs(1),
+        &cancelled,
+        || Some("interrupted: screen locked".to_string()),
+        || true,
+        || {
+            late_stops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        },
+    );
+    assert!(res_capture_wait.is_ok());
+    assert!(!cancelled.load(std::sync::atomic::Ordering::Acquire));
+    assert_eq!(late_stops.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
