@@ -5,6 +5,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use block2::RcBlock;
+use objc2::rc::autoreleasepool;
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
     CGBitmapContextCreate, CGBitmapContextGetData, CGColorSpace, CGContext, CGImage,
@@ -40,24 +41,26 @@ pub(crate) fn dispatch_screenshot_frame(
     let cancelled_cb = Arc::clone(cancelled);
 
     let block = RcBlock::new(move |img_ptr: *mut CGImage, err_ptr: *mut NSError| {
-        if cancelled_cb.load(Ordering::Acquire) || timed_out_cb.load(Ordering::Acquire) {
-            return;
-        }
-        if !err_ptr.is_null() {
-            let msg = unsafe { (&*err_ptr).localizedDescription().to_string() };
-            let _ = tx.send(Err(format!("Timelapse frame capture failed: {msg}")));
-            return;
-        }
-        if img_ptr.is_null() {
-            let _ = tx.send(Err("Timelapse frame capture returned no image".to_string()));
-            return;
-        }
-        // Render immediately while the borrowed CGImageRef is guaranteed alive inside this callback.
-        let image = unsafe { &*img_ptr };
-        let res = render_cgimage_aspect_fit_rgba(image, target_w, target_h);
-        if !cancelled_cb.load(Ordering::Acquire) && !timed_out_cb.load(Ordering::Acquire) {
-            let _ = tx.send(res);
-        }
+        autoreleasepool(|_| {
+            if cancelled_cb.load(Ordering::Acquire) || timed_out_cb.load(Ordering::Acquire) {
+                return;
+            }
+            if !err_ptr.is_null() {
+                let msg = unsafe { (&*err_ptr).localizedDescription().to_string() };
+                let _ = tx.send(Err(format!("Timelapse frame capture failed: {msg}")));
+                return;
+            }
+            if img_ptr.is_null() {
+                let _ = tx.send(Err("Timelapse frame capture returned no image".to_string()));
+                return;
+            }
+            // Render immediately while the borrowed CGImageRef is guaranteed alive inside this callback.
+            let image = unsafe { &*img_ptr };
+            let res = render_cgimage_aspect_fit_rgba(image, target_w, target_h);
+            if !cancelled_cb.load(Ordering::Acquire) && !timed_out_cb.load(Ordering::Acquire) {
+                let _ = tx.send(res);
+            }
+        });
     });
 
     unsafe {

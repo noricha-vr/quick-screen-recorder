@@ -131,7 +131,7 @@ fn execute(command: Command) -> Result<(), String> {
             let safe_saved =
                 sanitize_terminal_text(&outcome.output_path.display().to_string(), false);
             if let Some(partial_err) = outcome.partial_error {
-                println!("Saved partial recording -> {safe_saved}");
+                println!("Saved recording -> {safe_saved}");
                 return Err(partial_err);
             }
             println!("Recorded -> {safe_saved}");

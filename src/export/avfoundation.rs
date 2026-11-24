@@ -4,7 +4,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use block2::RcBlock;
-use objc2::rc::Retained;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::AnyObject;
 use objc2_av_foundation::{
     AVAsset, AVAssetExportPresetHEVCHighestQuality, AVAssetExportPresetHighestQuality,
@@ -212,30 +212,34 @@ fn stream_video_only_transcode(
     let mut writer = StreamingMp4Writer::new(target_w, target_h, fps, target_codec, &req.output)?;
 
     for idx in 0..total_frames {
-        let t = (start_sec + (idx as f64) * frame_step).min(meta.duration_sec);
-        #[allow(deprecated)]
-        let cg_res = unsafe {
-            generator.copyCGImageAtTime_actualTime_error(secs_to_cmtime(t), ptr::null_mut())
-        };
-        let decoded = match cg_res {
-            Ok(cg_img) => {
-                let frame = cgimage_to_rgba_sized(&cg_img, target_w as usize, target_h as usize)?;
-                last_good = Some(frame.clone());
-                frame
-            }
-            Err(_) if last_good.is_some() => last_good.clone().unwrap(),
-            Err(e) => {
-                return Err(format!(
-                    "Failed decoding video frame {idx}: {}",
-                    e.localizedDescription()
-                ));
-            }
-        };
-        writer.append_rgba_frame(&decoded)?;
+        autoreleasepool(|_| {
+            let t = (start_sec + (idx as f64) * frame_step).min(meta.duration_sec);
+            #[allow(deprecated)]
+            let cg_res = unsafe {
+                generator.copyCGImageAtTime_actualTime_error(secs_to_cmtime(t), ptr::null_mut())
+            };
+            let decoded = match cg_res {
+                Ok(cg_img) => {
+                    let frame =
+                        cgimage_to_rgba_sized(&cg_img, target_w as usize, target_h as usize)?;
+                    last_good = Some(frame.clone());
+                    frame
+                }
+                Err(_) if last_good.is_some() => last_good.clone().unwrap(),
+                Err(e) => {
+                    return Err(format!(
+                        "Failed decoding video frame {idx}: {}",
+                        e.localizedDescription()
+                    ));
+                }
+            };
+            writer.append_rgba_frame(&decoded)?;
+            Ok::<(), String>(())
+        })?;
         let p = 50 + (((idx + 1) * 910) / total_frames.max(1)) as u32;
         set_progress_permille(progress, p);
     }
-    writer.finish_with_duration(Some(duration))?;
+    autoreleasepool(|_| writer.finish_with_duration(Some(duration)))?;
     set_progress_permille(progress, 975);
     Ok(())
 }

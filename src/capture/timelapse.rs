@@ -4,6 +4,7 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use objc2::rc::autoreleasepool;
 use objc2_screen_capture_kit::SCStreamConfiguration;
 
 use crate::capture::cadence::TIMELAPSE_PLAYBACK_FPS;
@@ -14,8 +15,9 @@ use crate::capture::timelapse_frame::{FRAME_CAPTURE_TIMEOUT, dispatch_screenshot
 use crate::capture::timelapse_loop::{LoopExit, SyncState, run_timelapse_loop};
 use crate::capture::{CaptureConfig, RecordingCodec, RecordingOutcome};
 use crate::export::av_writer::{StreamingMp4Writer, WRITER_FINISH_TIMEOUT};
-use crate::fs_safety::ExclusiveStagingDir;
+use crate::fs_safety::{ExclusiveStagingDir, format_tilde_path};
 use crate::observe::{PerfEvent, PerfKind, now_unix_secs, record_perf_event};
+use crate::staging::private_recovery_dir;
 
 const START_INIT_TIMEOUT: Duration = Duration::from_secs(12);
 
@@ -198,43 +200,36 @@ fn run_timelapse_worker(
     if sync.is_start_cancelled() {
         return Err("Timelapse start cancelled before initialization".to_string());
     }
-    let snapshot = match query_shareable_content_for_capture() {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = init_tx.send(Err(e.clone()));
-            return Err(e);
-        }
-    };
-    let (filter, pixel_w, pixel_h, source_rect_opt) =
-        match build_filter_and_dimensions(&snapshot.content, &cfg) {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = init_tx.send(Err(e.clone()));
-                return Err(e);
+    // Drain autoreleased Cocoa intermediates created during setup on this non-main Rust thread.
+    let setup_res = autoreleasepool(|_| {
+        let snapshot = query_shareable_content_for_capture()?;
+        let (filter, pixel_w, pixel_h, source_rect_opt) =
+            build_filter_and_dimensions(&snapshot.content, &cfg)?;
+
+        let stream_cfg = unsafe { SCStreamConfiguration::new() };
+        unsafe {
+            stream_cfg.setWidth(pixel_w);
+            stream_cfg.setHeight(pixel_h);
+            stream_cfg.setShowsCursor(cfg.show_cursor);
+            stream_cfg.setShowMouseClicks(cfg.highlight_clicks);
+            stream_cfg.setCapturesAudio(false);
+            stream_cfg.setCaptureMicrophone(false);
+            if let Some(rect) = source_rect_opt {
+                stream_cfg.setSourceRect(rect);
             }
-        };
-
-    let stream_cfg = unsafe { SCStreamConfiguration::new() };
-    unsafe {
-        stream_cfg.setWidth(pixel_w);
-        stream_cfg.setHeight(pixel_h);
-        stream_cfg.setShowsCursor(cfg.show_cursor);
-        stream_cfg.setShowMouseClicks(cfg.highlight_clicks);
-        stream_cfg.setCapturesAudio(false);
-        stream_cfg.setCaptureMicrophone(false);
-        if let Some(rect) = source_rect_opt {
-            stream_cfg.setSourceRect(rect);
         }
-    }
 
-    let mut writer = match StreamingMp4Writer::new(
-        pixel_w as u32,
-        pixel_h as u32,
-        TIMELAPSE_PLAYBACK_FPS,
-        cfg.codec,
-        staging.staged_file(),
-    ) {
-        Ok(w) => w,
+        let writer = StreamingMp4Writer::new(
+            pixel_w as u32,
+            pixel_h as u32,
+            TIMELAPSE_PLAYBACK_FPS,
+            cfg.codec,
+            staging.staged_file(),
+        )?;
+        Ok::<_, String>((filter, stream_cfg, pixel_w, pixel_h, writer))
+    });
+    let (filter, stream_cfg, pixel_w, pixel_h, mut writer) = match setup_res {
+        Ok(v) => v,
         Err(e) => {
             let _ = init_tx.send(Err(e.clone()));
             return Err(e);
@@ -247,9 +242,13 @@ fn run_timelapse_worker(
         &sync,
         &frames_written,
         init_tx,
-        || dispatch_screenshot_frame(&filter, &stream_cfg, pixel_w, pixel_h, &cancel_flag),
+        || {
+            autoreleasepool(|_| {
+                dispatch_screenshot_frame(&filter, &stream_cfg, pixel_w, pixel_h, &cancel_flag)
+            })
+        },
         |inflight| inflight.wait(),
-        |frame| writer.append_rgba_frame(frame),
+        |frame| autoreleasepool(|_| writer.append_rgba_frame(frame)),
     ) {
         Ok(LoopExit::CancelledBeforeStart) => {
             return Err("Timelapse start cancelled before handoff".to_string());
@@ -263,7 +262,7 @@ fn run_timelapse_worker(
     };
 
     // Always finalize & commit frames already captured before an abort so hours of timelapse aren't lost.
-    if let Err(fin_err) = writer.finish() {
+    if let Err(fin_err) = autoreleasepool(|_| writer.finish()) {
         record_timelapse_perf(cfg.codec, started_at.elapsed(), 0, false);
         return Err(match partial_error {
             Some(cap_err) => {
@@ -272,24 +271,44 @@ fn run_timelapse_worker(
             None => fin_err,
         });
     }
-    let size = match staging.commit() {
-        Ok(s) => s,
-        Err(com_err) => {
-            record_timelapse_perf(cfg.codec, started_at.elapsed(), 0, false);
-            return Err(match partial_error {
-                Some(cap_err) => {
-                    format!("{cap_err}; additionally failed committing partial video: {com_err}")
-                }
-                None => com_err,
-            });
-        }
+    // If the destination disconnected (e.g. external drive unmounted), rescue the finished local
+    // MP4 into our private recovery folder before `ExclusiveStagingDir::drop()` cleans staging.
+    let (final_path, size, final_warning) = match staging.commit() {
+        Ok(s) => (output_path, s, partial_error),
+        Err(com_err) => match private_recovery_dir()
+            .and_then(|rec_dir| staging.preserve_to_recovery_dir(&rec_dir))
+        {
+            Ok((recovered_path, rec_size)) => {
+                let rec_display = format_tilde_path(&recovered_path);
+                let msg = match partial_error {
+                    Some(cap_err) => format!(
+                        "{cap_err}; also failed moving recording to destination ({com_err}). Saved locally instead: {rec_display}"
+                    ),
+                    None => format!(
+                        "Destination became unavailable ({com_err}). Recording was saved locally instead: {rec_display}"
+                    ),
+                };
+                (recovered_path, rec_size, Some(msg))
+            }
+            Err(rec_err) => {
+                record_timelapse_perf(cfg.codec, started_at.elapsed(), 0, false);
+                return Err(match partial_error {
+                    Some(cap_err) => format!(
+                        "{cap_err}; failed committing partial video ({com_err}) and local recovery also failed ({rec_err})"
+                    ),
+                    None => format!(
+                        "Failed saving recording to destination ({com_err}) and local recovery also failed ({rec_err})"
+                    ),
+                });
+            }
+        },
     };
 
-    let clean_ok = partial_error.is_none();
+    let clean_ok = final_warning.is_none();
     record_timelapse_perf(cfg.codec, started_at.elapsed(), size, clean_ok);
     Ok(RecordingOutcome {
-        output_path,
-        partial_error,
+        output_path: final_path,
+        partial_error: final_warning,
     })
 }
 

@@ -241,29 +241,45 @@ fn read_gif_frame_count_and_duration(path: &Path) -> (usize, f64) {
 }
 
 fn read_apng_frame_count_and_duration(path: &Path) -> (usize, f64) {
-    let bytes = fs::read(path).expect("read apng bytes");
-    assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
-    let mut pos = 8_usize;
-    let mut count = 0_usize;
+    let file = File::open(path).expect("open apng");
+    let mut reader = png::Decoder::new(BufReader::new(file))
+        .read_info()
+        .expect("decode apng header");
+    let anim = reader
+        .info()
+        .animation_control()
+        .expect("APNG must contain acTL chunk");
+    let num_frames = anim.num_frames as usize;
+    let width = reader.info().width;
+    let height = reader.info().height;
+    let buf_len = reader
+        .output_buffer_size()
+        .expect("APNG output buffer size");
+    let mut buf = vec![0_u8; buf_len];
+
     let mut total_secs = 0.0_f64;
-    while pos + 12 <= bytes.len() {
-        let len = u32::from_be_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
-        let chunk_type = &bytes[pos + 4..pos + 8];
-        let data_start = pos + 8;
-        let data_end = data_start + len;
-        if data_end + 4 > bytes.len() {
-            break;
-        }
-        if chunk_type == b"fcTL" && len >= 26 {
-            let num =
-                u16::from_be_bytes(bytes[data_start + 20..data_start + 22].try_into().unwrap());
-            let raw_den =
-                u16::from_be_bytes(bytes[data_start + 22..data_start + 24].try_into().unwrap());
-            let den = if raw_den == 0 { 100_u16 } else { raw_den };
-            count += 1;
-            total_secs += f64::from(num) / f64::from(den);
-        }
-        pos = data_end + 4;
+    for idx in 0..num_frames {
+        let fc = if idx == 0 {
+            *reader
+                .info()
+                .frame_control()
+                .expect("APNG frame 0 must carry fcTL")
+        } else {
+            *reader
+                .next_frame_info()
+                .expect("APNG subsequent frame must carry fcTL")
+        };
+        let out_info = reader
+            .next_frame(&mut buf)
+            .expect("decode APNG frame pixels and CRC");
+        assert_eq!(out_info.width, width, "APNG frame {idx} width mismatch");
+        assert_eq!(out_info.height, height, "APNG frame {idx} height mismatch");
+        assert!(
+            out_info.buffer_size() > 0 && buf[..out_info.buffer_size()].iter().any(|&b| b != 0),
+            "APNG frame {idx} decoded to empty/zero buffer"
+        );
+        let den = if fc.delay_den == 0 { 100 } else { fc.delay_den };
+        total_secs += f64::from(fc.delay_num) / f64::from(den);
     }
-    (count, total_secs)
+    (num_frames, total_secs)
 }

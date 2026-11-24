@@ -363,9 +363,9 @@ pub(crate) fn stop_active_recording(mtm: MainThreadMarker, runtime: &Rc<RefCell<
                 if let Some(partial_err) = outcome.partial_error {
                     show_error_alert(
                         m,
-                        "Recording Stopped Early",
+                        "Recording Saved With Warning",
                         &format!(
-                            "Captured frames were saved and opened in the editor, but recording ended early: {partial_err}"
+                            "The recording was saved and opened in the editor, with a warning: {partial_err}"
                         ),
                     );
                 }
