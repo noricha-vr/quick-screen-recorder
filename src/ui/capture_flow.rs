@@ -353,8 +353,22 @@ pub(crate) fn stop_active_recording(mtm: MainThreadMarker, runtime: &Rc<RefCell<
             return;
         };
         let app_name = captured_cell.borrow_mut().take();
+        let should_quit = rt_poll.borrow().quit_after_stop;
         match pending.finish() {
             Ok(outcome) => {
+                if should_quit {
+                    if let Some(partial_err) = outcome.partial_error {
+                        show_error_alert(
+                            m,
+                            "Recording Saved With Warning",
+                            &format!(
+                                "The recording finished saving before quit, with a warning: {partial_err}"
+                            ),
+                        );
+                    }
+                    crate::ui::finish_app_termination(m, &rt_poll);
+                    return;
+                }
                 if let Err(err) =
                     open_editor_for_file(m, &rt_poll, &outcome.output_path, app_name, tutorial_gen)
                 {
@@ -370,7 +384,12 @@ pub(crate) fn stop_active_recording(mtm: MainThreadMarker, runtime: &Rc<RefCell<
                     );
                 }
             }
-            Err(err) => show_error_alert(m, "Recording Error", &err),
+            Err(err) => {
+                show_error_alert(m, "Recording Error", &err);
+                if should_quit {
+                    crate::ui::finish_app_termination(m, &rt_poll);
+                }
+            }
         }
     });
 

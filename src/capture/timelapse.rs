@@ -140,26 +140,7 @@ impl TimelapseSession {
     }
 
     pub fn stop(self) -> Result<RecordingOutcome, String> {
-        let mut pending = self.begin_stop();
-        loop {
-            match pending.done_rx.recv_timeout(Duration::from_millis(200)) {
-                Ok(res) => {
-                    pending.result = Some(res);
-                    return pending.finish();
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err("Timelapse worker exited unexpectedly".to_string());
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    // Never cut off an active cross-volume file commit once encoding has finished.
-                    if !pending.committing.load(Ordering::Acquire)
-                        && pending.stop_initiated_at.elapsed() >= pending.timeout
-                    {
-                        return Err("Timed out finalizing timelapse MP4".to_string());
-                    }
-                }
-            }
-        }
+        self.begin_stop().finish()
     }
 }
 
@@ -200,9 +181,21 @@ impl PendingTimelapseStop {
         if let Some(res) = self.result.take() {
             return res;
         }
-        match self.done_rx.try_recv() {
-            Ok(res) => res,
-            Err(_) => Err("Timed out finalizing timelapse MP4".to_string()),
+        loop {
+            match self.done_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(res) => return res,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err("Timelapse worker exited unexpectedly".to_string());
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // Never cut off an active cross-volume file commit once encoding has finished.
+                    if !self.committing.load(Ordering::Acquire)
+                        && self.stop_initiated_at.elapsed() >= self.timeout
+                    {
+                        return Err("Timed out finalizing timelapse MP4".to_string());
+                    }
+                }
+            }
         }
     }
 }

@@ -62,6 +62,7 @@ pub(crate) struct AppRuntime {
     pub(crate) mic_perm_timer: Option<Retained<NSTimer>>,
     pub(crate) editors: Vec<EditorWindow>,
     pub(crate) temp_files: Vec<PathBuf>,
+    pub(crate) quit_after_stop: bool,
 }
 
 pub fn run_gui(
@@ -103,6 +104,7 @@ pub fn run_gui(
         mic_perm_timer: None,
         editors: Vec::new(),
         temp_files: Vec::new(),
+        quit_after_stop: false,
     }));
 
     let status_bar = StatusBarController::new(
@@ -276,25 +278,45 @@ pub(crate) fn apply_export_dir_change(
 }
 
 fn cleanup_and_quit(mtm: MainThreadMarker, runtime: &Rc<RefCell<AppRuntime>>) {
-    {
+    let has_active_session = {
         let mut rt = runtime.borrow_mut();
         if let Some(ob) = rt.onboarding.take() {
             ob.close();
         }
+        if let Some(ov) = rt.overlay.take() {
+            ov.close();
+        }
+        if let Some(t) = rt.mic_perm_timer.take() {
+            t.invalidate();
+        }
+        // Defer termination while an asynchronous stop/commit is in flight so cross-volume
+        // saves and local recovery always run to completion before the process exits.
+        if rt.pending_stop.is_some() {
+            rt.quit_after_stop = true;
+            return;
+        }
+        if rt.session.is_some() {
+            rt.quit_after_stop = true;
+            true
+        } else {
+            false
+        }
+    };
+    if has_active_session {
+        stop_active_recording(mtm, runtime);
+        return;
+    }
+    finish_app_termination(mtm, runtime);
+}
+
+pub(crate) fn finish_app_termination(mtm: MainThreadMarker, runtime: &Rc<RefCell<AppRuntime>>) {
+    {
+        let mut rt = runtime.borrow_mut();
         if let Some(t) = rt.rec_timer.take() {
             t.invalidate();
         }
         if let Some(t) = rt.stop_poll_timer.take() {
             t.invalidate();
-        }
-        if let Some(t) = rt.mic_perm_timer.take() {
-            t.invalidate();
-        }
-        if let Some(pending) = rt.pending_stop.take() {
-            let _ = pending.finish();
-        }
-        if let Some(sess) = rt.session.take() {
-            let _ = sess.stop();
         }
         for tmp in rt.temp_files.drain(..) {
             let _ = std::fs::remove_file(tmp);

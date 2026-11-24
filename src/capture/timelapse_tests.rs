@@ -354,7 +354,26 @@ fn slow_cross_volume_commit_does_not_time_out_after_encoder_finishes() {
         .send(Ok(expected.clone()))
         .expect("send commit done");
     assert_eq!(pending.poll(), StopPollState::Finished);
-    assert_eq!(pending.finish(), Ok(expected));
+    assert_eq!(pending.finish(), Ok(expected.clone()));
+
+    // Direct finish() without polling must also wait through an active commit past timeout.
+    let (done_tx_direct, done_rx_direct) =
+        mpsc::sync_channel::<Result<RecordingOutcome, String>>(1);
+    let pending_direct = PendingTimelapseStop {
+        sync: SyncState::new(),
+        committing: Arc::new(AtomicBool::new(true)),
+        done_rx: done_rx_direct,
+        result: None,
+        stop_initiated_at: Instant::now(),
+        timeout: Duration::from_millis(15),
+    };
+    let expected_direct = expected.clone();
+    let sender = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(45));
+        let _ = done_tx_direct.send(Ok(expected_direct));
+    });
+    assert_eq!(pending_direct.finish(), Ok(expected));
+    sender.join().expect("join sender");
 
     // Verify normal timeout still triggers when encoder is NOT yet in commit phase.
     let (_tx2, rx2) = mpsc::sync_channel::<Result<RecordingOutcome, String>>(1);

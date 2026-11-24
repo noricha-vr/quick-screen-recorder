@@ -423,11 +423,61 @@ impl ExclusiveStagingDir {
         ))
     }
 
-    /// Disarms automatic cleanup on drop so a completed local staged MP4 is preserved (`0600` in
-    /// our `0700` staging directory) even if both destination commit and recovery-dir move fail.
+    /// Disarms automatic cleanup on drop AND exempts the preserved staging directory from
+    /// 24-hour startup cache pruning by writing a `.qsr-keep` marker via `stage_dir_fd` and
+    /// renaming `.qsr-work-*` to `qsr-preserved-*` inside our private `0700` cache directory.
     pub fn retain_staged_file(&mut self) -> PathBuf {
         let _ = fs::set_permissions(&self.staged_file, fs::Permissions::from_mode(0o600));
+        // Create `.qsr-keep` via pinned `stage_dir_fd` so startup pruning skips this directory
+        // even if renaming the parent entry fails.
+        let marker_fd = unsafe {
+            libc::openat(
+                self.stage_dir_fd.as_raw_fd(),
+                c".qsr-keep".as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600_u32,
+            )
+        };
+        if marker_fd >= 0 {
+            unsafe {
+                libc::close(marker_fd);
+            }
+        }
         self.keep_staged_on_drop = true;
+
+        // Also rename `.qsr-work-*` -> `qsr-preserved-*` so it is permanently outside prune globs.
+        if let (Some(parent), Some(old_name), Some(file_name)) = (
+            self.stage_dir_path.parent(),
+            self.stage_dir_path.file_name().and_then(|s| s.to_str()),
+            self.staged_file.file_name(),
+        ) {
+            if let Some(suffix) = old_name.strip_prefix(".qsr-work-") {
+                let preserved_dir = parent.join(format!("qsr-preserved-{suffix}"));
+                if let (Ok(parent_fd), Ok(old_c), Ok(new_c)) = (
+                    OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                        .open(parent),
+                    CString::new(old_name.as_bytes()),
+                    CString::new(format!("qsr-preserved-{suffix}").as_bytes()),
+                ) {
+                    let rc = unsafe {
+                        libc::renameatx_np(
+                            parent_fd.as_raw_fd(),
+                            old_c.as_ptr(),
+                            parent_fd.as_raw_fd(),
+                            new_c.as_ptr(),
+                            libc::RENAME_EXCL,
+                        )
+                    };
+                    if rc == 0 {
+                        let new_staged = preserved_dir.join(file_name);
+                        self.stage_dir_path = preserved_dir;
+                        self.staged_file = new_staged;
+                    }
+                }
+            }
+        }
         self.staged_file.clone()
     }
 }
@@ -441,54 +491,5 @@ impl Drop for ExclusiveStagingDir {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn preserve_to_recovery_dir_and_retain_staged_protect_finished_recordings() {
-        let base = std::env::temp_dir().join(format!("qsr-recover-{}", random_hex_token()));
-        let dest_dir = base.join("external-drive");
-        let rec_dir = base.join("local-recovered");
-        fs::create_dir_all(&dest_dir).expect("create mock external drive");
-        let target = dest_dir.join("2026-11-24_timelapse.mp4");
-
-        let staging = ExclusiveStagingDir::create_for_target(&target, "mp4").expect("stage");
-        fs::write(staging.staged_file(), b"valid-mp4-payload").expect("write staged mp4");
-        fs::remove_dir_all(&dest_dir).expect("remove mock external drive");
-        assert!(staging.commit().is_err());
-
-        let sym_rec = base.join("symlink-recovered");
-        std::os::unix::fs::symlink(&base, &sym_rec).expect("create symlink");
-        assert!(staging.preserve_to_recovery_dir(&sym_rec).is_err());
-
-        let (rec_path, size) = staging.preserve_to_recovery_dir(&rec_dir).expect("recover");
-        assert_eq!(size, b"valid-mp4-payload".len() as u64);
-        drop(staging);
-        assert_eq!(fs::read(&rec_path).unwrap(), b"valid-mp4-payload");
-        assert_eq!(
-            fs::symlink_metadata(&rec_path)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
-
-        fs::create_dir_all(&dest_dir).expect("recreate mock drive");
-        let mut staging2 = ExclusiveStagingDir::create_for_target(&target, "mp4").expect("stage2");
-        fs::write(staging2.staged_file(), b"last-resort-mp4").expect("write staged2");
-        fs::remove_dir_all(&dest_dir).expect("remove mock drive again");
-        assert!(staging2.commit().is_err());
-        assert!(staging2.preserve_to_recovery_dir(&sym_rec).is_err());
-        let kept = staging2.retain_staged_file();
-        drop(staging2);
-        assert_eq!(fs::read(&kept).unwrap(), b"last-resort-mp4");
-        assert_eq!(
-            fs::symlink_metadata(&kept).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-
-        let _ = fs::remove_dir_all(kept.parent().unwrap());
-        let _ = fs::remove_dir_all(&base);
-    }
-}
+#[path = "staging_tests.rs"]
+mod tests;
