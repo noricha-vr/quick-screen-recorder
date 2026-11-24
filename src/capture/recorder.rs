@@ -236,7 +236,12 @@ impl RecordingSession {
         }
         if let Some(msg) = check_interrupted() {
             cancelled_after_start.store(true, std::sync::atomic::Ordering::Release);
-            let _ = unsafe { stream.removeRecordingOutput_error(&recording_output) };
+            // Route through the shared serial stop worker (never calling `removeRecordingOutput`
+            // concurrently with the hook just attached to `interrupt_latch`).
+            stopper.request_stop_async(StopMode::StartupAbort);
+            stopper
+                .control()
+                .wait_until_worker_idle(Duration::from_secs(2));
             return Err(msg);
         }
 

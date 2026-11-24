@@ -210,6 +210,15 @@ impl StopControl {
             .map(|t0| finished_at.saturating_duration_since(t0).as_millis() as u64)
     }
 
+    pub(super) fn wait_until_worker_idle(&self, timeout: Duration) {
+        let Ok(guard) = self.state.lock() else {
+            return;
+        };
+        let _ = self
+            .cvar
+            .wait_timeout_while(guard, timeout, |st| st.worker_running);
+    }
+
     /// Executes the strictly serialized stop protocol on the single background worker thread:
     /// 1. Calls `do_remove()` at most once (never re-invoking once `RemovePhase::Succeeded`).
     /// 2. When `do_remove()` succeeded, waits on `signal` until `finished == true` OR the
@@ -283,11 +292,26 @@ impl StopControl {
             }
 
             // Step 3: Dispatch `stopCaptureWithCompletionHandler:` strictly after Step 1+2.
-            let gen_to_send = {
+            // If a delayed `startCapture` callback arrived AFTER an initial pre-start remove
+            // failed and BEFORE the first `stopCapture` was dispatched, loop back to retry
+            // `removeRecordingOutput` + wait for `finished` on the newly started stream first.
+            enum Step3Action {
+                RetryRemove,
+                SendStop(u64),
+                None,
+            }
+            let step3 = {
                 let Ok(mut st) = self.state.lock() else {
                     return;
                 };
-                if st.stop_capture_sent_at.is_none() {
+                if st.pending_late_start_gen.is_some()
+                    && st.remove_phase == RemovePhase::Failed
+                    && st.stop_capture_sent_at.is_none()
+                {
+                    st.remove_phase = RemovePhase::Idle;
+                    st.forced_stop_on_timeout = false;
+                    Step3Action::RetryRemove
+                } else if st.stop_capture_sent_at.is_none() {
                     let expected_gen = st
                         .pending_late_start_gen
                         .take()
@@ -295,13 +319,15 @@ impl StopControl {
                     st.stop_capture_sent_at = Some(now_fn());
                     st.stop_capture_gen = Some(expected_gen);
                     self.cvar.notify_all();
-                    Some(expected_gen)
+                    Step3Action::SendStop(expected_gen)
                 } else {
-                    None
+                    Step3Action::None
                 }
             };
-            if let Some(expected_gen) = gen_to_send {
-                do_stop_capture(expected_gen);
+            match step3 {
+                Step3Action::RetryRemove => continue,
+                Step3Action::SendStop(expected_gen) => do_stop_capture(expected_gen),
+                Step3Action::None => {}
             }
 
             // Step 4: If a delayed start callback queued a post-start generation AFTER we sent a

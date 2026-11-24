@@ -250,6 +250,73 @@ fn late_start_retries_remove_only_when_pre_start_remove_failed() {
 }
 
 #[test]
+fn late_start_arriving_between_failed_remove_and_first_stop_retries_remove_and_waits_finish() {
+    let t0 = Instant::now();
+    let ctrl = Arc::new(StopControl::new(t0, true));
+    let signal = Arc::new((Mutex::new(DelegateSignal::default()), Condvar::new()));
+
+    let fake_clock = Arc::new(Mutex::new(t0 + Duration::from_millis(50)));
+    assert!(ctrl.register_stop_request(StopMode::StartupAbort, *fake_clock.lock().unwrap()));
+
+    let remove_calls = Arc::new(AtomicUsize::new(0));
+    let stop_gens = Arc::new(Mutex::new(Vec::<u64>::new()));
+
+    let ctrl_w = Arc::clone(&ctrl);
+    let sig_w = Arc::clone(&signal);
+    let rem_w = Arc::clone(&remove_calls);
+    let gens_w = Arc::clone(&stop_gens);
+    let clk_w = Arc::clone(&fake_clock);
+
+    let worker = thread::spawn(move || {
+        ctrl_w.run_serial_worker_loop(
+            &sig_w,
+            || {
+                let n = rem_w.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // First pre-start remove fails; delayed `startCapture` arrives RIGHT BEFORE
+                    // the worker reaches Step 3 (so `stop_capture_sent_at` is still `None`).
+                    let now = *clk_w.lock().unwrap();
+                    let _ = ctrl_w.register_late_start_stop(42, now, &sig_w);
+                    if let Ok(mut g) = sig_w.0.lock() {
+                        g.start_completed = true;
+                        g.started = true;
+                    }
+                    false
+                } else {
+                    // Second remove (post-start) succeeds; worker MUST now wait for `finished`.
+                    true
+                }
+            },
+            |g| gens_w.lock().unwrap().push(g),
+            || *clk_w.lock().unwrap(),
+        );
+    });
+
+    // Give worker time to run remove #1 (fail), loop back, run remove #2 (succeed), and park
+    // waiting for `finished` (MUST NOT have sent `stopCapture` prematurely!).
+    thread::sleep(Duration::from_millis(80));
+    *fake_clock.lock().unwrap() += Duration::from_secs(10);
+    thread::sleep(Duration::from_millis(60));
+    assert_eq!(remove_calls.load(Ordering::SeqCst), 2);
+    assert!(
+        stop_gens.lock().unwrap().is_empty(),
+        "must wait for recordingOutputDidFinishRecording after post-start remove retry"
+    );
+
+    // Signal finish -> worker dispatches `stopCapture(42)` once and exits cleanly.
+    {
+        let mut g = signal.0.lock().unwrap();
+        g.finished = true;
+        signal.1.notify_all();
+    }
+    worker.join().expect("join worker");
+    assert_eq!(remove_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(*stop_gens.lock().unwrap(), vec![42]);
+    assert_eq!(ctrl.snapshot().remove_phase, RemovePhase::Succeeded);
+    assert!(!ctrl.snapshot().forced_stop_on_timeout);
+}
+
+#[test]
 fn forced_timeout_did_fail_retains_staging_untouched_even_when_stream_stop_confirmed() {
     use std::os::unix::fs::PermissionsExt;
 

@@ -11,18 +11,17 @@ trap 'rm -rf "$TMP_ROOT"' EXIT
 STUB_BIN="$TMP_ROOT/bin"
 mkdir -p "$STUB_BIN"
 TCC_LOG="$TMP_ROOT/tcc.log"
+PGREP_COUNT_FILE="$TMP_ROOT/pgrep.count"
 
 cat > "$STUB_BIN/codesign" << 'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-# Stub codesign driven by sentinel files inside the .app bundle (`.stub-sig`)
 if [[ "$1" == "--verify" ]]; then
   app="${@: -1}"
   [[ -f "$app/.stub-verify-fail" ]] && exit 1
   exit 0
 fi
 if [[ "$1" == "--force" ]]; then
-  # --force --deep --sign <identity> <app>
   ident=""
   prev=""
   for arg in "$@"; do
@@ -65,10 +64,29 @@ exit 0
 EOF
 chmod +x "$STUB_BIN/tccutil"
 
+cat > "$STUB_BIN/pgrep" << EOF
+#!/usr/bin/env bash
+set -euo pipefail
+count=0
+[[ -f "$PGREP_COUNT_FILE" ]] && count="\$(cat "$PGREP_COUNT_FILE")"
+count=\$((count + 1))
+echo "\$count" > "$PGREP_COUNT_FILE"
+case "\${STUB_PGREP_MODE:-not_running}" in
+  not_running) exit 1 ;;
+  running) exit 0 ;;
+  error) exit 3 ;;
+  running_on_second)
+    if [[ "\$count" -ge 2 ]]; then exit 0; else exit 1; fi
+    ;;
+esac
+exit 1
+EOF
+chmod +x "$STUB_BIN/pgrep"
+
 make_fake_app() {
   local dir="$1"
   local bid="$2"
-  local sig_mode="$3"   # adhoc | cert | corrupt
+  local sig_mode="$3"
   local cdhash="$4"
   local cs_id="${5:-$bid}"
   rm -rf "$dir"
@@ -99,7 +117,8 @@ PLIST
 }
 
 run_inst() {
-  PATH="$STUB_BIN:$PATH" bash "$INSTALLER" --skip-running-check "$@"
+  rm -f "$PGREP_COUNT_FILE"
+  PATH="$STUB_BIN:$PATH" bash "$INSTALLER" "$@"
 }
 
 assert_log_lines() {
@@ -202,5 +221,49 @@ if run_inst --target-dir "$APPS_DIR" --source-app "$SRC_V4" >/dev/null 2>&1; the
   exit 1
 fi
 assert_log_lines 0
+rm -rf "$APPS_DIR/QuickScreenRecorder.app"
 
-echo "INSTALL_LOCAL_STUB_TESTS_OK (11/11 cases passed)"
+# 12. Refuses to install when pgrep reports the app is running (exit 0).
+: > "$TCC_LOG"
+if STUB_PGREP_MODE=running run_inst --target-dir "$APPS_DIR" --source-app "$SRC_V4" >/dev/null 2>&1; then
+  echo "FAIL: must refuse install while app is running" >&2
+  exit 1
+fi
+assert_log_lines 0
+
+# 13. Fails closed when pgrep encounters an internal error (exit 3 != 1).
+: > "$TCC_LOG"
+if STUB_PGREP_MODE=error run_inst --target-dir "$APPS_DIR" --source-app "$SRC_V4" >/dev/null 2>&1; then
+  echo "FAIL: must fail closed when pgrep exits with error 3" >&2
+  exit 1
+fi
+assert_log_lines 0
+
+# 14. Re-checks running status right before swap (catches app launched mid-build/staging).
+: > "$TCC_LOG"
+if STUB_PGREP_MODE=running_on_second run_inst --target-dir "$APPS_DIR" --source-app "$SRC_V4" >/dev/null 2>&1; then
+  echo "FAIL: must re-check running app before swap" >&2
+  exit 1
+fi
+assert_log_lines 0
+[[ ! -e "$APPS_DIR/QuickScreenRecorder.app" ]]
+
+# 15. Refuses installing into dist/ (including dist/. and dist/../dist aliases).
+mkdir -p "$ROOT_DIR/dist"
+for bad_target in "$ROOT_DIR/dist" "$ROOT_DIR/dist/." "$ROOT_DIR/dist/../dist"; do
+  if run_inst --target-dir "$bad_target" --source-app "$SRC_V4" --sign-identity "Developer ID Application: Local" >/dev/null 2>&1; then
+    echo "FAIL: must refuse installing into $bad_target" >&2
+    exit 1
+  fi
+done
+
+# 16. Sanitizes control characters (e.g. ANSI escape) from untrusted plist values in error output.
+SRC_ESC="$TMP_ROOT/esc.app"
+make_fake_app "$SRC_ESC" "$(printf 'com.evil.\033[31mred')" "adhoc" "eeee"
+OUT_ESC="$(run_inst --target-dir "$APPS_DIR" --source-app "$SRC_ESC" 2>&1 || true)"
+if printf '%s' "$OUT_ESC" | LC_ALL=C grep -q $'\033'; then
+  echo "FAIL: raw ESC control byte leaked to terminal output" >&2
+  exit 1
+fi
+
+echo "INSTALL_LOCAL_STUB_TESTS_OK (16/16 cases passed)"
